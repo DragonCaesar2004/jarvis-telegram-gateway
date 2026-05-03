@@ -115,11 +115,17 @@ def unique_channels_from_search(videos: list[dict[str, Any]]) -> list[dict[str, 
 # Channel metadata
 # ---------------------------------------------------------------------------
 
-def get_channel_metadata(channel_id_or_url: str) -> dict[str, Any]:
+def get_channel_metadata(channel_id_or_url: str,
+                         video_count_sample: int = 200) -> dict[str, Any]:
     """Fetch subscriber count, video count, description, etc.
 
     Accepts either a bare channel_id ("UC...") or full channel URL.
     Returns {} on failure (caller should skip the channel).
+
+    Video count is sampled from /videos tab up to `video_count_sample` entries.
+    If the channel has more than this, we report the cap. If yt-dlp doesn't
+    expose a count at all, we return -1 — caller should treat as "unknown",
+    not zero (else hard filter rejects everything).
     """
     url = _channel_url(channel_id_or_url)
     with _ydl({"extract_flat": True}) as ydl:
@@ -134,11 +140,32 @@ def get_channel_metadata(channel_id_or_url: str) -> dict[str, Any]:
         "channel_name": info.get("channel") or info.get("uploader") or info.get("title") or "",
         "channel_url": info.get("channel_url") or info.get("webpage_url") or url,
         "subscribers": int(info.get("channel_follower_count") or 0),
-        "video_count": _extract_video_count(info),
+        "video_count": _count_channel_videos(channel_id_or_url, sample=video_count_sample),
         "description": (info.get("description") or "")[:2000],
         "language": _extract_language(info),
         "thumbnail": _best_thumbnail(info),
     }
+
+
+def _count_channel_videos(channel_id_or_url: str, sample: int = 200) -> int:
+    """Best-effort count by fetching /videos with playlistend=sample.
+
+    Returns:
+        > 0  exact count if total ≤ sample
+        =sample  channel has at least `sample` videos (likely more)
+        -1   couldn't determine — treat as 'unknown', not zero
+    """
+    url = _channel_videos_url(channel_id_or_url)
+    try:
+        with _ydl({"extract_flat": "in_playlist", "playlistend": sample}) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        log.warning(f"youtube_dl: video count probe failed for {url}: {e}")
+        return -1
+    entries = info.get("entries")
+    if isinstance(entries, list):
+        return len(entries)
+    return -1
 
 
 def list_channel_videos(channel_id_or_url: str, max_results: int = 50,

@@ -243,9 +243,16 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
 # ---------------------------------------------------------------------------
 
 def _passes_hard_filter(meta: dict[str, Any], criteria: dict[str, Any]) -> bool:
-    """Apply min/max subs and video_count gates. 0/empty in Criteria = no limit."""
-    subs = meta.get("subscribers", 0) or 0
-    vids = meta.get("video_count", 0) or 0
+    """Apply min/max subs and video_count gates.
+
+    Rules:
+    - 0/empty in Criteria  → that gate is skipped (no limit).
+    - 0 subscribers from yt-dlp → skip the subs gates (data missing, don't reject).
+    - -1 video_count from yt-dlp → "unknown", skip video_count gates.
+    """
+    subs = int(meta.get("subscribers") or 0)
+    vids = int(meta.get("video_count") or 0)
+    vids_known = vids >= 0
 
     def _limit(key: str) -> int:
         v = criteria.get(key)
@@ -259,14 +266,16 @@ def _passes_hard_filter(meta: dict[str, Any], criteria: dict[str, Any]) -> bool:
     min_vids = _limit("min_videos_on_channel")
     max_vids = _limit("max_videos_on_channel")
 
-    if min_subs and subs and subs < min_subs:
-        return False
-    if max_subs and subs and subs > max_subs:
-        return False
-    if min_vids and vids and vids < min_vids:
-        return False
-    if max_vids and vids and vids > max_vids:
-        return False
+    if subs > 0:
+        if min_subs and subs < min_subs:
+            return False
+        if max_subs and subs > max_subs:
+            return False
+    if vids_known and vids > 0:
+        if min_vids and vids < min_vids:
+            return False
+        if max_vids and vids > max_vids:
+            return False
     return True
 
 
