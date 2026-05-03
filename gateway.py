@@ -1536,6 +1536,41 @@ def handle_command(token: str, chat_id: int, agent: str, cmd: str, args: str, cf
             pass
         return True
 
+    if cmd == "/model":
+        model_map = {
+            "sonnet": "claude-sonnet-4-6",
+            "opus": "claude-opus-4-7",
+            "haiku": "claude-haiku-4-5-20251001",
+        }
+        alias = args.strip().split()[0] if args.strip() else ""
+        if alias not in model_map:
+            try:
+                tg_api(token, "sendMessage", chat_id=chat_id,
+                       text="Usage: /model sonnet | opus | haiku")
+            except Exception:
+                pass
+            return True
+        new_model = model_map[alias]
+        cfg["model"] = new_model
+        try:
+            full_cfg = json.loads(CONFIG_PATH.read_text())
+            full_cfg.setdefault("agents", {}).setdefault(agent, {})["model"] = new_model
+            tmp_path = CONFIG_PATH.with_suffix(".json.tmp")
+            tmp_path.write_text(json.dumps(full_cfg, indent=2, ensure_ascii=False))
+            os.replace(tmp_path, CONFIG_PATH)
+            persisted = True
+        except Exception as e:
+            log.warning(f"/model persist failed: {e}")
+            persisted = False
+        suffix = "" if persisted else " (in-memory only — persist failed, see logs)"
+        try:
+            tg_api(token, "sendMessage", chat_id=chat_id,
+                   text=f"Model switched to {alias} ({new_model}){suffix}")
+        except Exception:
+            pass
+        log.info(f"[{agent}] /model switched to {alias} ({new_model}) persisted={persisted}")
+        return True
+
     if cmd == "/help":
         text = (
             "<b>gateway commands</b>\n\n"
@@ -1544,6 +1579,7 @@ def handle_command(token: str, chat_id: int, agent: str, cmd: str, args: str, cf
             "<code>/reset</code> -- reset session (saves important to MEMORY)\n"
             "<code>/reset force</code> -- reset without saving\n"
             "<code>/compact</code> -- manual memory compaction\n"
+            "<code>/model sonnet|opus|haiku</code> -- switch LLM model\n"
             "<code>/help</code> -- this help\n\n"
             "<i>auto-compact: daily 05:00 UTC</i>"
         )
