@@ -75,11 +75,11 @@ def _worker(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
 def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
          topic: str, count: int, onb: dict) -> None:
     # ── 1. Resolve secrets and open Sheet ────────────────────────────────
+    # Anthropic API key not needed: llm.py uses `claude -p` CLI via Max OAuth.
     sa_path = _secrets.resolve_path(onb, "google_service_account")
     sheet_id = onb.get("google_sheet_id") or ""
     if not sheet_id:
         raise RuntimeError("config: onboarder.google_sheet_id not set")
-    anthropic_key = _secrets.resolve(onb, "anthropic_api_key", env="ANTHROPIC_API_KEY")
 
     client = sheets.open_client(sa_path)
     criteria = sheets.read_criteria(client, sheet_id)
@@ -135,7 +135,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     # ── 5. Claude scores remaining channels ──────────────────────────────
     _send(token, chat_id, f"🤖 Оцениваю {len(enriched)} каналов через Claude…")
     sheets.update_run_status(client, sheet_id, run_id, status="phase1_scoring")
-    scored = llm.score_channels(anthropic_key, topic=topic, criteria=criteria,
+    scored = llm.score_channels(topic=topic, criteria=criteria,
                                 channels=enriched)
     # Merge score into enriched lookup
     score_by_id = {s["channel_id"]: s for s in scored}
@@ -169,7 +169,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
             continue
 
         try:
-            sel = llm.select_videos(anthropic_key, topic=topic, criteria=criteria,
+            sel = llm.select_videos(topic=topic, criteria=criteria,
                                     channel_name=ch_name, videos=videos_for_llm)
         except Exception as e:
             log.warning(f"phase1[{user_id}] select_videos failed for {ch_name}: {e}")

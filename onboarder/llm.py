@@ -1,4 +1,4 @@
-"""Anthropic Claude API client for the onboarder pipeline.
+"""Claude LLM calls for the onboarder pipeline.
 
 Four jobs:
     1. score_channels()   — rank candidate YouTube channels against criteria + topic
@@ -7,55 +7,105 @@ Four jobs:
                             for intro/outro/promo/off-topic segments to remove
     4. compose_course()   — final course title, excerpt, aboutContent + author bio
 
-Defaults to Sonnet 4.6 (cheap, fast, plenty smart for these classification tasks).
-Bump to Opus 4.7 for course composition if quality is insufficient.
+Implementation: subprocess to `claude -p` CLI (Claude Code). Uses the OAuth
+token already configured for the gateway's Max subscription, so no separate
+Anthropic API key is needed. Costs are charged against the Max quota.
 
-All functions accept `api_key` as the resolved string value. Caller resolves
-via onboarder._secrets.resolve(cfg, "anthropic_api_key", env="ANTHROPIC_API_KEY").
+Defaults to Sonnet (fast & cheap quota-wise) for classification, Opus for prose.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("gateway")
 
-DEFAULT_MODEL_FAST = "claude-sonnet-4-6"
-DEFAULT_MODEL_QUALITY = "claude-opus-4-7"
+# CLI model aliases (claude -p --model <alias>)
+DEFAULT_MODEL_FAST = "sonnet"
+DEFAULT_MODEL_QUALITY = "opus"
+
+# Default subprocess timeout — should fit longest prompt round-trip.
+# Channel scoring on 15 channels: ~15s. Video selection: ~30s. Course composition: ~60s.
+CLAUDE_CLI_TIMEOUT_SEC = 180
 
 
 # ---------------------------------------------------------------------------
-# Client
+# Subprocess wrapper
 # ---------------------------------------------------------------------------
 
-def _client(api_key: str) -> Any:
-    """Build an Anthropic client. Lazy import so gateway core doesn't need anthropic."""
-    from anthropic import Anthropic
-    if not api_key:
-        raise ValueError("anthropic api key is empty")
-    return Anthropic(api_key=api_key)
+def _call_json(*, model: str, system: str, user: str,
+               max_tokens: int = 4096,  # accepted for API compat; CLI ignores
+               timeout: int = CLAUDE_CLI_TIMEOUT_SEC) -> Any:
+    """Invoke `claude -p` and parse the response as JSON.
 
+    The system prompt is prepended to the user prompt because Claude Code CLI
+    in `-p` mode doesn't take a separate system-message flag in all versions.
+    Using --append-system-prompt would be cleaner but isn't supported on every
+    install path.
+    """
+    del max_tokens  # CLI handles token budget itself
+    full_prompt = f"{system.strip()}\n\n---\n\n{user.strip()}\n\nReturn ONLY the JSON, no commentary."
 
-def _call_json(api_key: str, *, model: str, system: str, user: str,
-               max_tokens: int = 4096) -> Any:
-    """Call Claude, expect JSON, return parsed object. Raises on parse failure."""
-    client = _client(api_key)
-    resp = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    text = "".join(b.text for b in resp.content if hasattr(b, "text")).strip()
-    # Strip code fences if present
+    # Run from an isolated tmpdir so Claude Code doesn't pick up workspace state.
+    with tempfile.TemporaryDirectory(prefix="onboarder-claude-") as tmpdir:
+        env = os.environ.copy()
+        env.setdefault("PATH", f"{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+        try:
+            r = subprocess.run(
+                [
+                    "claude", "-p", full_prompt,
+                    "--model", model,
+                    "--output-format", "text",
+                    "--permission-mode", "bypassPermissions",
+                ],
+                cwd=tmpdir,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"claude CLI timed out after {timeout}s") from e
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                "claude CLI not found in PATH. Ensure Claude Code is installed "
+                "and CLAUDE_CODE_OAUTH_TOKEN is set in the gateway's env."
+            ) from e
+
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"claude CLI exit {r.returncode}: stderr={r.stderr[:500]!r} "
+                f"stdout={r.stdout[:500]!r}"
+            )
+
+    text = (r.stdout or "").strip()
+    if not text:
+        raise RuntimeError(f"claude CLI returned empty stdout. stderr={r.stderr[:500]!r}")
+
+    # Strip code fences if model wrapped JSON in ```json ... ```
     if text.startswith("```"):
-        text = text.split("\n", 1)[1]
-        if text.endswith("```"):
+        # Drop opening fence (with optional language tag) and trailing fence
+        first_nl = text.find("\n")
+        if first_nl != -1:
+            text = text[first_nl + 1:]
+        if text.rstrip().endswith("```"):
             text = text.rsplit("```", 1)[0]
-        if text.startswith("json\n"):
-            text = text[5:]
+        text = text.strip()
+
+    # Some Claude responses include leading prose before JSON; try to find first { or [
+    if not (text.startswith("{") or text.startswith("[")):
+        for opener in ("{", "["):
+            idx = text.find(opener)
+            if idx != -1:
+                text = text[idx:]
+                break
+
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
@@ -87,7 +137,7 @@ Return ONLY valid JSON, no prose:
 """
 
 
-def score_channels(api_key: str, *, topic: str, criteria: dict[str, Any],
+def score_channels(*, topic: str, criteria: dict[str, Any],
                    channels: list[dict[str, Any]], model: str = DEFAULT_MODEL_FAST) -> list[dict[str, Any]]:
     """Return list of {channel_id, score, reason} sorted by score desc.
 
@@ -98,7 +148,7 @@ def score_channels(api_key: str, *, topic: str, criteria: dict[str, Any],
     """
     user = json.dumps({"topic": topic, "criteria": criteria, "channels": channels},
                       ensure_ascii=False, indent=2)
-    parsed = _call_json(api_key, model=model, system=SCORE_CHANNELS_SYSTEM, user=user)
+    parsed = _call_json(model=model, system=SCORE_CHANNELS_SYSTEM, user=user)
     if not isinstance(parsed, list):
         raise ValueError(f"score_channels: expected list, got {type(parsed).__name__}")
     parsed.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -134,7 +184,7 @@ If the channel doesn't have enough on-topic material for a coherent 6+ video cou
 """
 
 
-def select_videos(api_key: str, *, topic: str, criteria: dict[str, Any],
+def select_videos(*, topic: str, criteria: dict[str, Any],
                   channel_name: str, videos: list[dict[str, Any]],
                   model: str = DEFAULT_MODEL_FAST) -> dict[str, Any]:
     """Return {course_title, lessons[]} or {course_title: null, lessons: [], skip_reason}.
@@ -147,7 +197,7 @@ def select_videos(api_key: str, *, topic: str, criteria: dict[str, Any],
         "topic": topic, "criteria": criteria,
         "channel_name": channel_name, "videos": videos,
     }, ensure_ascii=False, indent=2)
-    parsed = _call_json(api_key, model=model, system=SELECT_VIDEOS_SYSTEM, user=user,
+    parsed = _call_json(model=model, system=SELECT_VIDEOS_SYSTEM, user=user,
                         max_tokens=8192)
     if not isinstance(parsed, dict):
         raise ValueError(f"select_videos: expected dict, got {type(parsed).__name__}")
@@ -180,12 +230,12 @@ Use exact timestamps from the transcript. Cuts must not overlap. Empty list if n
 """
 
 
-def mark_cuts(api_key: str, *, course_topic: str, transcript: dict[str, Any],
+def mark_cuts(*, course_topic: str, transcript: dict[str, Any],
               model: str = DEFAULT_MODEL_FAST) -> list[dict[str, Any]]:
     """Return list of {start, end, reason} time ranges to remove."""
     user = json.dumps({"course_topic": course_topic, "transcript": transcript},
                       ensure_ascii=False)
-    parsed = _call_json(api_key, model=model, system=MARK_CUTS_SYSTEM, user=user,
+    parsed = _call_json(model=model, system=MARK_CUTS_SYSTEM, user=user,
                         max_tokens=4096)
     if not isinstance(parsed, list):
         raise ValueError(f"mark_cuts: expected list, got {type(parsed).__name__}")
@@ -214,7 +264,7 @@ Return ONLY valid JSON, no prose:
 """
 
 
-def compose_course(api_key: str, *, course_topic: str, course_title: str,
+def compose_course(*, course_topic: str, course_title: str,
                    channel_name: str, channel_description: str,
                    lesson_transcripts: list[str],
                    model: str = DEFAULT_MODEL_QUALITY) -> dict[str, str]:
@@ -230,7 +280,7 @@ def compose_course(api_key: str, *, course_topic: str, course_title: str,
         "channel_name": channel_name, "channel_description": channel_description,
         "lesson_transcripts": trimmed,
     }, ensure_ascii=False)
-    parsed = _call_json(api_key, model=model, system=COMPOSE_COURSE_SYSTEM, user=user,
+    parsed = _call_json(model=model, system=COMPOSE_COURSE_SYSTEM, user=user,
                         max_tokens=2048)
     if not isinstance(parsed, dict):
         raise ValueError(f"compose_course: expected dict, got {type(parsed).__name__}")
