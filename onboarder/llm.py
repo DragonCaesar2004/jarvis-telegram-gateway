@@ -1,6 +1,6 @@
 """Anthropic Claude API client for the onboarder pipeline.
 
-Three jobs:
+Four jobs:
     1. score_channels()   — rank candidate YouTube channels against criteria + topic
     2. select_videos()    — pick a coherent course of 6-12 videos from one channel's video list
     3. mark_cuts()        — given a Whisper transcript with word timestamps, return [(start_s, end_s, reason)]
@@ -9,13 +9,15 @@ Three jobs:
 
 Defaults to Sonnet 4.6 (cheap, fast, plenty smart for these classification tasks).
 Bump to Opus 4.7 for course composition if quality is insufficient.
+
+All functions accept `api_key` as the resolved string value. Caller resolves
+via onboarder._secrets.resolve(cfg, "anthropic_api_key", env="ANTHROPIC_API_KEY").
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("gateway")
@@ -28,22 +30,18 @@ DEFAULT_MODEL_QUALITY = "claude-opus-4-7"
 # Client
 # ---------------------------------------------------------------------------
 
-def _client(api_key_file: str) -> Any:
+def _client(api_key: str) -> Any:
     """Build an Anthropic client. Lazy import so gateway core doesn't need anthropic."""
     from anthropic import Anthropic
-    key_path = Path(api_key_file).expanduser()
-    if not key_path.exists():
-        raise FileNotFoundError(f"anthropic api key file not found: {key_path}")
-    api_key = key_path.read_text().strip()
     if not api_key:
-        raise ValueError(f"anthropic api key is empty: {key_path}")
+        raise ValueError("anthropic api key is empty")
     return Anthropic(api_key=api_key)
 
 
-def _call_json(api_key_file: str, *, model: str, system: str, user: str,
+def _call_json(api_key: str, *, model: str, system: str, user: str,
                max_tokens: int = 4096) -> Any:
     """Call Claude, expect JSON, return parsed object. Raises on parse failure."""
-    client = _client(api_key_file)
+    client = _client(api_key)
     resp = client.messages.create(
         model=model,
         max_tokens=max_tokens,
@@ -89,7 +87,7 @@ Return ONLY valid JSON, no prose:
 """
 
 
-def score_channels(api_key_file: str, *, topic: str, criteria: dict[str, Any],
+def score_channels(api_key: str, *, topic: str, criteria: dict[str, Any],
                    channels: list[dict[str, Any]], model: str = DEFAULT_MODEL_FAST) -> list[dict[str, Any]]:
     """Return list of {channel_id, score, reason} sorted by score desc.
 
@@ -100,7 +98,7 @@ def score_channels(api_key_file: str, *, topic: str, criteria: dict[str, Any],
     """
     user = json.dumps({"topic": topic, "criteria": criteria, "channels": channels},
                       ensure_ascii=False, indent=2)
-    parsed = _call_json(api_key_file, model=model, system=SCORE_CHANNELS_SYSTEM, user=user)
+    parsed = _call_json(api_key, model=model, system=SCORE_CHANNELS_SYSTEM, user=user)
     if not isinstance(parsed, list):
         raise ValueError(f"score_channels: expected list, got {type(parsed).__name__}")
     parsed.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -136,7 +134,7 @@ If the channel doesn't have enough on-topic material for a coherent 6+ video cou
 """
 
 
-def select_videos(api_key_file: str, *, topic: str, criteria: dict[str, Any],
+def select_videos(api_key: str, *, topic: str, criteria: dict[str, Any],
                   channel_name: str, videos: list[dict[str, Any]],
                   model: str = DEFAULT_MODEL_FAST) -> dict[str, Any]:
     """Return {course_title, lessons[]} or {course_title: null, lessons: [], skip_reason}.
@@ -149,7 +147,7 @@ def select_videos(api_key_file: str, *, topic: str, criteria: dict[str, Any],
         "topic": topic, "criteria": criteria,
         "channel_name": channel_name, "videos": videos,
     }, ensure_ascii=False, indent=2)
-    parsed = _call_json(api_key_file, model=model, system=SELECT_VIDEOS_SYSTEM, user=user,
+    parsed = _call_json(api_key, model=model, system=SELECT_VIDEOS_SYSTEM, user=user,
                         max_tokens=8192)
     if not isinstance(parsed, dict):
         raise ValueError(f"select_videos: expected dict, got {type(parsed).__name__}")
@@ -182,12 +180,12 @@ Use exact timestamps from the transcript. Cuts must not overlap. Empty list if n
 """
 
 
-def mark_cuts(api_key_file: str, *, course_topic: str, transcript: dict[str, Any],
+def mark_cuts(api_key: str, *, course_topic: str, transcript: dict[str, Any],
               model: str = DEFAULT_MODEL_FAST) -> list[dict[str, Any]]:
     """Return list of {start, end, reason} time ranges to remove."""
     user = json.dumps({"course_topic": course_topic, "transcript": transcript},
                       ensure_ascii=False)
-    parsed = _call_json(api_key_file, model=model, system=MARK_CUTS_SYSTEM, user=user,
+    parsed = _call_json(api_key, model=model, system=MARK_CUTS_SYSTEM, user=user,
                         max_tokens=4096)
     if not isinstance(parsed, list):
         raise ValueError(f"mark_cuts: expected list, got {type(parsed).__name__}")
@@ -216,7 +214,7 @@ Return ONLY valid JSON, no prose:
 """
 
 
-def compose_course(api_key_file: str, *, course_topic: str, course_title: str,
+def compose_course(api_key: str, *, course_topic: str, course_title: str,
                    channel_name: str, channel_description: str,
                    lesson_transcripts: list[str],
                    model: str = DEFAULT_MODEL_QUALITY) -> dict[str, str]:
@@ -232,7 +230,7 @@ def compose_course(api_key_file: str, *, course_topic: str, course_title: str,
         "channel_name": channel_name, "channel_description": channel_description,
         "lesson_transcripts": trimmed,
     }, ensure_ascii=False)
-    parsed = _call_json(api_key_file, model=model, system=COMPOSE_COURSE_SYSTEM, user=user,
+    parsed = _call_json(api_key, model=model, system=COMPOSE_COURSE_SYSTEM, user=user,
                         max_tokens=2048)
     if not isinstance(parsed, dict):
         raise ValueError(f"compose_course: expected dict, got {type(parsed).__name__}")

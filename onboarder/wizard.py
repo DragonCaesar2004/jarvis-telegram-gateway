@@ -165,18 +165,22 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
                        f"Тема: <b>{_html_escape(topic)}</b>\n"
                        f"Курсов: <b>{count}</b>\n\n"
                        "Это займёт ~10-20 минут. Можешь пока вернуться в чат с агентом "
-                       "(<code>/menu</code> → 💬 Чат), пришлю результат как будет готово.\n\n"
-                       "<i>(пока stub: реальная Phase 1 ещё не подключена)</i>"
+                       "(<code>/menu</code> → 💬 Чат), пришлю результат как будет готово."
                    ),
                    parse_mode="HTML")
         except Exception:
             pass
-        # TODO: launch background phase1 task here when phase1_discovery.py is implemented:
-        #   import threading
-        #   from . import phase1_discovery
-        #   threading.Thread(target=phase1_discovery.run,
-        #                    args=(token, agent, cfg, chat_id, user_id, topic, count),
-        #                    daemon=True).start()
+        try:
+            from . import phase1_discovery
+            phase1_discovery.launch(token, agent, cfg, chat_id, user_id, topic, count)
+        except Exception as e:
+            log.exception(f"[{agent}] failed to launch phase1: {e}")
+            try:
+                tg_api(token, "sendMessage", chat_id=chat_id,
+                       text=f"⚠️ Не удалось запустить Phase 1: {e}")
+            except Exception:
+                pass
+            _state.update(agent, user_id, step="error", error=str(e))
         return
 
     if action == "start_phase2":
