@@ -188,12 +188,16 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
         _state.update(agent, user_id, step=STEP_PHASE2_RUNNING)
         answer_callback_query(token, cq_id, "Phase 2 запущен")
         try:
-            tg_api(token, "sendMessage", chat_id=chat_id,
-                   text="🎬 <b>Phase 2 запущен.</b>\n\n<i>(stub)</i>",
-                   parse_mode="HTML")
-        except Exception:
-            pass
-        # TODO: launch background phase2 task
+            from . import phase2_production
+            phase2_production.launch(token, agent, cfg, chat_id, user_id)
+        except Exception as e:
+            log.exception(f"[{agent}] failed to launch phase2: {e}")
+            try:
+                tg_api(token, "sendMessage", chat_id=chat_id,
+                       text=f"⚠️ Не удалось запустить Phase 2: {e}")
+            except Exception:
+                pass
+            _state.update(agent, user_id, step="error", error=str(e))
         return
 
     answer_callback_query(token, cq_id)
