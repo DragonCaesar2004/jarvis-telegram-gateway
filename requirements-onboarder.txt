@@ -1,0 +1,11 @@
+# Onboarder pipeline dependencies (separate from core gateway).
+# Install on VPS only when wizard mode is enabled:
+#   pip install -r requirements-onboarder.txt
+
+gspread>=6.0.0           # Google Sheets I/O
+google-auth>=2.20.0      # Service account auth
+yt-dlp>=2025.1.0         # YouTube search + download
+openai>=1.50.0           # Whisper transcription API
+anthropic>=0.40.0        # Claude API for scoring/classification
+elevenlabs>=1.0.0        # Dubbing API
+requests>=2.31.0         # already in core requirements.txt — pin here for clarity
