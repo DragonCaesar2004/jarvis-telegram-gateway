@@ -34,7 +34,21 @@
         "silvana",
         "сильвана"
       ],
-      "topic_routing": {}
+      "topic_routing": {},
+      "_onboarder_comment": "Wizard pipeline for YouTube → course onboarding. Toggled by /menu → 🎓 Новый курс. When 'enabled' is false, the button is hidden.",
+      "onboarder": {
+        "enabled": false,
+        "google_sheet_id": "",
+        "google_service_account_file": "~/.secrets/google-sheets-sa.json",
+        "nms_endpoint": "https://truelifeflow.com",
+        "nms_api_token_file": "~/.secrets/nms-agent-token",
+        "openai_api_key_file": "~/.secrets/openai.key",
+        "elevenlabs_api_key_file": "~/.secrets/elevenlabs.key",
+        "bunny_stream_library_id": "",
+        "bunny_stream_api_key_file": "~/.secrets/bunny-stream.key",
+        "scratch_dir": "/tmp/onboarder",
+        "phase2_parallel_videos": 1
+      }
     },
     "kaelthas": {
       "_role": "marketer -- offers, positioning, content strategy, funnels",

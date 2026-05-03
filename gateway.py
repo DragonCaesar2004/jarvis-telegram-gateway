@@ -1307,7 +1307,38 @@ def delete_message(token: str, chat_id: int, message_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Commands (/status, /reset, /new, /compact, /stop, /help)
+# Mode state (chat | wizard) -- per (agent, user_id)
+# ---------------------------------------------------------------------------
+
+MODE_CHAT = "chat"
+MODE_WIZARD = "wizard"
+
+
+def _mode_file(agent: str, user_id: int) -> Path:
+    return STATE_DIR / f"mode-{agent}-{user_id}.txt"
+
+
+def get_user_mode(agent: str, user_id: int) -> str:
+    """Return current mode for a user. Default: chat (existing Claude behavior)."""
+    f = _mode_file(agent, user_id)
+    if not f.exists():
+        return MODE_CHAT
+    val = f.read_text().strip()
+    return val if val in (MODE_CHAT, MODE_WIZARD) else MODE_CHAT
+
+
+def set_user_mode(agent: str, user_id: int, mode: str) -> None:
+    if mode not in (MODE_CHAT, MODE_WIZARD):
+        raise ValueError(f"invalid mode: {mode}")
+    f = _mode_file(agent, user_id)
+    if mode == MODE_CHAT:
+        f.unlink(missing_ok=True)
+    else:
+        f.write_text(mode)
+
+
+# ---------------------------------------------------------------------------
+# Commands (/status, /reset, /new, /compact, /stop, /menu, /help)
 # ---------------------------------------------------------------------------
 
 def _get_workspace(agent: str, cfg: dict) -> str:
@@ -1571,15 +1602,58 @@ def handle_command(token: str, chat_id: int, agent: str, cmd: str, args: str, cf
         log.info(f"[{agent}] /model switched to {alias} ({new_model}) persisted={persisted}")
         return True
 
+    if cmd == "/menu":
+        # Onboarder is opt-in: only show wizard button when configured
+        from_user = (cfg.get("_last_message_from_user") or {})  # set by process_update
+        user_id = from_user.get("id", chat_id)
+        onboarder_cfg = (cfg.get("onboarder") or {})
+        onboarder_enabled = bool(onboarder_cfg.get("enabled"))
+
+        rows: list[list[dict[str, str]]] = []
+        rows.append([{"text": "💬 Чат с агентом", "callback_data": "menu:chat"}])
+        if onboarder_enabled:
+            rows.append([{"text": "🎓 Новый курс", "callback_data": "menu:onboard"}])
+        rows.append([{"text": "📊 Статус", "callback_data": "menu:status"}])
+
+        current_mode = get_user_mode(agent, user_id)
+        text = (
+            f"<b>Меню</b>\n\n"
+            f"Текущий режим: <code>{current_mode}</code>\n\n"
+            "Выбери действие:"
+        )
+        send_message_with_buttons(token, chat_id, text, rows)
+        return True
+
+    if cmd == "/cancel":
+        from_user = (cfg.get("_last_message_from_user") or {})
+        user_id = from_user.get("id", chat_id)
+        prev = get_user_mode(agent, user_id)
+        set_user_mode(agent, user_id, MODE_CHAT)
+        # Clear wizard state if any
+        try:
+            from onboarder import wizard as _wiz
+            _wiz.clear_wizard_state(agent, user_id)
+        except Exception:
+            pass
+        text = "<b>Окей, обратно в чат с агентом.</b>" if prev != MODE_CHAT else "<b>Уже в режиме чата.</b>"
+        try:
+            tg_api(token, "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML")
+        except Exception:
+            pass
+        return True
+
     if cmd == "/help":
+        onboarder_enabled = bool((cfg.get("onboarder") or {}).get("enabled"))
+        wizard_line = "<code>/menu</code> -- меню (включая 🎓 Новый курс)\n" if onboarder_enabled else ""
         text = (
             "<b>gateway commands</b>\n\n"
-            "<code>/stop</code> or <code>/cancel</code> -- stop current agent task\n"
+            "<code>/stop</code> or <code>/cancel</code> -- stop current agent task / выход из wizard\n"
             "<code>/status</code> -- session and memory status\n"
             "<code>/reset</code> -- reset session (saves important to MEMORY)\n"
             "<code>/reset force</code> -- reset without saving\n"
             "<code>/compact</code> -- manual memory compaction\n"
             "<code>/model sonnet|opus|haiku</code> -- switch LLM model\n"
+            f"{wizard_line}"
             "<code>/help</code> -- this help\n\n"
             "<i>auto-compact: daily 05:00 UTC</i>"
         )
@@ -2778,13 +2852,36 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
     text = (msg.get("text") or msg.get("caption") or "").strip()
     message_id = msg.get("message_id")
 
-    # Handle gateway commands (/status, /reset, /help, /new) -- don't go to claude
+    # Stash sender info on cfg so handle_command() can read user_id / username.
+    # Cleared after dispatch to avoid leaking between messages.
+    cfg["_last_message_from_user"] = msg.get("from") or {}
+
+    # Handle gateway commands (/status, /reset, /help, /new, /menu, /cancel) -- don't go to claude
     if text.startswith("/"):
         parts = text.split(None, 1)
         cmd = parts[0].lower()
         args = parts[1] if len(parts) > 1 else ""
         if handle_command(token, chat_id, agent, cmd, args, cfg):
             log.info(f"[{agent}] command: {cmd} {args}".strip())
+            cfg.pop("_last_message_from_user", None)
+            return
+
+    # Mode router: if user is in wizard mode, dispatch to onboarder, skip Claude.
+    # Default mode is chat (existing behavior).
+    if user_id is not None:
+        mode = get_user_mode(agent, user_id)
+        if mode == MODE_WIZARD:
+            try:
+                from onboarder import wizard as _wizard
+                _wizard.handle_wizard_message(token, agent, cfg, chat_id, user_id, text, msg)
+            except Exception as e:
+                log.exception(f"[{agent}] wizard handler error: {e}")
+                try:
+                    tg_api(token, "sendMessage", chat_id=chat_id,
+                           text=f"⚠️ Wizard error: {e}\nUse /cancel to return to chat.")
+                except Exception:
+                    pass
+            cfg.pop("_last_message_from_user", None)
             return
 
     # Classify source for memory extraction provenance
@@ -3452,6 +3549,67 @@ def _start_webhook_server(
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _menu_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> None:
+    """Handle inline buttons from /menu (callback_data: 'menu:chat' | 'menu:onboard' | 'menu:status')."""
+    cq_id = cq.get("id", "")
+    data = cq.get("data", "")
+    msg = cq.get("message") or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    user_id = (cq.get("from") or {}).get("id")
+    if chat_id is None or user_id is None:
+        answer_callback_query(token, cq_id)
+        return
+
+    action = data.split(":", 1)[1] if ":" in data else ""
+
+    if action == "chat":
+        set_user_mode(agent, user_id, MODE_CHAT)
+        try:
+            from onboarder import wizard as _wiz
+            _wiz.clear_wizard_state(agent, user_id)
+        except Exception:
+            pass
+        answer_callback_query(token, cq_id, "Режим: чат с агентом")
+        try:
+            tg_api(token, "sendMessage", chat_id=chat_id,
+                   text="<b>💬 Чат с агентом активен.</b>\nПиши как обычно.",
+                   parse_mode="HTML")
+        except Exception:
+            pass
+        return
+
+    if action == "onboard":
+        if not (cfg.get("onboarder") or {}).get("enabled"):
+            answer_callback_query(token, cq_id, "Онбордер выключен в config.json", show_alert=True)
+            return
+        set_user_mode(agent, user_id, MODE_WIZARD)
+        answer_callback_query(token, cq_id, "Запускаю wizard…")
+        try:
+            from onboarder import wizard as _wiz
+            _wiz.start_wizard(token, agent, cfg, chat_id, user_id)
+        except Exception as e:
+            log.exception(f"[{agent}] start_wizard failed: {e}")
+            try:
+                tg_api(token, "sendMessage", chat_id=chat_id,
+                       text=f"⚠️ Не удалось запустить wizard: {e}")
+            except Exception:
+                pass
+        return
+
+    if action == "status":
+        # Reuse /status text path
+        from_msg = {"chat": {"id": chat_id}, "from": {"id": user_id}}
+        cfg["_last_message_from_user"] = from_msg["from"]
+        try:
+            handle_command(token, chat_id, agent, "/status", "", cfg)
+        finally:
+            cfg.pop("_last_message_from_user", None)
+        answer_callback_query(token, cq_id)
+        return
+
+    answer_callback_query(token, cq_id)
+
+
 def main() -> None:
     if not CONFIG_PATH.exists():
         log.error(f"config not found: {CONFIG_PATH}")
@@ -3470,6 +3628,16 @@ def main() -> None:
     if not agents:
         log.error("no enabled agents in config")
         sys.exit(1)
+
+    # Register inline-keyboard handlers for /menu (chat | onboard | status)
+    register_callback_handler("menu:", _menu_callback_handler)
+    try:
+        from onboarder import wizard as _wiz
+        _wiz.register_callbacks(register_callback_handler)
+    except ImportError:
+        log.info("onboarder module not present; wizard mode disabled")
+    except Exception as e:
+        log.warning(f"onboarder.wizard.register_callbacks failed: {e}")
 
     log.info(
         f"gateway started (producer-consumer), "
