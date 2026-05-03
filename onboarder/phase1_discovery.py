@@ -110,6 +110,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
           f"📊 Найдено {len(candidates)} каналов. Проверяю метаданные топ-{len(pool)}…")
 
     enriched: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []  # for diagnostic on empty result
     last_progress = time.time()
     for idx, ch in enumerate(pool):
         meta = ytdl.get_channel_metadata(ch["channel_id"])
@@ -118,6 +119,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         if not _passes_hard_filter(meta, criteria):
             log.info(f"phase1[{user_id}] filter out: {meta['channel_name']} "
                      f"(subs={meta['subscribers']}, videos={meta['video_count']})")
+            rejected.append(meta)
             continue
         enriched.append({**meta, "votes": ch.get("votes", 0),
                          "sample_titles": ch.get("sample_titles", [])})
@@ -126,10 +128,19 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
             last_progress = time.time()
 
     if not enriched:
+        diag = ""
+        if rejected:
+            sample = sorted(rejected, key=lambda m: m.get("subscribers", 0), reverse=True)[:5]
+            lines = [f"  • {m.get('channel_name', '?')[:40]}: "
+                     f"{m.get('subscribers', 0):,} subs, "
+                     f"{m.get('video_count', 0)} videos"
+                     for m in sample]
+            diag = "\nПримеры отфильтрованных каналов:\n" + "\n".join(lines)
         raise RuntimeError(
             f"После фильтрации (subs {criteria.get('min_subscribers')}-{criteria.get('max_subscribers')}, "
             f"videos {criteria.get('min_videos_on_channel')}-{criteria.get('max_videos_on_channel')}) "
-            f"не осталось каналов. Расширь критерии в Sheet'е (таб Criteria)."
+            f"не осталось каналов.{diag}\n\n"
+            f"Tip: оставь поле Значение пустым в Sheet'е → лимит снимется."
         )
 
     # ── 5. Claude scores remaining channels ──────────────────────────────
@@ -232,15 +243,29 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
 # ---------------------------------------------------------------------------
 
 def _passes_hard_filter(meta: dict[str, Any], criteria: dict[str, Any]) -> bool:
+    """Apply min/max subs and video_count gates. 0/empty in Criteria = no limit."""
     subs = meta.get("subscribers", 0) or 0
     vids = meta.get("video_count", 0) or 0
-    if subs and criteria.get("min_subscribers") and subs < criteria["min_subscribers"]:
+
+    def _limit(key: str) -> int:
+        v = criteria.get(key)
+        try:
+            return int(v) if v else 0
+        except (TypeError, ValueError):
+            return 0
+
+    min_subs = _limit("min_subscribers")
+    max_subs = _limit("max_subscribers")
+    min_vids = _limit("min_videos_on_channel")
+    max_vids = _limit("max_videos_on_channel")
+
+    if min_subs and subs and subs < min_subs:
         return False
-    if subs and criteria.get("max_subscribers") and subs > criteria["max_subscribers"]:
+    if max_subs and subs and subs > max_subs:
         return False
-    if criteria.get("min_videos_on_channel") and vids < criteria["min_videos_on_channel"]:
+    if min_vids and vids and vids < min_vids:
         return False
-    if criteria.get("max_videos_on_channel") and vids > criteria["max_videos_on_channel"]:
+    if max_vids and vids and vids > max_vids:
         return False
     return True
 
