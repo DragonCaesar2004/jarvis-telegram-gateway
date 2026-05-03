@@ -30,9 +30,10 @@ from . import _secrets, llm, sheets, state as _state, youtube_dl as ytdl
 
 log = logging.getLogger("gateway")
 
-# Tuning knobs (could be moved to config later)
-SEARCH_RESULTS = 30
-CHANNEL_CANDIDATES_MULTIPLIER = 3   # consider 3*N channels before scoring
+# Tuning knobs (some now overridable via Criteria)
+DEFAULT_SEARCH_RESULTS = 50   # criteria.search_results overrides
+TARGET_PASSING_PER_COURSE = 4  # try to get this many passing channels per course
+HARD_CAP_CHANNELS_TO_CHECK = 50  # absolute ceiling on metadata fetches
 MIN_LLM_SCORE = 0.5
 CHANNEL_VIDEOS_TO_LIST = 50
 PROGRESS_INTERVAL_SEC = 30  # don't spam Telegram
@@ -96,24 +97,28 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                   sheet_url=sheets.sheet_tab_url(sheet_id))
 
     # ── 3. yt-dlp search → unique channels ───────────────────────────────
+    search_results = _criteria_int(criteria, "search_results", DEFAULT_SEARCH_RESULTS)
     _send(token, chat_id, f"🔎 <i>Ищу каналы по теме «{_html_escape(topic)}»…</i>")
-    videos = ytdl.search_videos(topic, max_results=SEARCH_RESULTS)
+    videos = ytdl.search_videos(topic, max_results=search_results)
     if not videos:
         raise RuntimeError(f"yt-dlp search returned 0 results for '{topic}'")
     candidates = ytdl.unique_channels_from_search(videos)
-    log.info(f"phase1[{user_id}] {len(candidates)} unique channel candidates")
+    log.info(f"phase1[{user_id}] {len(candidates)} unique channel candidates from {len(videos)} videos")
 
-    # ── 4. Hard filter on top 3*N channels ───────────────────────────────
-    pool_size = max(count * CHANNEL_CANDIDATES_MULTIPLIER, count + 5)
-    pool = candidates[:pool_size]
+    # ── 4. Greedy filter: scan candidates until we have enough passing ───
+    target_passing = max(count * TARGET_PASSING_PER_COURSE, count + 3)
+    cap = min(len(candidates), HARD_CAP_CHANNELS_TO_CHECK)
     _send(token, chat_id,
-          f"📊 Найдено {len(candidates)} каналов. Проверяю метаданные топ-{len(pool)}…")
+          f"📊 Найдено {len(candidates)} каналов в выдаче. "
+          f"Проверяю метаданные (цель: {target_passing} прошедших фильтр, лимит: {cap})…")
 
     enriched: list[dict[str, Any]] = []
-    rejected: list[dict[str, Any]] = []  # for diagnostic on empty result
+    rejected: list[dict[str, Any]] = []
     last_progress = time.time()
-    for idx, ch in enumerate(pool):
+    checked = 0
+    for ch in candidates[:cap]:
         meta = ytdl.get_channel_metadata(ch["channel_id"])
+        checked += 1
         if not meta:
             continue
         if not _passes_hard_filter(meta, criteria):
@@ -124,23 +129,30 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         enriched.append({**meta, "votes": ch.get("votes", 0),
                          "sample_titles": ch.get("sample_titles", [])})
         if time.time() - last_progress > PROGRESS_INTERVAL_SEC:
-            _send(token, chat_id, f"… проверено {idx+1}/{len(pool)}, прошло фильтр: {len(enriched)}")
+            _send(token, chat_id,
+                  f"… проверено {checked}/{cap}, прошло фильтр: {len(enriched)}")
             last_progress = time.time()
+        if len(enriched) >= target_passing:
+            log.info(f"phase1[{user_id}] reached target {target_passing} passing channels, stop scanning")
+            break
 
     if not enriched:
         diag = ""
         if rejected:
-            sample = sorted(rejected, key=lambda m: m.get("subscribers", 0), reverse=True)[:5]
+            sample = sorted(rejected, key=lambda m: m.get("subscribers", 0))[:5]
             lines = [f"  • {m.get('channel_name', '?')[:40]}: "
                      f"{m.get('subscribers', 0):,} subs, "
                      f"{m.get('video_count', 0)} videos"
                      for m in sample]
-            diag = "\nПримеры отфильтрованных каналов:\n" + "\n".join(lines)
+            diag = (f"\n\nПроверено {checked} каналов из {len(candidates)} найденных. "
+                    f"Самые мелкие из отклонённых:\n" + "\n".join(lines))
         raise RuntimeError(
-            f"После фильтрации (subs {criteria.get('min_subscribers')}-{criteria.get('max_subscribers')}, "
-            f"videos {criteria.get('min_videos_on_channel')}-{criteria.get('max_videos_on_channel')}) "
-            f"не осталось каналов.{diag}\n\n"
-            f"Tip: оставь поле Значение пустым в Sheet'е → лимит снимется."
+            f"Ни один канал не прошёл фильтр "
+            f"(subs {criteria.get('min_subscribers')}-{criteria.get('max_subscribers')}, "
+            f"videos {criteria.get('min_videos_on_channel')}-{criteria.get('max_videos_on_channel')})."
+            f"{diag}\n\n"
+            f"Tip: бамп <code>search_results</code> в Criteria до 100-200, чтобы yt-dlp "
+            f"копал глубже в выдачу — мелкие каналы там обычно дальше топа."
         )
 
     # ── 5. Claude scores remaining channels ──────────────────────────────
@@ -241,6 +253,17 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _criteria_int(criteria: dict[str, Any], key: str, default: int = 0) -> int:
+    """Read an integer-valued criterion, falling back to `default` if missing/blank/invalid."""
+    v = criteria.get(key)
+    if v in (None, ""):
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
 
 def _passes_hard_filter(meta: dict[str, Any], criteria: dict[str, Any]) -> bool:
     """Apply min/max subs and video_count gates.
