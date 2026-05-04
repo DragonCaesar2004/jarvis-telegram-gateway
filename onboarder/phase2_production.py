@@ -327,7 +327,9 @@ def _process_one_video(*, token: str, chat_id: int, prefix: str,
     _send(token, chat_id, f"📝 {prefix}: транскрибация для разметки вырезок…")
     working = whisper.transcribe(api_key=openai_key, file_path=raw_path,
                                  with_word_timestamps=True)
-    detected_lang = (working.get("language") or "").lower()
+    # Normalise full language name → ISO 639-1 ("english" → "en", "russian" → "ru")
+    from .elevenlabs_dub import _iso as _lang_iso
+    detected_lang = _lang_iso((working.get("language") or "").lower())
 
     # 3. LLM marks cuts
     cuts = llm.mark_cuts(course_topic=course_topic, transcript=working)
