@@ -32,6 +32,19 @@ class DubError(RuntimeError):
     pass
 
 
+_LANG_NAME_TO_ISO: dict[str, str] = {
+    "english": "en", "russian": "ru", "spanish": "es", "french": "fr",
+    "german": "de", "portuguese": "pt", "italian": "it", "chinese": "zh",
+    "japanese": "ja", "korean": "ko", "arabic": "ar", "hindi": "hi",
+    "turkish": "tr", "polish": "pl", "dutch": "nl", "ukrainian": "uk",
+}
+
+
+def _iso(lang: str) -> str:
+    """Normalise full language name → ISO 639-1 code ('english' → 'en')."""
+    return _LANG_NAME_TO_ISO.get(lang.lower(), lang.lower())
+
+
 def submit_dub(*, api_key: str, file_path: str | Path,
                source_lang: str, target_lang: str = "en",
                name: str | None = None,
@@ -52,6 +65,8 @@ def submit_dub(*, api_key: str, file_path: str | Path,
     if name:
         fields["name"] = name
 
+    source_lang = _iso(source_lang)
+    target_lang = _iso(target_lang)
     log.info(f"elevenlabs: submitting dub {p.name}, {source_lang} → {target_lang}")
     try:
         with p.open("rb") as f:
