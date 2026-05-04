@@ -52,11 +52,17 @@ def start_wizard(token: str, agent: str, cfg: dict, chat_id: int, user_id: int) 
 def start_cookies_upload(token: str, agent: str, cfg: dict, chat_id: int, user_id: int) -> None:
     """Enter the wizard 'awaiting cookies file' state.
 
-    Bot waits for the next message with a document attachment, validates it as a
-    Netscape-format cookies.txt, and saves it to onboarder.youtube_cookies_file.
+    Preserves existing run state (sheet_tab, run_id, step) so that uploading
+    cookies during an active Phase 1/Phase 2 run doesn't wipe the run context.
     """
-    _state.clear(agent, user_id)
-    _state.save(agent, user_id, {"step": STEP_AWAITING_COOKIES, "chat_id": chat_id})
+    existing = _state.load(agent, user_id)
+    # Stash the previous step so we can restore it after upload
+    _state.save(agent, user_id, {
+        **existing,
+        "_prev_step": existing.get("step"),
+        "step": STEP_AWAITING_COOKIES,
+        "chat_id": chat_id,
+    })
     _send(token, chat_id,
           "📎 <b>Загрузка YouTube cookies</b>\n\n"
           "Отправь следующим сообщением файл <code>cookies.txt</code> "
@@ -313,11 +319,32 @@ def _handle_cookies_upload(token: str, agent: str, cfg: dict,
 
     size_kb = target_path.stat().st_size / 1024
     line_count = sum(1 for _ in target_path.open("r", errors="replace"))
-    clear_wizard_state(agent, user_id)
-    set_user_mode(agent, user_id, MODE_CHAT)
-    _send(token, chat_id,
-          f"✅ <b>Cookies сохранены.</b>\n\n"
-          f"Путь: <code>{target_path}</code>\n"
-          f"Размер: {size_kb:.1f} KB, строк: {line_count}\n\n"
-          f"Следующий запуск Phase 2 будет использовать этот файл.\n"
-          f"Возвращаюсь в чат с агентом.")
+
+    # Restore previous run state — don't wipe sheet_tab / run_id
+    st = _state.load(agent, user_id)
+    prev_step = st.pop("_prev_step", None)
+    if prev_step and prev_step not in (STEP_AWAITING_COOKIES, STEP_DONE, "error", ""):
+        # There was an active run — restore it
+        st["step"] = prev_step
+        _state.save(agent, user_id, st)
+        # Stay in wizard mode so user can continue
+        confirm_text = (
+            f"✅ <b>Cookies обновлены.</b>\n\n"
+            f"Размер: {size_kb:.1f} KB, строк: {line_count}\n\n"
+        )
+        if prev_step == STEP_AWAITING_APPROVAL:
+            confirm_text += "Подборка в Sheet всё ещё ждёт тебя. Нажми кнопку чтобы запустить обработку:"
+            _send_with_buttons(token, chat_id, confirm_text,
+                               [[{"text": "🚀 Запустить обработку", "callback_data": "wiz:start_phase2"},
+                                 {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]])
+        else:
+            _send(token, chat_id, confirm_text + f"Продолжаю с шага: <code>{prev_step}</code>.")
+    else:
+        # No active run — clear state and return to chat
+        clear_wizard_state(agent, user_id)
+        set_user_mode(agent, user_id, MODE_CHAT)
+        _send(token, chat_id,
+              f"✅ <b>Cookies сохранены.</b>\n\n"
+              f"Размер: {size_kb:.1f} KB, строк: {line_count}\n\n"
+              f"Следующий запуск Phase 2 будет использовать этот файл.\n"
+              f"Возвращаюсь в чат с агентом.")
