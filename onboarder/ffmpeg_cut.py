@@ -23,6 +23,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Iterable
@@ -37,6 +38,19 @@ class FFmpegError(RuntimeError):
 def _check_tool(name: str) -> None:
     if shutil.which(name) is None:
         raise FFmpegError(f"{name!r} not found in PATH — apt install {name}")
+
+
+def _ytdlp_cmd() -> list[str]:
+    """Resolve yt-dlp invocation: CLI if on PATH, else `python -m yt_dlp`.
+
+    Systemd-run services often don't have the venv's bin/ on PATH, so the
+    CLI 'yt-dlp' lookup fails. The Python module is always available because
+    it's installed in the same venv that runs gateway.
+    """
+    cli = shutil.which("yt-dlp")
+    if cli:
+        return [cli]
+    return [sys.executable, "-m", "yt_dlp"]
 
 
 def probe_duration(path: str | Path) -> float:
@@ -64,14 +78,12 @@ def download_video(*, url: str, output_path: str | Path,
 
     Format selector: best video up to max_height + best audio, merge to MP4.
     """
-    _check_tool("yt-dlp")
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     fmt = f"bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
     log.info(f"yt-dlp: download {url} → {out}")
     r = subprocess.run(
-        [
-            "yt-dlp",
+        _ytdlp_cmd() + [
             "-f", fmt,
             "--merge-output-format", "mp4",
             "--no-playlist",
