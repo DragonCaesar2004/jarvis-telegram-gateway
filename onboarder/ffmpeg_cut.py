@@ -97,6 +97,7 @@ def download_video(*, url: str, output_path: str | Path,
         "--merge-output-format", "mp4",
         "--no-playlist",
         "--no-warnings",
+        "--remote-components", "ejs:github",  # EJS challenge solver (needed for 2025+ YouTube)
         "-o", str(out),
     ]
     if cookies_file:
@@ -108,7 +109,13 @@ def download_video(*, url: str, output_path: str | Path,
     if proxy:
         args.extend(["--proxy", proxy])
     args.append(url)
-    r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    # Ensure deno is on PATH for ejs challenge solving
+    env = os.environ.copy()
+    home = str(Path.home())
+    deno_bin = f"{home}/.deno/bin"
+    if deno_bin not in env.get("PATH", ""):
+        env["PATH"] = f"{deno_bin}:{env.get('PATH', '')}"
+    r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
     if r.returncode != 0:
         raise FFmpegError(f"yt-dlp failed: {r.stderr[-500:]}")
     if not out.exists():
