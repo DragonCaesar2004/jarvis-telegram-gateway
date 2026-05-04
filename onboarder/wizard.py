@@ -32,6 +32,7 @@ STEP_PHASE1_RUNNING = "phase1_running"
 STEP_AWAITING_APPROVAL = "awaiting_approval"
 STEP_PHASE2_RUNNING = "phase2_running"
 STEP_DONE = "done"
+STEP_AWAITING_COOKIES = "awaiting_cookies"  # bot is waiting for a cookies.txt upload
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,26 @@ def start_wizard(token: str, agent: str, cfg: dict, chat_id: int, user_id: int) 
           "<i>/cancel — выход в чат с агентом.</i>")
 
 
+def start_cookies_upload(token: str, agent: str, cfg: dict, chat_id: int, user_id: int) -> None:
+    """Enter the wizard 'awaiting cookies file' state.
+
+    Bot waits for the next message with a document attachment, validates it as a
+    Netscape-format cookies.txt, and saves it to onboarder.youtube_cookies_file.
+    """
+    _state.clear(agent, user_id)
+    _state.save(agent, user_id, {"step": STEP_AWAITING_COOKIES, "chat_id": chat_id})
+    _send(token, chat_id,
+          "📎 <b>Загрузка YouTube cookies</b>\n\n"
+          "Отправь следующим сообщением файл <code>cookies.txt</code> "
+          "(Netscape-format) — прикрепи его как документ.\n\n"
+          "<b>Как получить файл:</b>\n"
+          "1. Поставь расширение <i>Get cookies.txt LOCALLY</i> в Chrome/Edge\n"
+          "2. Открой youtube.com (залогинен)\n"
+          "3. Иконка расширения → Export As → cookies.txt\n"
+          "4. Перетащи скачанный файл сюда\n\n"
+          "<i>/cancel — отмена.</i>")
+
+
 def clear_wizard_state(agent: str, user_id: int) -> None:
     _state.clear(agent, user_id)
 
@@ -62,6 +83,10 @@ def handle_wizard_message(token: str, agent: str, cfg: dict, chat_id: int,
         return
 
     step = st.get("step", STEP_ASK_TOPIC)
+
+    if step == STEP_AWAITING_COOKIES:
+        _handle_cookies_upload(token, agent, cfg, chat_id, user_id, msg)
+        return
 
     if step == STEP_ASK_TOPIC:
         topic = text.strip()
@@ -227,3 +252,72 @@ def _html_escape(s: str) -> str:
          .replace("<", "&lt;")
          .replace(">", "&gt;")
     )
+
+
+# ---------------------------------------------------------------------------
+# Cookie upload handler
+# ---------------------------------------------------------------------------
+
+def _handle_cookies_upload(token: str, agent: str, cfg: dict,
+                           chat_id: int, user_id: int, msg: dict) -> None:
+    """Save attached document as YouTube cookies.txt at the configured path."""
+    from gateway import download_telegram_file, set_user_mode, MODE_CHAT  # type: ignore
+    import os
+    import shutil
+    from pathlib import Path
+
+    doc = msg.get("document")
+    if not doc:
+        _send(token, chat_id,
+              "Жду файл прикреплением (как документ). Просто текст не подходит. "
+              "Если передумал — /cancel.")
+        return
+
+    file_id = doc.get("file_id")
+    file_name = doc.get("file_name") or "cookies.txt"
+    if not file_id:
+        _send(token, chat_id, "⚠️ Не удалось прочитать file_id. Попробуй ещё раз.")
+        return
+
+    onb = (cfg.get("onboarder") or {})
+    target = onb.get("youtube_cookies_file") or "~/.secrets/youtube-cookies.txt"
+    target_path = Path(target).expanduser()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    local = download_telegram_file(token, file_id, "document", file_name)
+    if not local:
+        _send(token, chat_id, "⚠️ Не смог скачать файл из Telegram (>20MB или ошибка сети).")
+        return
+
+    # Validate: Netscape cookies.txt starts with `# Netscape HTTP Cookie File`
+    # or at least has tab-separated YouTube domain entries.
+    try:
+        head = local.read_text(errors="replace")[:4096]
+    except Exception as e:
+        _send(token, chat_id, f"⚠️ Не смог прочитать файл: {e}")
+        return
+
+    if "youtube.com" not in head and "Netscape" not in head:
+        _send(token, chat_id,
+              "⚠️ Файл не похож на Netscape cookies.txt от youtube.com "
+              "(не нашёл ни 'Netscape', ни 'youtube.com' в первых 4KB). "
+              "Перепроверь, что экспортировал именно с youtube.com.")
+        return
+
+    try:
+        shutil.move(str(local), str(target_path))
+        os.chmod(target_path, 0o600)
+    except Exception as e:
+        _send(token, chat_id, f"⚠️ Не смог сохранить файл в {target_path}: {e}")
+        return
+
+    size_kb = target_path.stat().st_size / 1024
+    line_count = sum(1 for _ in target_path.open("r", errors="replace"))
+    clear_wizard_state(agent, user_id)
+    set_user_mode(agent, user_id, MODE_CHAT)
+    _send(token, chat_id,
+          f"✅ <b>Cookies сохранены.</b>\n\n"
+          f"Путь: <code>{target_path}</code>\n"
+          f"Размер: {size_kb:.1f} KB, строк: {line_count}\n\n"
+          f"Следующий запуск Phase 2 будет использовать этот файл.\n"
+          f"Возвращаюсь в чат с агентом.")

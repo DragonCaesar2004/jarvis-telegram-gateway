@@ -1613,6 +1613,7 @@ def handle_command(token: str, chat_id: int, agent: str, cmd: str, args: str, cf
         rows.append([{"text": "💬 Чат с агентом", "callback_data": "menu:chat"}])
         if onboarder_enabled:
             rows.append([{"text": "🎓 Новый курс", "callback_data": "menu:onboard"}])
+            rows.append([{"text": "📎 Загрузить YouTube cookies", "callback_data": "menu:cookies"}])
         rows.append([{"text": "📊 Статус", "callback_data": "menu:status"}])
 
         current_mode = get_user_mode(agent, user_id)
@@ -3592,6 +3593,24 @@ def _menu_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> None:
             try:
                 tg_api(token, "sendMessage", chat_id=chat_id,
                        text=f"⚠️ Не удалось запустить wizard: {e}")
+            except Exception:
+                pass
+        return
+
+    if action == "cookies":
+        if not (cfg.get("onboarder") or {}).get("enabled"):
+            answer_callback_query(token, cq_id, "Онбордер выключен в config.json", show_alert=True)
+            return
+        set_user_mode(agent, user_id, MODE_WIZARD)
+        answer_callback_query(token, cq_id, "Жду файл cookies.txt…")
+        try:
+            from onboarder import wizard as _wiz
+            _wiz.start_cookies_upload(token, agent, cfg, chat_id, user_id)
+        except Exception as e:
+            log.exception(f"[{agent}] start_cookies_upload failed: {e}")
+            try:
+                tg_api(token, "sendMessage", chat_id=chat_id,
+                       text=f"⚠️ Не удалось запустить загрузку cookies: {e}")
             except Exception:
                 pass
         return
