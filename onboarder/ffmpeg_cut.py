@@ -74,7 +74,8 @@ def probe_duration(path: str | Path) -> float:
 
 def download_video(*, url: str, output_path: str | Path,
                    max_height: int = 1080, timeout: int = 1800,
-                   cookies_file: str | None = None) -> Path:
+                   cookies_file: str | None = None,
+                   proxy: str | None = None) -> Path:
     """Download MP4 via yt-dlp. Returns the actual output path.
 
     Format selector: best video up to max_height + best audio, merge to MP4.
@@ -82,11 +83,15 @@ def download_video(*, url: str, output_path: str | Path,
     `cookies_file`: optional Netscape-format cookies.txt. Required when YouTube
     starts demanding "Sign in to confirm you're not a bot" (datacenter IPs hit
     this fast). Export via a browser extension on a logged-in machine.
+
+    `proxy`: optional URL like 'http://user:pass@host:port' or 'socks5://host:port'.
+    Required for production downloads from VPS — YouTube blocks datacenter IPs
+    even with valid cookies+PO Token.
     """
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     fmt = f"bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
-    log.info(f"yt-dlp: download {url} → {out}")
+    log.info(f"yt-dlp: download {url} → {out} (proxy={'yes' if proxy else 'no'})")
     args = _ytdlp_cmd() + [
         "-f", fmt,
         "--merge-output-format", "mp4",
@@ -100,6 +105,8 @@ def download_video(*, url: str, output_path: str | Path,
             args.extend(["--cookies", str(cookies_path)])
         else:
             log.warning(f"yt-dlp: cookies file {cookies_path} missing, downloading without")
+    if proxy:
+        args.extend(["--proxy", proxy])
     args.append(url)
     r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
