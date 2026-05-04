@@ -73,6 +73,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
     if not sheet_id:
         raise RuntimeError("config: onboarder.google_sheet_id not set")
     openai_key = _secrets.resolve(onb, "openai_api_key", env="OPENAI_API_KEY")
+    youtube_cookies_file = onb.get("youtube_cookies_file") or None
     bunny_lib = str(onb.get("bunny_stream_library_id") or "").strip()
     if not bunny_lib:
         raise RuntimeError("config: onboarder.bunny_stream_library_id not set")
@@ -152,6 +153,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                 openai_key=openai_key, get_elevenlabs_key=_elevenlabs_key,
                 bunny_lib=bunny_lib, bunny_key=bunny_key,
                 course_topic=clean_title,
+                youtube_cookies_file=youtube_cookies_file,
             )
         finally:
             # Free disk regardless of outcome
@@ -268,7 +270,8 @@ def _process_course_videos(*, token: str, chat_id: int, agent: str, user_id: int
                            lessons: list[dict[str, Any]], course_idx: int,
                            scratch_dir: Path, openai_key: str,
                            get_elevenlabs_key, bunny_lib: str, bunny_key: str,
-                           course_topic: str) -> list[dict[str, Any]]:
+                           course_topic: str,
+                           youtube_cookies_file: str | None = None) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     total = len(lessons)
     for i, lesson in enumerate(lessons, start=1):
@@ -280,6 +283,7 @@ def _process_course_videos(*, token: str, chat_id: int, agent: str, user_id: int
                 openai_key=openai_key, get_elevenlabs_key=get_elevenlabs_key,
                 bunny_lib=bunny_lib, bunny_key=bunny_key,
                 course_topic=course_topic,
+                youtube_cookies_file=youtube_cookies_file,
             )
             out.append(row)
         except Exception as e:
@@ -295,7 +299,8 @@ def _process_one_video(*, token: str, chat_id: int, prefix: str,
                        lesson: dict[str, Any], scratch_dir: Path,
                        openai_key: str, get_elevenlabs_key,
                        bunny_lib: str, bunny_key: str,
-                       course_topic: str) -> dict[str, Any]:
+                       course_topic: str,
+                       youtube_cookies_file: str | None = None) -> dict[str, Any]:
     video_id = lesson["video_id"]
     title = lesson["title"]
     url = lesson["url"]
@@ -306,7 +311,10 @@ def _process_one_video(*, token: str, chat_id: int, prefix: str,
 
     # 1. Download
     _send(token, chat_id, f"⏳ {prefix}: скачивание <i>{_html_escape(title)[:50]}</i>…")
-    raw_path = ffmpeg_cut.download_video(url=url, output_path=raw_path)
+    raw_path = ffmpeg_cut.download_video(
+        url=url, output_path=raw_path,
+        cookies_file=youtube_cookies_file,
+    )
 
     # 2. Working transcribe (find cuts)
     _send(token, chat_id, f"📝 {prefix}: транскрибация для разметки вырезок…")

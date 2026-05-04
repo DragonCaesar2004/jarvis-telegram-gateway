@@ -73,26 +73,35 @@ def probe_duration(path: str | Path) -> float:
 
 
 def download_video(*, url: str, output_path: str | Path,
-                   max_height: int = 1080, timeout: int = 1800) -> Path:
+                   max_height: int = 1080, timeout: int = 1800,
+                   cookies_file: str | None = None) -> Path:
     """Download MP4 via yt-dlp. Returns the actual output path.
 
     Format selector: best video up to max_height + best audio, merge to MP4.
+
+    `cookies_file`: optional Netscape-format cookies.txt. Required when YouTube
+    starts demanding "Sign in to confirm you're not a bot" (datacenter IPs hit
+    this fast). Export via a browser extension on a logged-in machine.
     """
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     fmt = f"bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
     log.info(f"yt-dlp: download {url} → {out}")
-    r = subprocess.run(
-        _ytdlp_cmd() + [
-            "-f", fmt,
-            "--merge-output-format", "mp4",
-            "--no-playlist",
-            "--no-warnings",
-            "-o", str(out),
-            url,
-        ],
-        capture_output=True, text=True, timeout=timeout,
-    )
+    args = _ytdlp_cmd() + [
+        "-f", fmt,
+        "--merge-output-format", "mp4",
+        "--no-playlist",
+        "--no-warnings",
+        "-o", str(out),
+    ]
+    if cookies_file:
+        cookies_path = Path(cookies_file).expanduser()
+        if cookies_path.exists():
+            args.extend(["--cookies", str(cookies_path)])
+        else:
+            log.warning(f"yt-dlp: cookies file {cookies_path} missing, downloading without")
+    args.append(url)
+    r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         raise FFmpegError(f"yt-dlp failed: {r.stderr[-500:]}")
     if not out.exists():
