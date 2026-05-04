@@ -56,6 +56,9 @@ def submit_dub(*, api_key: str, file_path: str | Path,
         raise DubError(f"dub: file not found: {p}")
 
     url = f"{API_BASE}/dubbing"
+    source_lang = _iso(source_lang)  # normalise BEFORE building fields dict
+    target_lang = _iso(target_lang)
+    log.info(f"elevenlabs: submitting dub {p.name}, {source_lang} → {target_lang}")
     fields = {
         "source_lang": source_lang,
         "target_lang": target_lang,
@@ -64,10 +67,6 @@ def submit_dub(*, api_key: str, file_path: str | Path,
     }
     if name:
         fields["name"] = name
-
-    source_lang = _iso(source_lang)
-    target_lang = _iso(target_lang)
-    log.info(f"elevenlabs: submitting dub {p.name}, {source_lang} → {target_lang}")
     try:
         with p.open("rb") as f:
             r = requests.post(
