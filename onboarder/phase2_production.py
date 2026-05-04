@@ -369,6 +369,15 @@ def _process_one_video(*, token: str, chat_id: int, prefix: str,
         file_path=final_path, title=title,
     )
 
+    # 8. Clean up local video files immediately — don't wait for course cleanup
+    for f in (raw_path, cleaned_path, final_path):
+        try:
+            p = Path(f)
+            if p.exists():
+                p.unlink()
+        except Exception as e:
+            log.warning(f"cleanup: could not delete {f}: {e}")
+
     _send(token, chat_id, f"✅ {prefix}: готово")
 
     return {
