@@ -106,7 +106,9 @@ def _probe(proxy: str, cookies_file: str | None, video_id: str) -> tuple[bool, s
 
     out = (r.stdout or "").strip()
     err = (r.stderr or "")
-    if r.returncode == 0 and out == "ok":
+    # yt-dlp returns 0 on success regardless of what `--print` actually emits.
+    # Treat any zero exit as success — it means YouTube returned playable metadata.
+    if r.returncode == 0:
         return True, ""
     # Common error patterns we care about
     snippet = err.split("\n")[0] if err else f"exit {r.returncode}"
