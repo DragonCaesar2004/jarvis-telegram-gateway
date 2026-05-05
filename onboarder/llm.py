@@ -246,48 +246,436 @@ def mark_cuts(*, course_topic: str, transcript: dict[str, Any],
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: course composition (description + author bio)
+# Phase 2: full course composition via delimiter-based template
 # ---------------------------------------------------------------------------
 
-COMPOSE_COURSE_SYSTEM = """You write course landing-page copy in English for an online learning platform.
+COMPOSE_FULL_SYSTEM = """You are an expert course content writer for an online education platform called TrueLifeFlow. Create a complete, structured course description from the materials provided.
 
-Given a course topic, the channel/author info, and short transcripts of each lesson, produce:
-- excerpt: 1-2 sentence hook (max 200 chars), conversational tone
-- aboutContent: 2-3 short paragraphs, what the student will learn and why it matters
-- author_bio: 2-3 sentences about the instructor, focused on credibility (years experience, specialty)
+I will give you:
+- Transcribed video lessons (each video = exactly one lesson — DO NOT invent extra lessons)
+- Channel/author info
+- Course topic + course title
 
-Tone: confident, practical, no hype. No exclamation marks. No "transform your life" cliches.
+Fill in the template below. Follow rules EXACTLY.
 
-Return ONLY valid JSON, no prose:
-{
-  "excerpt": "...",
-  "aboutContent": "...\\n\\n...",
-  "author_bio": "..."
-}
-"""
+## TEMPLATE RULES
+
+Sections start with `===SECTION===`. Sub-blocks use `---block---` or `-- lesson: NAME --`. Comments starting with `#` are ignored.
+
+### ===AUTHOR===
+- name: Real instructor name from materials
+- bio: 3-7 sentences, third person, highlights expertise. NO links, NO URLs, NO social media handles. Self-contained text only. Markdown bold/italic OK.
+
+### ===COURSE===
+- title: If a course title is provided, use it EXACTLY. Else create 3-10 word engaging title.
+- isAdult: true if 18+, else false
+
+### ===EXCERPT===
+2-4 sentences. Plain text. Hook + value proposition.
+
+### ===ABOUT===
+Markdown. 150-400 words. Compelling opening paragraph, **bold** for benefits, bullet lists for outcomes, who it's for, motivating CTA at end.
+
+### ===PLAN===
+Format:
+```
+---section: Section Title---
+- Topic
+- Another topic
+```
+3-8 sections, 2-5 topics each. Marketing roadmap, NOT lesson list. Topics can span lines (continuation lines without `- ` prefix).
+
+### ===SCIENCE===
+Format:
+```
+headline: One sentence (10-18 words) positioning the course's method as research-backed
+subtitle: One clarifying sentence (10-20 words) mentioning the specific topic
+
+---institution---
+name: Real institution / journal name
+style: serif|serif-italic|serif-caps|serif-wide|serif-bold|serif-smallcaps|sans|sans-caps|sans-bold|sans-thin|display|mono
+
+---institution---
+name: ...
+style: ... (use a DIFFERENT style than above)
+
+---institution---
+name: ...
+style: ... (DIFFERENT third style)
+
+---stat---
+value: 74% (or 3.5x or "5 YEARS")
+description: One-sentence outcome
+citation: Source · Year
+
+---stat---
+value: ...
+description: ...
+citation: ...
+
+---stat---
+value: ...
+description: ...
+citation: ...
+```
+EXACTLY 3 institutions + EXACTLY 3 stats. Real, credible publications/institutions related to the course topic. Don't invent fake sources. Use 3 DIFFERENT styles. Good trios: `serif-italic + serif-wide + sans-caps`, or `serif-caps + sans-bold + serif-smallcaps`.
+
+### ===CURRICULUM===
+Format:
+```
+---section: Section Title---
+
+-- lesson: Your Lesson Title --
+description: 1-2 sentences
+
+-- lesson: Another Lesson --
+description: ...
+```
+**CRITICAL: total lessons MUST equal number of transcribed videos provided. Each video = exactly one lesson, in order.** Write your own lesson titles (don't copy YouTube titles), 3-8 words. Group into sections by learning theme. Add `[BONUS]` to bonus section titles.
+
+### ===TESTIMONIALS===
+Format:
+```
+---review---
+name: Diverse first+last name
+text: Specific review (1-4 sentences, mention concrete techniques)
+rating: 5
+```
+Generate 5-8 testimonials. All rating: 5. Vary tone, length. Be specific to actual course content.
+
+### ===COLLECTION===
+- name: Pick from existing or suggest new (1-3 words):
+  - Fitness & Health
+  - Mindfulness
+  - Dance & Movement
+  - Creativity & Arts
+  - Relationships & Intimacy
+  - New
+  - Men's Sexual Health
+
+## OUTPUT RULES
+
+Return ONLY the filled template. Start with `===AUTHOR===`. End after `===COLLECTION===`. No markdown code fences around it. No commentary."""
 
 
+# Section names in order
+_TEMPLATE_SECTIONS = ["AUTHOR", "COURSE", "EXCERPT", "ABOUT", "PLAN", "SCIENCE",
+                      "CURRICULUM", "TESTIMONIALS", "COLLECTION"]
+
+
+def _split_top_sections(text: str) -> dict[str, str]:
+    """Split text by `===SECTION===` markers."""
+    import re
+    sections: dict[str, str] = {}
+    pattern = re.compile(r"^===([A-Z_]+)===\s*$", re.MULTILINE)
+    matches = list(pattern.finditer(text))
+    for i, m in enumerate(matches):
+        name = m.group(1)
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        sections[name] = text[start:end].strip()
+    return sections
+
+
+def _parse_kv(block: str) -> dict[str, str]:
+    """Parse simple `key: value` blocks (multiline values supported until next key or EOF)."""
+    out: dict[str, str] = {}
+    current_key: str | None = None
+    for line in block.splitlines():
+        if line.strip().startswith("#"):
+            continue
+        # New key starts with `word:` at column 0 (no leading spaces)
+        if ":" in line and not line.startswith((" ", "\t")) and " " not in line.split(":", 1)[0]:
+            key, _, val = line.partition(":")
+            key = key.strip()
+            val = val.strip()
+            current_key = key
+            out[key] = val
+        elif current_key is not None and line.strip():
+            # continuation
+            out[current_key] = (out[current_key] + "\n" + line).strip()
+    return out
+
+
+def _parse_plan(block: str) -> list[dict[str, Any]]:
+    """Parse PLAN section: ---section: Title--- followed by `- topic` lines."""
+    import re
+    sections: list[dict[str, Any]] = []
+    cur: dict[str, Any] | None = None
+    cur_topic: str | None = None
+    section_pat = re.compile(r"^---section:\s*(.+?)\s*---$")
+    for raw in block.splitlines():
+        line = raw.rstrip()
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        m = section_pat.match(line.strip())
+        if m:
+            if cur:
+                if cur_topic is not None:
+                    cur["items"].append({"title": cur_topic.strip()})
+                sections.append(cur)
+            cur = {"title": m.group(1), "items": []}
+            cur_topic = None
+            continue
+        if cur is None:
+            continue
+        if line.strip().startswith("- "):
+            if cur_topic is not None:
+                cur["items"].append({"title": cur_topic.strip()})
+            cur_topic = line.strip()[2:]
+        elif cur_topic is not None:
+            cur_topic = cur_topic + " " + line.strip()
+    if cur:
+        if cur_topic is not None:
+            cur["items"].append({"title": cur_topic.strip()})
+        sections.append(cur)
+    return sections
+
+
+def _parse_science(block: str) -> dict[str, Any] | None:
+    """Parse SCIENCE section into sciencePlan dict, or None if blank."""
+    import re
+    if not block.strip():
+        return None
+    headline = ""
+    subtitle = ""
+    institutions: list[dict[str, str]] = []
+    stats: list[dict[str, str]] = []
+    cur_kind: str | None = None
+    cur: dict[str, str] | None = None
+
+    def flush():
+        nonlocal cur, cur_kind
+        if cur is None:
+            return
+        if cur_kind == "institution":
+            institutions.append(cur)
+        elif cur_kind == "stat":
+            stats.append(cur)
+        cur = None
+
+    for raw in block.splitlines():
+        line = raw.rstrip()
+        if line.strip().startswith("#") or not line.strip():
+            continue
+        if line.strip() == "---institution---":
+            flush()
+            cur_kind = "institution"
+            cur = {"name": "", "logo": None, "style": "serif"}
+            continue
+        if line.strip() == "---stat---":
+            flush()
+            cur_kind = "stat"
+            cur = {"value": "", "description": "", "citation": ""}
+            continue
+        if cur is None:
+            # top-level kv (headline/subtitle)
+            if line.startswith("headline:"):
+                headline = line.split(":", 1)[1].strip()
+            elif line.startswith("subtitle:"):
+                subtitle = line.split(":", 1)[1].strip()
+            continue
+        # inside institution or stat
+        if ":" in line:
+            k, _, v = line.partition(":")
+            cur[k.strip()] = v.strip()
+    flush()
+    if not headline and not institutions and not stats:
+        return None
+    return {
+        "enabled": True,
+        "headline": headline,
+        "subtitle": subtitle,
+        "institutions": institutions[:3],
+        "stats": stats[:3],
+    }
+
+
+def _parse_curriculum(block: str) -> list[dict[str, Any]]:
+    """Parse CURRICULUM into [{title, isBonus, lessons:[{title, description}]}]."""
+    import re
+    sections: list[dict[str, Any]] = []
+    cur_section: dict[str, Any] | None = None
+    cur_lesson: dict[str, str] | None = None
+    section_pat = re.compile(r"^---section:\s*(.+?)\s*---$")
+    lesson_pat = re.compile(r"^--\s*lesson:\s*(.+?)\s*--$")
+
+    def flush_lesson():
+        nonlocal cur_lesson
+        if cur_lesson is not None and cur_section is not None:
+            cur_section["lessons"].append(cur_lesson)
+            cur_lesson = None
+
+    for raw in block.splitlines():
+        line = raw.rstrip()
+        if line.strip().startswith("#"):
+            continue
+        ms = section_pat.match(line.strip())
+        if ms:
+            flush_lesson()
+            if cur_section is not None:
+                sections.append(cur_section)
+            title = ms.group(1)
+            is_bonus = "[BONUS]" in title.upper()
+            title = title.replace("[BONUS]", "").replace("[bonus]", "").strip()
+            cur_section = {"title": title, "isBonus": is_bonus, "lessons": []}
+            continue
+        ml = lesson_pat.match(line.strip())
+        if ml:
+            flush_lesson()
+            cur_lesson = {"title": ml.group(1), "description": ""}
+            continue
+        if cur_lesson is not None and line.startswith("description:"):
+            cur_lesson["description"] = line.split(":", 1)[1].strip()
+        elif cur_lesson is not None and line.strip() and not line.strip().startswith("---"):
+            # Continuation of description
+            cur_lesson["description"] = (cur_lesson["description"] + " " + line.strip()).strip()
+    flush_lesson()
+    if cur_section is not None:
+        sections.append(cur_section)
+    return sections
+
+
+def _parse_testimonials(block: str) -> list[dict[str, Any]]:
+    """Parse TESTIMONIALS into [{authorName, text, rating}]."""
+    out: list[dict[str, Any]] = []
+    cur: dict[str, Any] | None = None
+    for raw in block.splitlines():
+        line = raw.rstrip()
+        if line.strip().startswith("#"):
+            continue
+        if line.strip() == "---review---":
+            if cur and cur.get("authorName") and cur.get("text"):
+                out.append(cur)
+            cur = {"authorName": "", "text": "", "rating": 5}
+            continue
+        if cur is None:
+            continue
+        if line.startswith("name:"):
+            cur["authorName"] = line.split(":", 1)[1].strip()
+        elif line.startswith("text:"):
+            cur["text"] = line.split(":", 1)[1].strip()
+        elif line.startswith("rating:"):
+            try:
+                cur["rating"] = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                cur["rating"] = 5
+        elif cur.get("text") and line.strip() and not line.strip().startswith(("---", "name:", "rating:")):
+            cur["text"] = (cur["text"] + "\n" + line).strip()
+    if cur and cur.get("authorName") and cur.get("text"):
+        out.append(cur)
+    return out
+
+
+def parse_template(text: str) -> dict[str, Any]:
+    """Parse the LLM's filled template into a structured dict ready for NMS API."""
+    sections = _split_top_sections(text)
+
+    author_kv = _parse_kv(sections.get("AUTHOR", ""))
+    course_kv = _parse_kv(sections.get("COURSE", ""))
+    is_adult = course_kv.get("isAdult", "false").strip().lower() in ("true", "yes", "1")
+
+    return {
+        "author": {
+            "name": author_kv.get("name", "").strip(),
+            "bio": author_kv.get("bio", "").strip(),
+        },
+        "course": {
+            "title": course_kv.get("title", "").strip(),
+            "isAdult": is_adult,
+            "excerpt": sections.get("EXCERPT", "").strip(),
+            "aboutContent": sections.get("ABOUT", "").strip(),
+        },
+        "planSections": _parse_plan(sections.get("PLAN", "")),
+        "sciencePlan": _parse_science(sections.get("SCIENCE", "")),
+        "curriculum": _parse_curriculum(sections.get("CURRICULUM", "")),
+        "testimonials": _parse_testimonials(sections.get("TESTIMONIALS", "")),
+        "collectionName": _parse_kv(sections.get("COLLECTION", "")).get("name", "").strip(),
+    }
+
+
+def compose_full_course(*, course_topic: str, course_title: str,
+                        channel_name: str, channel_description: str,
+                        lesson_transcripts: list[str],
+                        model: str = DEFAULT_MODEL_QUALITY,
+                        timeout: int = 600) -> dict[str, Any]:
+    """Generate full course content via template + parser. Returns structured dict."""
+    # Trim each transcript to ~700 words to stay within budget but keep enough context
+    trimmed_lessons = []
+    for i, t in enumerate(lesson_transcripts, start=1):
+        words = (t or "").split()
+        trimmed_lessons.append(f"--- Video {i} transcript ---\n" + " ".join(words[:700]))
+
+    materials = (
+        f"COURSE TOPIC: {course_topic}\n"
+        f"COURSE TITLE (use exactly if you keep one): {course_title}\n"
+        f"INSTRUCTOR / CHANNEL: {channel_name}\n"
+        f"CHANNEL DESCRIPTION: {channel_description[:500] if channel_description else '(none)'}\n\n"
+        f"NUMBER OF VIDEO LESSONS: {len(lesson_transcripts)} "
+        f"(curriculum MUST contain exactly this many lessons in this order)\n\n"
+        + "\n\n".join(trimmed_lessons)
+    )
+
+    full_prompt = COMPOSE_FULL_SYSTEM + "\n\n---\n\n## MATERIALS\n\n" + materials
+
+    # Use the same _call subprocess machinery as _call_json, but expect plain text (template).
+    import os, subprocess, tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory(prefix="onboarder-claude-") as tmpdir:
+        env = os.environ.copy()
+        env.setdefault("PATH", f"{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+        try:
+            r = subprocess.run(
+                ["claude", "-p",
+                 "--model", model,
+                 "--output-format", "text",
+                 "--permission-mode", "bypassPermissions"],
+                input=full_prompt,
+                cwd=tmpdir, env=env,
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"compose_full_course: claude CLI timed out after {timeout}s") from e
+
+    if r.returncode != 0 or not (r.stdout or "").strip():
+        raise RuntimeError(f"compose_full_course: claude exit {r.returncode}, stderr={r.stderr[:300]!r}")
+
+    text = r.stdout.strip()
+    # Strip optional code fences
+    if text.startswith("```"):
+        first_nl = text.find("\n")
+        if first_nl != -1:
+            text = text[first_nl + 1:]
+        if text.rstrip().endswith("```"):
+            text = text.rsplit("```", 1)[0].strip()
+
+    parsed = parse_template(text)
+
+    # Sanity validation
+    if not parsed["author"]["name"] or not parsed["author"]["bio"]:
+        raise ValueError(f"compose_full_course: missing author.name or author.bio. Got: {parsed['author']}")
+    if not parsed["course"]["title"]:
+        raise ValueError("compose_full_course: missing course.title")
+    if not parsed["curriculum"]:
+        raise ValueError("compose_full_course: empty curriculum")
+
+    return parsed
+
+
+# Backward-compat shim — phase2 will be updated to use compose_full_course
 def compose_course(*, course_topic: str, course_title: str,
                    channel_name: str, channel_description: str,
                    lesson_transcripts: list[str],
                    model: str = DEFAULT_MODEL_QUALITY) -> dict[str, str]:
-    """Return {excerpt, aboutContent, author_bio}. Uses Opus by default for prose quality."""
-    # Truncate each lesson transcript to ~500 words to stay within token budget
-    trimmed = []
-    for t in lesson_transcripts:
-        words = t.split()
-        trimmed.append(" ".join(words[:500]))
-
-    user = json.dumps({
-        "course_topic": course_topic, "course_title": course_title,
-        "channel_name": channel_name, "channel_description": channel_description,
-        "lesson_transcripts": trimmed,
-    }, ensure_ascii=False)
-    parsed = _call_json(model=model, system=COMPOSE_COURSE_SYSTEM, user=user,
-                        max_tokens=2048)
-    if not isinstance(parsed, dict):
-        raise ValueError(f"compose_course: expected dict, got {type(parsed).__name__}")
-    for key in ("excerpt", "aboutContent", "author_bio"):
-        if key not in parsed:
-            raise ValueError(f"compose_course: missing '{key}'")
-    return parsed
+    """Legacy: returns only {excerpt, aboutContent, author_bio} for back-compat."""
+    full = compose_full_course(
+        course_topic=course_topic, course_title=course_title,
+        channel_name=channel_name, channel_description=channel_description,
+        lesson_transcripts=lesson_transcripts, model=model,
+    )
+    return {
+        "excerpt": full["course"]["excerpt"],
+        "aboutContent": full["course"]["aboutContent"],
+        "author_bio": full["author"]["bio"],
+    }

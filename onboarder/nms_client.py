@@ -26,29 +26,52 @@ class NMSError(RuntimeError):
 def create_draft_course(*, endpoint: str, token: str,
                         author: dict[str, Any],
                         course: dict[str, Any],
-                        lessons: list[dict[str, Any]],
+                        lessons: list[dict[str, Any]] | None = None,
+                        curriculum: list[dict[str, Any]] | None = None,
                         section_title: str | None = None,
+                        plan_sections: list[dict[str, Any]] | None = None,
+                        science_plan: dict[str, Any] | None = None,
+                        testimonials: list[dict[str, Any]] | None = None,
+                        collection_name: str | None = None,
                         timeout: int = 60) -> dict[str, Any]:
-    """POST a fully-assembled course to NewMindStart. Returns {courseId, slug, adminUrl}.
+    """POST a fully-assembled course to NewMindStart. Returns {courseId, slug, adminUrl, ...}.
+
+    Pass EITHER `lessons` (single section) OR `curriculum` (multi-section).
 
     Args:
-        endpoint: Base URL like "https://truelifeflow.com" (no trailing slash needed).
+        endpoint: Base URL like "https://truelifeflow.com".
         token:    Bearer token (matches AGENT_API_TOKEN on the NMS .env).
-        author:   {"name": str, "bio": str, "avatar"?: str}
-        course:   {"title": str, "excerpt"?: str, "aboutContent"?: str, "isAdult"?: bool}
-        lessons:  list of {"title", "order"?, "description"?, "videoKey",
-                           "videoLibraryId", "duration"?, "transcriptEn"?,
-                           "originalLang"?, "wasDubbed"?}
-        section_title: defaults to "Course content" (NMS picks if None).
+        author:   {"name", "bio", "avatar"?}
+        course:   {"title", "excerpt"?, "aboutContent"?, "isAdult"?}
+        lessons:  flat list (single section) of {"title","videoKey","videoLibraryId",...}
+        curriculum: list of sections [{"title","isBonus","lessons":[...]}]
+        plan_sections: [{"title","items":[{"title": str}]}]
+        science_plan: {"enabled","headline","subtitle","institutions","stats"}
+        testimonials: [{"authorName","text","rating"}]
+        collection_name: existing or new collection title
     """
+    if not lessons and not curriculum:
+        raise NMSError("must provide either lessons or curriculum")
+
     url = endpoint.rstrip("/") + "/api/agent/onboard-course"
     body: dict[str, Any] = {
         "author": author,
         "course": course,
-        "lessons": lessons,
     }
+    if curriculum:
+        body["curriculum"] = curriculum
+    elif lessons:
+        body["lessons"] = lessons
     if section_title:
         body["sectionTitle"] = section_title
+    if plan_sections:
+        body["planSections"] = plan_sections
+    if science_plan:
+        body["sciencePlan"] = science_plan
+    if testimonials:
+        body["testimonials"] = testimonials
+    if collection_name:
+        body["collectionName"] = collection_name
 
     try:
         r = requests.post(

@@ -169,60 +169,112 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                   f"⚠️ Курс {course_idx} пропущен — ни одно видео не обработалось до конца.")
             continue
 
-        # ── 4. Compose course copy via Claude ────────────────────────────
-        _send(token, chat_id, f"✍️ Курс {course_idx}: пишу описание и био автора через Claude…")
+        # ── 4. Compose full course (template-based) via Claude ──────────
+        _send(token, chat_id, f"✍️ Курс {course_idx}: пишу описание, план, science, отзывы через Claude…")
+        composed_full: dict[str, Any] | None = None
         try:
-            composed = llm.compose_course(
+            composed_full = llm.compose_full_course(
                 course_topic=clean_title,
                 course_title=clean_title,
                 channel_name=ch_name,
-                channel_description="",  # Phase 1 didn't persist; could re-fetch
+                channel_description="",
                 lesson_transcripts=[l["transcriptEn"] for l in processed_lessons],
             )
         except Exception as e:
-            log.warning(f"phase2: compose_course failed: {e}; falling back to defaults")
-            composed = {
+            log.warning(f"phase2: compose_full_course failed: {e}; falling back to minimal compose")
+            composed_full = None
+
+        # Build the curriculum: zip LLM lesson titles with our processed video metadata.
+        # LLM curriculum may have multiple sections — we map ALL its lessons in order
+        # against our N processed videos.
+        if composed_full and composed_full.get("curriculum"):
+            llm_curriculum = composed_full["curriculum"]
+            llm_flat_lessons: list[tuple[dict[str, Any], int, int]] = []
+            for s_idx, sec in enumerate(llm_curriculum):
+                for l_idx_in_sec, lesson in enumerate(sec.get("lessons", [])):
+                    llm_flat_lessons.append((lesson, s_idx, l_idx_in_sec))
+
+            # If LLM produced a different lesson count than we have videos, fall back
+            # to a single "Lessons" section using LLM titles where possible.
+            if len(llm_flat_lessons) != len(processed_lessons):
+                log.warning(
+                    f"phase2: LLM gave {len(llm_flat_lessons)} lessons but we have "
+                    f"{len(processed_lessons)} videos — flattening to single section"
+                )
+                merged_lessons = []
+                for v_idx, video in enumerate(processed_lessons):
+                    title = (llm_flat_lessons[v_idx][0]["title"]
+                             if v_idx < len(llm_flat_lessons) else video["title"])
+                    description = (llm_flat_lessons[v_idx][0].get("description", "")
+                                   if v_idx < len(llm_flat_lessons) else "")
+                    merged_lessons.append(_lesson_payload(video, v_idx, title, description))
+                curriculum_payload = [{
+                    "title": "Lessons",
+                    "isBonus": False,
+                    "lessons": merged_lessons,
+                }]
+            else:
+                # 1-to-1 mapping: rebuild sections preserving structure
+                curriculum_payload = []
+                video_iter = iter(enumerate(processed_lessons))
+                for s_idx, sec in enumerate(llm_curriculum):
+                    sec_payload = {
+                        "title": sec.get("title", f"Section {s_idx + 1}"),
+                        "isBonus": bool(sec.get("isBonus", False)),
+                        "lessons": [],
+                    }
+                    for lesson in sec.get("lessons", []):
+                        v_idx, video = next(video_iter)
+                        sec_payload["lessons"].append(
+                            _lesson_payload(video, v_idx, lesson["title"], lesson.get("description", ""))
+                        )
+                    curriculum_payload.append(sec_payload)
+        else:
+            # Fallback: single "Lessons" section using video titles
+            curriculum_payload = [{
+                "title": "Lessons",
+                "isBonus": False,
+                "lessons": [_lesson_payload(v, idx, v["title"], "") for idx, v in enumerate(processed_lessons)],
+            }]
+
+        # Author / course fields with fallbacks
+        if composed_full:
+            author_payload = {
+                "name": composed_full["author"]["name"] or ch_name,
+                "bio": composed_full["author"]["bio"],
+            }
+            course_payload = {
+                "title": composed_full["course"]["title"] or clean_title,
+                "excerpt": composed_full["course"]["excerpt"],
+                "aboutContent": composed_full["course"]["aboutContent"],
+                "isAdult": composed_full["course"]["isAdult"],
+            }
+            plan_sections = composed_full.get("planSections") or []
+            science_plan = composed_full.get("sciencePlan")  # may be None
+            testimonials = composed_full.get("testimonials") or []
+            collection_name = composed_full.get("collectionName") or None
+        else:
+            author_payload = {"name": ch_name, "bio": f"{ch_name} — educator on YouTube."}
+            course_payload = {
+                "title": clean_title,
                 "excerpt": f"A practical course on {clean_title}.",
                 "aboutContent": f"Curated lessons from {ch_name} on {clean_title}.",
-                "author_bio": f"{ch_name} — educator on YouTube.",
+                "isAdult": False,
             }
+            plan_sections, science_plan, testimonials, collection_name = [], None, [], None
 
-        # ── 5. Push DRAFT course to NewMindStart (if NMS is configured) ──
-        course_payload = {
-            "author": {
-                "name": ch_name,
-                "bio": composed["author_bio"],
-            },
-            "course": {
-                "title": clean_title,
-                "excerpt": composed["excerpt"],
-                "aboutContent": composed["aboutContent"],
-            },
-            "lessons": [
-                {
-                    "title": l["title"],
-                    "order": idx,
-                    "description": (l["transcriptEn"] or "")[:500],
-                    "videoKey": l["videoKey"],
-                    "videoLibraryId": l["videoLibraryId"],
-                    "duration": l["duration"],
-                    "transcriptEn": l["transcriptEn"],
-                    "originalLang": l["originalLang"],
-                    "wasDubbed": l["wasDubbed"],
-                }
-                for idx, l in enumerate(processed_lessons)
-            ],
-            "sectionTitle": "Lessons",
-        }
-
+        # ── 5. Push DRAFT course to NewMindStart ────────────────────────
         if nms_endpoint and nms_token:
             try:
                 resp = nms_client.create_draft_course(
                     endpoint=nms_endpoint, token=nms_token,
-                    author=course_payload["author"],
-                    course=course_payload["course"],
-                    lessons=course_payload["lessons"],
-                    section_title=course_payload["sectionTitle"],
+                    author=author_payload,
+                    course=course_payload,
+                    curriculum=curriculum_payload,
+                    plan_sections=plan_sections,
+                    science_plan=science_plan,
+                    testimonials=testimonials,
+                    collection_name=collection_name,
                 )
                 course_results.append({
                     "course_idx": course_idx, "title": clean_title,
@@ -230,9 +282,11 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                 })
                 _send(token, chat_id,
                       f"✅ <b>Курс {course_idx} создан в админке (DRAFT):</b>\n"
-                      f"<a href=\"{resp['adminUrl']}\">{_html_escape(clean_title)}</a>")
+                      f"<a href=\"{resp['adminUrl']}\">{_html_escape(course_payload['title'])}</a>\n\n"
+                      f"План: {len(plan_sections)} | Science: {'есть' if science_plan else 'нет'} | "
+                      f"Отзывы: {len(testimonials)} | Коллекция: {collection_name or '—'}")
             except Exception as e:
-                log.error(f"phase2: NMS push failed for course {course_idx}: {e}")
+                log.error(f"phase2: NMS push failed for course {course_idx}: {e}", exc_info=True)
                 _send(token, chat_id,
                       f"⚠️ Курс {course_idx}: видео загружены на Bunny, "
                       f"но создание DRAFT не удалось:\n<code>{_html_escape(str(e))[:300]}</code>")
@@ -394,6 +448,23 @@ def _process_one_video(*, token: str, chat_id: int, prefix: str,
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _lesson_payload(video: dict[str, Any], order: int,
+                    title: str, description: str) -> dict[str, Any]:
+    """Build per-lesson payload dict for the NMS API from a processed video + LLM-given title/desc."""
+    transcript = video.get("transcriptEn") or ""
+    return {
+        "title": title or video.get("title", f"Lesson {order + 1}"),
+        "order": order,
+        "description": description or transcript[:500],
+        "videoKey": video["videoKey"],
+        "videoLibraryId": video["videoLibraryId"],
+        "duration": video.get("duration"),
+        "transcriptEn": transcript,
+        "originalLang": video.get("originalLang", ""),
+        "wasDubbed": bool(video.get("wasDubbed", False)),
+    }
+
 
 def _strip_course_prefix(s: str, idx: int) -> str:
     """Drop the leading 'Курс N: <Channel> —' part if present."""
