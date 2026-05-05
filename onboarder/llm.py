@@ -56,14 +56,17 @@ def _call_json(*, model: str, system: str, user: str,
     with tempfile.TemporaryDirectory(prefix="onboarder-claude-") as tmpdir:
         env = os.environ.copy()
         env.setdefault("PATH", f"{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+        # Pipe prompt via stdin to avoid OS ARG_MAX limit on long transcripts.
+        # claude -p reads stdin when no positional prompt argument is given.
         try:
             r = subprocess.run(
                 [
-                    "claude", "-p", full_prompt,
+                    "claude", "-p",
                     "--model", model,
                     "--output-format", "text",
                     "--permission-mode", "bypassPermissions",
                 ],
+                input=full_prompt,
                 cwd=tmpdir,
                 env=env,
                 capture_output=True,
