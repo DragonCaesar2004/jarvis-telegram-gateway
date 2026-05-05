@@ -73,7 +73,7 @@ def probe_duration(path: str | Path) -> float:
 
 
 def download_video(*, url: str, output_path: str | Path,
-                   max_height: int = 1080, timeout: int = 1800,
+                   max_height: int = 720, timeout: int = 1800,
                    cookies_file: str | None = None,
                    proxy: str | None = None) -> Path:
     """Download MP4 via yt-dlp. Returns the actual output path.
