@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Iterable
@@ -72,8 +73,11 @@ def find_working_proxy(*, proxies: list[str],
 
 def _probe(proxy: str, cookies_file: str | None, video_id: str) -> tuple[bool, str]:
     """Run a fast yt-dlp metadata fetch through the proxy. Returns (ok, error_snippet)."""
+    # Use the same Python interpreter that's running the gateway — that's the
+    # venv where yt-dlp was pip-installed. Direct `yt-dlp` binary isn't in
+    # systemd's PATH.
     args = [
-        "yt-dlp",
+        sys.executable, "-m", "yt_dlp",
         "--proxy", proxy,
         "--remote-components", "ejs:github",
         "--skip-download",
@@ -98,7 +102,7 @@ def _probe(proxy: str, cookies_file: str | None, video_id: str) -> tuple[bool, s
     except subprocess.TimeoutExpired:
         return False, "probe timeout"
     except FileNotFoundError:
-        return False, "yt-dlp not found"
+        return False, "python -m yt_dlp not found"
 
     out = (r.stdout or "").strip()
     err = (r.stderr or "")
