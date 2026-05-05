@@ -1614,6 +1614,9 @@ def handle_command(token: str, chat_id: int, agent: str, cmd: str, args: str, cf
         if onboarder_enabled:
             rows.append([{"text": "🎓 Новый курс", "callback_data": "menu:onboard"}])
             rows.append([{"text": "📎 Загрузить YouTube cookies", "callback_data": "menu:cookies"}])
+            current_compose = (onboarder_cfg.get("models") or {}).get("compose") or "opus"
+            rows.append([{"text": f"⚙️ Модель курсов: {current_compose}",
+                          "callback_data": "menu:compose_model"}])
         rows.append([{"text": "📊 Статус", "callback_data": "menu:status"}])
 
         current_mode = get_user_mode(agent, user_id)
@@ -3624,6 +3627,56 @@ def _menu_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> None:
         finally:
             cfg.pop("_last_message_from_user", None)
         answer_callback_query(token, cq_id)
+        return
+
+    if action == "compose_model":
+        # Show submenu: pick model for course composition
+        onb = (cfg.get("onboarder") or {})
+        current = (onb.get("models") or {}).get("compose") or "opus"
+        answer_callback_query(token, cq_id)
+        send_message_with_buttons(
+            token, chat_id,
+            text=(f"⚙️ <b>Модель для генерации курсов</b>\n\n"
+                  f"Текущая: <code>{current}</code>\n\n"
+                  f"Выбери:\n"
+                  f"• <b>Opus</b> — лучшее качество прозы, медленнее\n"
+                  f"• <b>Sonnet</b> — быстрее и дешевле, качество ниже\n"
+                  f"• <b>Haiku</b> — самая быстрая, для простых тем"),
+            buttons=[[
+                {"text": f"{'✓ ' if current=='opus' else ''}Opus", "callback_data": "menu:set_compose:opus"},
+                {"text": f"{'✓ ' if current=='sonnet' else ''}Sonnet", "callback_data": "menu:set_compose:sonnet"},
+                {"text": f"{'✓ ' if current=='haiku' else ''}Haiku", "callback_data": "menu:set_compose:haiku"},
+            ]],
+        )
+        return
+
+    if action.startswith("set_compose:"):
+        new_model = action.split(":", 1)[1]
+        if new_model not in ("sonnet", "opus", "haiku"):
+            answer_callback_query(token, cq_id, "Неизвестная модель", show_alert=True)
+            return
+        try:
+            full_cfg = json.loads(CONFIG_PATH.read_text())
+            full_cfg.setdefault("agents", {}).setdefault(agent, {}) \
+                .setdefault("onboarder", {}).setdefault("models", {})["compose"] = new_model
+            tmp_path = CONFIG_PATH.with_suffix(".json.tmp")
+            tmp_path.write_text(json.dumps(full_cfg, indent=2, ensure_ascii=False))
+            os.replace(tmp_path, CONFIG_PATH)
+            # Update in-memory cfg too so the next phase 2 picks it up immediately
+            cfg.setdefault("onboarder", {}).setdefault("models", {})["compose"] = new_model
+            persisted = True
+        except Exception as e:
+            log.warning(f"set_compose persist failed: {e}")
+            persisted = False
+        suffix = "" if persisted else " ⚠️ (in-memory only — не сохранилось в config.json)"
+        answer_callback_query(token, cq_id, f"Модель: {new_model}")
+        try:
+            tg_api(token, "sendMessage", chat_id=chat_id,
+                   text=f"✅ Модель курсов: <code>{new_model}</code>{suffix}",
+                   parse_mode="HTML")
+        except Exception:
+            pass
+        log.info(f"[{agent}] onboarder.models.compose → {new_model} persisted={persisted}")
         return
 
     answer_callback_query(token, cq_id)

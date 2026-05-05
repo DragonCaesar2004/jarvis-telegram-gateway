@@ -226,6 +226,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
         # ── 4. Compose full course (template-based) via Claude ──────────
         _send(token, chat_id, f"✍️ Курс {course_idx}: пишу описание, план, science, отзывы через Claude…")
         composed_full: dict[str, Any] | None = None
+        compose_model = (onb.get("models") or {}).get("compose") or llm.DEFAULT_MODEL_QUALITY
         try:
             composed_full = llm.compose_full_course(
                 course_topic=clean_title,
@@ -233,6 +234,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                 channel_name=ch_name,
                 channel_description="",
                 lesson_transcripts=[l["transcriptEn"] for l in processed_lessons],
+                model=compose_model,
             )
         except Exception as e:
             log.warning(f"phase2: compose_full_course failed: {e}; falling back to minimal compose")
