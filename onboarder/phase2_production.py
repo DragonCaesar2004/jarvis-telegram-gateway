@@ -57,6 +57,28 @@ def _worker(token: str, agent: str, cfg: dict, chat_id: int, user_id: int) -> No
     onb = (cfg.get("onboarder") or {})
     try:
         _run(token, agent, cfg, chat_id, user_id, onb)
+    except CookiesNeededError as e:
+        # Pool exhausted — pause Phase 2 and ask user to upload fresh cookies
+        log.warning(f"phase2: cookies needed: {e}")
+        _state.update(agent, user_id, step="awaiting_cookies_pre_phase2")
+        try:
+            from gateway import set_user_mode, MODE_WIZARD  # type: ignore
+            set_user_mode(agent, user_id, MODE_WIZARD)
+        except Exception:
+            pass
+        _send_with_buttons(
+            token, chat_id,
+            text=(
+                "⏸ <b>Phase 2 на паузе.</b>\n\n"
+                f"{_html_escape(str(e))}\n\n"
+                "Загрузи свежий cookies.txt с youtube.com → бот сам "
+                "перезапустит Phase 2 с того видео, на котором остановился."
+            ),
+            buttons=[[
+                {"text": "🚀 Продолжить (cookies свежие)", "callback_data": "wiz:start_phase2"},
+                {"text": "✖️ Отмена", "callback_data": "wiz:cancel"},
+            ]],
+        )
     except Exception as e:
         tb = traceback.format_exc()
         log.error(f"phase2 worker crashed: {e}\n{tb}")
@@ -132,8 +154,8 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
     _state.update(agent, user_id, step="phase2_running")
     sheets.update_run_status(client, sheet_id, run_id, status="phase2_running")
 
-    # ── 2.5 Validate proxy pool — pick the first working proxy ──────────
-    youtube_proxy: str | None = None
+    # ── 2.5 Initialize proxy rotator — pick first working proxy ─────────
+    rotator = proxy_pool.ProxyRotator(proxy_pool_list, cookies_file=youtube_cookies_file)
     if proxy_pool_list:
         _send(token, chat_id,
               f"🔍 Проверяю {len(proxy_pool_list)} прокси на YouTube (~10 сек на каждый)…")
@@ -149,13 +171,9 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                 last_progress[0] = now
 
         try:
-            youtube_proxy = proxy_pool.find_working_proxy(
-                proxies=proxy_pool_list,
-                cookies_file=youtube_cookies_file,
-                on_progress=_on_probe,
-            )
+            rotator.init(on_progress=_on_probe)
             _send(token, chat_id,
-                  f"✅ Использую прокси: <code>{proxy_pool._proxy_label(youtube_proxy)}</code>")
+                  f"✅ Использую прокси: <code>{proxy_pool._proxy_label(rotator.current)}</code>")
         except proxy_pool.NoWorkingProxyError as e:
             raise RuntimeError(
                 f"Ни один прокси не прошёл проверку YouTube.\n\n{str(e)[:600]}\n\n"
@@ -191,7 +209,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                 bunny_lib=bunny_lib, bunny_key=bunny_key,
                 course_topic=clean_title,
                 youtube_cookies_file=youtube_cookies_file,
-                youtube_proxy=youtube_proxy,
+                rotator=rotator,
             )
         finally:
             # Free disk regardless of outcome
@@ -358,13 +376,17 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
 # Per-course / per-video processing
 # ---------------------------------------------------------------------------
 
+class CookiesNeededError(RuntimeError):
+    """All proxies in pool are blocked by YouTube — cookies refresh required."""
+
+
 def _process_course_videos(*, token: str, chat_id: int, agent: str, user_id: int,
                            lessons: list[dict[str, Any]], course_idx: int,
                            scratch_dir: Path, openai_key: str,
                            get_elevenlabs_key, bunny_lib: str, bunny_key: str,
                            course_topic: str,
                            youtube_cookies_file: str | None = None,
-                           youtube_proxy: str | None = None) -> list[dict[str, Any]]:
+                           rotator=None) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     total = len(lessons)
     for i, lesson in enumerate(lessons, start=1):
@@ -377,10 +399,13 @@ def _process_course_videos(*, token: str, chat_id: int, agent: str, user_id: int
                 bunny_lib=bunny_lib, bunny_key=bunny_key,
                 course_topic=course_topic,
                 youtube_cookies_file=youtube_cookies_file,
-                youtube_proxy=youtube_proxy,
+                rotator=rotator,
             )
 
             out.append(row)
+        except CookiesNeededError:
+            # Pool exhausted — rethrow so the worker pauses Phase 2
+            raise
         except Exception as e:
             log.error(f"phase2: video {lesson.get('video_id')} failed: {e}", exc_info=True)
             _send(token, chat_id,
@@ -390,13 +415,51 @@ def _process_course_videos(*, token: str, chat_id: int, agent: str, user_id: int
     return out
 
 
+def _is_bot_check_error(err: Exception) -> bool:
+    s = str(err).lower()
+    return "sign in to confirm" in s or "not a bot" in s
+
+
+def _download_with_rotation(*, token: str, chat_id: int, prefix: str,
+                            url: str, output_path, cookies_file: str | None,
+                            rotator) -> "Path":
+    """Download with proxy rotation on bot-check failures.
+
+    Tries current rotator.current; on bot-check, rotates and retries up to len(pool).
+    Raises CookiesNeededError if pool is exhausted.
+    """
+    last_err: Exception | None = None
+    while True:
+        proxy = rotator.current if rotator else None
+        try:
+            return ffmpeg_cut.download_video(
+                url=url, output_path=output_path,
+                cookies_file=cookies_file, proxy=proxy,
+            )
+        except ffmpeg_cut.FFmpegError as e:
+            last_err = e
+            if not _is_bot_check_error(e) or rotator is None:
+                raise
+            label = proxy_pool._proxy_label(proxy) if proxy else "no-proxy"
+            _send(token, chat_id,
+                  f"🔁 {prefix}: bot-check на <code>{label}</code>, ищу другой прокси…")
+            new_proxy = rotator.rotate()
+            if new_proxy is None:
+                raise CookiesNeededError(
+                    f"Все {len(rotator.pool)} прокси из пула заблокированы YouTube'ом. "
+                    f"Cookies скорее всего тоже устарели — нужно обновить и повторить."
+                ) from e
+            _send(token, chat_id,
+                  f"➡️ {prefix}: переключился на <code>{proxy_pool._proxy_label(new_proxy)}</code>, повторяю…")
+
+
 def _process_one_video(*, token: str, chat_id: int, prefix: str,
                        lesson: dict[str, Any], scratch_dir: Path,
                        openai_key: str, get_elevenlabs_key,
                        bunny_lib: str, bunny_key: str,
                        course_topic: str,
                        youtube_cookies_file: str | None = None,
-                       youtube_proxy: str | None = None) -> dict[str, Any]:
+                       rotator=None) -> dict[str, Any]:
     video_id = lesson["video_id"]
     title = lesson["title"]
     url = lesson["url"]
@@ -405,12 +468,13 @@ def _process_one_video(*, token: str, chat_id: int, prefix: str,
     cleaned_path = scratch_dir / f"{video_id}.cleaned.mp4"
     final_path = scratch_dir / f"{video_id}.final.mp4"
 
-    # 1. Download
+    # 1. Download (with proxy rotation on bot-check)
     _send(token, chat_id, f"⏳ {prefix}: скачивание <i>{_html_escape(title)[:50]}</i>…")
-    raw_path = ffmpeg_cut.download_video(
+    raw_path = _download_with_rotation(
+        token=token, chat_id=chat_id, prefix=prefix,
         url=url, output_path=raw_path,
         cookies_file=youtube_cookies_file,
-        proxy=youtube_proxy,
+        rotator=rotator,
     )
 
     # 2. Working transcribe (find cuts)

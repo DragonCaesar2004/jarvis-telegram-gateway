@@ -127,6 +127,54 @@ def _proxy_label(proxy_url: str) -> str:
         return proxy_url
 
 
+class ProxyRotator:
+    """Holds a pool of proxies + the currently-active one.
+
+    Phase 2 creates one of these at the start. Each video uses .current. If
+    a download fails with bot-check, .rotate() picks the next working proxy
+    (re-probing the unused remainder). Returns None when the pool is exhausted.
+    """
+
+    def __init__(self, pool: list[str], cookies_file: str | None = None):
+        self.pool = list(pool)
+        self.cookies_file = cookies_file
+        self.tried: set[str] = set()
+        self.current: str | None = None
+
+    def init(self, on_progress=None) -> str | None:
+        """Pick the first working proxy. Returns it or raises NoWorkingProxyError."""
+        if not self.pool:
+            return None
+        proxy = find_working_proxy(
+            proxies=self.pool,
+            cookies_file=self.cookies_file,
+            on_progress=on_progress,
+        )
+        self.tried.add(proxy)
+        self.current = proxy
+        return proxy
+
+    def rotate(self, on_progress=None) -> str | None:
+        """Pick the next working proxy from untried pool. None if exhausted."""
+        remaining = [p for p in self.pool if p not in self.tried]
+        if not remaining:
+            return None
+        try:
+            proxy = find_working_proxy(
+                proxies=remaining,
+                cookies_file=self.cookies_file,
+                on_progress=on_progress,
+            )
+            self.tried.add(proxy)
+            self.current = proxy
+            return proxy
+        except NoWorkingProxyError:
+            # All remaining failed too — mark them tried so we don't loop forever
+            for p in remaining:
+                self.tried.add(p)
+            return None
+
+
 def normalise_pool(cfg_value) -> list[str]:
     """Accept both `youtube_proxy` (str, single) and `youtube_proxies` (list of str)."""
     if not cfg_value:
