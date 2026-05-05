@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from . import (_secrets, bunny, elevenlabs_dub, ffmpeg_cut, llm, nms_client,
-               sheets, state as _state, whisper)
+               proxy_pool, sheets, state as _state, whisper)
 
 log = logging.getLogger("gateway")
 
@@ -74,7 +74,9 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
         raise RuntimeError("config: onboarder.google_sheet_id not set")
     openai_key = _secrets.resolve(onb, "openai_api_key", env="OPENAI_API_KEY")
     youtube_cookies_file = onb.get("youtube_cookies_file") or None
-    youtube_proxy = onb.get("youtube_proxy") or None
+    proxy_pool_list = proxy_pool.normalise_pool(
+        onb.get("youtube_proxies") or onb.get("youtube_proxy")
+    )
     bunny_lib = str(onb.get("bunny_stream_library_id") or "").strip()
     if not bunny_lib:
         raise RuntimeError("config: onboarder.bunny_stream_library_id not set")
@@ -129,6 +131,40 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
           f"Прогресс прилечу отдельными сообщениями.")
     _state.update(agent, user_id, step="phase2_running")
     sheets.update_run_status(client, sheet_id, run_id, status="phase2_running")
+
+    # ── 2.5 Validate proxy pool — pick the first working proxy ──────────
+    youtube_proxy: str | None = None
+    if proxy_pool_list:
+        _send(token, chat_id,
+              f"🔍 Проверяю {len(proxy_pool_list)} прокси на YouTube (~10 сек на каждый)…")
+
+        last_progress = [time.time()]
+        results: list[str] = []
+
+        def _on_probe(idx: int, total: int, name: str, ok: bool) -> None:
+            results.append(f"{'✅' if ok else '❌'} {idx}/{total} {name}")
+            now = time.time()
+            if ok or now - last_progress[0] > 15 or idx == total:
+                _send(token, chat_id, "\n".join(results[-12:]))
+                last_progress[0] = now
+
+        try:
+            youtube_proxy = proxy_pool.find_working_proxy(
+                proxies=proxy_pool_list,
+                cookies_file=youtube_cookies_file,
+                on_progress=_on_probe,
+            )
+            _send(token, chat_id,
+                  f"✅ Использую прокси: <code>{proxy_pool._proxy_label(youtube_proxy)}</code>")
+        except proxy_pool.NoWorkingProxyError as e:
+            raise RuntimeError(
+                f"Ни один прокси не прошёл проверку YouTube.\n\n{str(e)[:600]}\n\n"
+                f"Возможные причины: cookies протухли, все IP rate-limited, "
+                f"YouTube ужесточил защиту. Попробуй: обновить cookies, "
+                f"добавить новые прокси в config.json, подождать 1-2 часа."
+            )
+    else:
+        _send(token, chat_id, "⚠️ Прокси не настроен — пробую напрямую с VPS-IP")
 
     # ── 3. Process every video, then assemble courses ────────────────────
     course_results: list[dict[str, Any]] = []
