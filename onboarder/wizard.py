@@ -30,9 +30,10 @@ STEP_ASK_COUNT = "ask_count"
 STEP_CONFIRM = "confirm"
 STEP_PHASE1_RUNNING = "phase1_running"
 STEP_AWAITING_APPROVAL = "awaiting_approval"
+STEP_AWAITING_COOKIES_PRE_PHASE2 = "awaiting_cookies_pre_phase2"  # forced refresh before phase2
 STEP_PHASE2_RUNNING = "phase2_running"
 STEP_DONE = "done"
-STEP_AWAITING_COOKIES = "awaiting_cookies"  # bot is waiting for a cookies.txt upload
+STEP_AWAITING_COOKIES = "awaiting_cookies"  # standalone cookies upload (from /menu)
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +91,7 @@ def handle_wizard_message(token: str, agent: str, cfg: dict, chat_id: int,
 
     step = st.get("step", STEP_ASK_TOPIC)
 
-    if step == STEP_AWAITING_COOKIES:
+    if step in (STEP_AWAITING_COOKIES, STEP_AWAITING_COOKIES_PRE_PHASE2):
         _handle_cookies_upload(token, agent, cfg, chat_id, user_id, msg)
         return
 
@@ -215,9 +216,31 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
         return
 
     if action == "start_phase2":
-        # Triggered when user has approved the Sheet and clicks "Запустить обработку"
+        # Force a cookies refresh before Phase 2 — common failure mode is
+        # forgetting to update YouTube cookies between runs.
+        _state.update(agent, user_id, step=STEP_AWAITING_COOKIES_PRE_PHASE2)
+        answer_callback_query(token, cq_id, "Сначала обнови cookies")
+        _send_with_buttons(
+            token, chat_id,
+            text=(
+                "🍪 <b>Обнови YouTube cookies перед запуском.</b>\n\n"
+                "Cookies живут 2-4 недели — лучше залить свежие, чтобы Phase 2 "
+                "не упал в середине.\n\n"
+                "Открой <b>youtube.com</b> в Chrome (залогинен) → расширение "
+                "<i>Get cookies.txt LOCALLY</i> → <b>Export All</b> → прикрепи файл сюда.\n\n"
+                "Если уверен что cookies свежие — жми «Пропустить»."
+            ),
+            buttons=[[
+                {"text": "⏭ Пропустить (cookies свежие)", "callback_data": "wiz:skip_cookies"},
+                {"text": "✖️ Отмена", "callback_data": "wiz:cancel"},
+            ]],
+        )
+        return
+
+    if action == "skip_cookies":
+        # User asserts cookies are fresh — proceed straight to Phase 2
         _state.update(agent, user_id, step=STEP_PHASE2_RUNNING)
-        answer_callback_query(token, cq_id, "Phase 2 запущен")
+        answer_callback_query(token, cq_id, "Запускаю Phase 2")
         try:
             from . import phase2_production
             phase2_production.launch(token, agent, cfg, chat_id, user_id)
@@ -320,31 +343,45 @@ def _handle_cookies_upload(token: str, agent: str, cfg: dict,
     size_kb = target_path.stat().st_size / 1024
     line_count = sum(1 for _ in target_path.open("r", errors="replace"))
 
-    # Restore previous run state — don't wipe sheet_tab / run_id
     st = _state.load(agent, user_id)
+    current_step = st.get("step")
     prev_step = st.pop("_prev_step", None)
+
+    # Case A: cookies were requested as part of the pre-Phase 2 gate → autostart Phase 2
+    if current_step == STEP_AWAITING_COOKIES_PRE_PHASE2:
+        st["step"] = STEP_PHASE2_RUNNING
+        _state.save(agent, user_id, st)
+        _send(token, chat_id,
+              f"✅ <b>Cookies обновлены</b> ({size_kb:.1f} KB, {line_count} строк).\n"
+              f"Запускаю Phase 2…")
+        try:
+            from . import phase2_production
+            phase2_production.launch(token, agent, cfg, chat_id, user_id)
+        except Exception as e:
+            log.exception(f"phase2 autostart after cookies upload failed: {e}")
+            _send(token, chat_id, f"⚠️ Не удалось запустить Phase 2: {e}")
+            _state.update(agent, user_id, step="error", error=str(e))
+        return
+
+    # Case B: standalone cookies upload during an active run (e.g. user is on
+    # awaiting_approval and uploaded cookies via /menu) → restore prev step
     if prev_step and prev_step not in (STEP_AWAITING_COOKIES, STEP_DONE, "error", ""):
-        # There was an active run — restore it
         st["step"] = prev_step
         _state.save(agent, user_id, st)
-        # Stay in wizard mode so user can continue
-        confirm_text = (
-            f"✅ <b>Cookies обновлены.</b>\n\n"
-            f"Размер: {size_kb:.1f} KB, строк: {line_count}\n\n"
-        )
+        confirm_text = f"✅ <b>Cookies обновлены</b> ({size_kb:.1f} KB, {line_count} строк).\n\n"
         if prev_step == STEP_AWAITING_APPROVAL:
-            confirm_text += "Подборка в Sheet всё ещё ждёт тебя. Нажми кнопку чтобы запустить обработку:"
+            confirm_text += "Подборка в Sheet всё ещё ждёт. Нажми кнопку:"
             _send_with_buttons(token, chat_id, confirm_text,
                                [[{"text": "🚀 Запустить обработку", "callback_data": "wiz:start_phase2"},
                                  {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]])
         else:
             _send(token, chat_id, confirm_text + f"Продолжаю с шага: <code>{prev_step}</code>.")
-    else:
-        # No active run — clear state and return to chat
-        clear_wizard_state(agent, user_id)
-        set_user_mode(agent, user_id, MODE_CHAT)
-        _send(token, chat_id,
-              f"✅ <b>Cookies сохранены.</b>\n\n"
-              f"Размер: {size_kb:.1f} KB, строк: {line_count}\n\n"
-              f"Следующий запуск Phase 2 будет использовать этот файл.\n"
-              f"Возвращаюсь в чат с агентом.")
+        return
+
+    # Case C: standalone upload from /menu without active run → return to chat
+    clear_wizard_state(agent, user_id)
+    set_user_mode(agent, user_id, MODE_CHAT)
+    _send(token, chat_id,
+          f"✅ <b>Cookies сохранены</b> ({size_kb:.1f} KB, {line_count} строк).\n\n"
+          f"Следующий запуск Phase 2 будет использовать этот файл.\n"
+          f"Возвращаюсь в чат с агентом.")
