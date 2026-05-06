@@ -1567,20 +1567,37 @@ def handle_command(token: str, chat_id: int, agent: str, cmd: str, args: str, cf
             pass
         return True
 
-    if cmd == "/model":
+    if cmd in ("/model", "/toggle"):
         model_map = {
             "sonnet": "claude-sonnet-4-6",
             "opus": "claude-opus-4-7",
             "haiku": "claude-haiku-4-5-20251001",
         }
-        alias = args.strip().split()[0] if args.strip() else ""
-        if alias not in model_map:
-            try:
-                tg_api(token, "sendMessage", chat_id=chat_id,
-                       text="Usage: /model sonnet | opus | haiku")
-            except Exception:
-                pass
-            return True
+        alias_map = {v: k for k, v in model_map.items()}
+        current_model = cfg.get("model", "sonnet")
+        current_alias = alias_map.get(current_model, current_model)
+
+        if cmd == "/toggle":
+            alias = "opus" if current_alias == "sonnet" else "sonnet"
+        else:
+            alias = args.strip().split()[0] if args.strip() else ""
+            if not alias:
+                try:
+                    tg_api(token, "sendMessage", chat_id=chat_id,
+                           text=f"Current model: <b>{current_alias}</b> (<code>{current_model}</code>)\n\n"
+                                f"Switch: <code>/model sonnet|opus|haiku</code> or <code>/toggle</code>",
+                           parse_mode="HTML")
+                except Exception:
+                    pass
+                return True
+            if alias not in model_map:
+                try:
+                    tg_api(token, "sendMessage", chat_id=chat_id,
+                           text="Usage: /model sonnet | opus | haiku")
+                except Exception:
+                    pass
+                return True
+
         new_model = model_map[alias]
         cfg["model"] = new_model
         try:
@@ -1591,15 +1608,16 @@ def handle_command(token: str, chat_id: int, agent: str, cmd: str, args: str, cf
             os.replace(tmp_path, CONFIG_PATH)
             persisted = True
         except Exception as e:
-            log.warning(f"/model persist failed: {e}")
+            log.warning(f"{cmd} persist failed: {e}")
             persisted = False
         suffix = "" if persisted else " (in-memory only — persist failed, see logs)"
         try:
             tg_api(token, "sendMessage", chat_id=chat_id,
-                   text=f"Model switched to {alias} ({new_model}){suffix}")
+                   text=f"Model switched to <b>{alias}</b> (<code>{new_model}</code>){suffix}",
+                   parse_mode="HTML")
         except Exception:
             pass
-        log.info(f"[{agent}] /model switched to {alias} ({new_model}) persisted={persisted}")
+        log.info(f"[{agent}] {cmd} switched to {alias} ({new_model}) persisted={persisted}")
         return True
 
     if cmd == "/menu":
@@ -1656,7 +1674,9 @@ def handle_command(token: str, chat_id: int, agent: str, cmd: str, args: str, cf
             "<code>/reset</code> -- reset session (saves important to MEMORY)\n"
             "<code>/reset force</code> -- reset without saving\n"
             "<code>/compact</code> -- manual memory compaction\n"
+            "<code>/model</code> -- show current LLM model\n"
             "<code>/model sonnet|opus|haiku</code> -- switch LLM model\n"
+            "<code>/toggle</code> -- toggle between sonnet and opus\n"
             f"{wizard_line}"
             "<code>/help</code> -- this help\n\n"
             "<i>auto-compact: daily 05:00 UTC</i>"
@@ -3155,6 +3175,8 @@ _BOT_COMMANDS = [
     {"command": "stop", "description": "Остановить текущую задачу"},
     {"command": "compact", "description": "Компактизация памяти"},
     {"command": "reset", "description": "Сброс без handoff (force)"},
+    {"command": "model", "description": "Текущая модель / sonnet|opus|haiku"},
+    {"command": "toggle", "description": "Переключить sonnet ↔ opus"},
     {"command": "help", "description": "Справка по командам"},
 ]
 
