@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Iterable
 
@@ -34,6 +35,11 @@ PROBE_TIMEOUT_SEC = 25
 
 
 class NoWorkingProxyError(RuntimeError):
+    pass
+
+
+class CookiesNeededError(RuntimeError):
+    """All proxies in the pool are blocked by YouTube — cookies refresh required."""
     pass
 
 
@@ -130,9 +136,10 @@ def _proxy_label(proxy_url: str) -> str:
 class ProxyRotator:
     """Holds a pool of proxies + the currently-active one.
 
-    Phase 2 creates one of these at the start. Each video uses .current. If
-    a download fails with bot-check, .rotate() picks the next working proxy
-    (re-probing the unused remainder). Returns None when the pool is exhausted.
+    Thread-safe: callers may share one rotator across worker threads. When a
+    worker hits a bot-check, it calls rotate_locked(failing_proxy) — only the
+    first thread to land on a given failing proxy actually triggers a probe;
+    later threads observe the already-rotated `.current` and proceed.
     """
 
     def __init__(self, pool: list[str], cookies_file: str | None = None):
@@ -140,6 +147,7 @@ class ProxyRotator:
         self.cookies_file = cookies_file
         self.tried: set[str] = set()
         self.current: str | None = None
+        self._lock = threading.Lock()
 
     def init(self, on_progress=None) -> str | None:
         """Pick the first working proxy. Returns it or raises NoWorkingProxyError."""
@@ -150,13 +158,15 @@ class ProxyRotator:
             cookies_file=self.cookies_file,
             on_progress=on_progress,
         )
-        self.tried.add(proxy)
-        self.current = proxy
+        with self._lock:
+            self.tried.add(proxy)
+            self.current = proxy
         return proxy
 
     def rotate(self, on_progress=None) -> str | None:
         """Pick the next working proxy from untried pool. None if exhausted."""
-        remaining = [p for p in self.pool if p not in self.tried]
+        with self._lock:
+            remaining = [p for p in self.pool if p not in self.tried]
         if not remaining:
             return None
         try:
@@ -165,14 +175,30 @@ class ProxyRotator:
                 cookies_file=self.cookies_file,
                 on_progress=on_progress,
             )
-            self.tried.add(proxy)
-            self.current = proxy
+            with self._lock:
+                self.tried.add(proxy)
+                self.current = proxy
             return proxy
         except NoWorkingProxyError:
             # All remaining failed too — mark them tried so we don't loop forever
-            for p in remaining:
-                self.tried.add(p)
+            with self._lock:
+                for p in remaining:
+                    self.tried.add(p)
             return None
+
+    def rotate_if_still(self, failing_proxy: str | None, on_progress=None) -> str | None:
+        """Rotate only if `.current` is still the proxy that failed.
+
+        Lets multiple workers share a single rotator: the first failure triggers
+        the rotation, subsequent failures (on the now-stale proxy) are no-ops.
+        Returns the (possibly new) current proxy.
+        """
+        with self._lock:
+            already_rotated = self.current != failing_proxy
+            current_snapshot = self.current
+        if already_rotated:
+            return current_snapshot
+        return self.rotate(on_progress=on_progress)
 
 
 def normalise_pool(cfg_value) -> list[str]:

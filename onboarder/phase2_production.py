@@ -27,6 +27,7 @@ from typing import Any
 
 from . import (_secrets, bunny, elevenlabs_dub, ffmpeg_cut, llm, nms_client,
                proxy_pool, sheets, state as _state, whisper)
+from .proxy_pool import CookiesNeededError
 
 log = logging.getLogger("gateway")
 
@@ -407,8 +408,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
 # Per-course / per-video processing
 # ---------------------------------------------------------------------------
 
-class CookiesNeededError(RuntimeError):
-    """All proxies in pool are blocked by YouTube — cookies refresh required."""
+# CookiesNeededError now lives in proxy_pool (re-exported at the top of this module).
 
 
 def _process_course_videos(*, token: str, chat_id: int, agent: str, user_id: int,

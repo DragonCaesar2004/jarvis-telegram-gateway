@@ -50,6 +50,15 @@ def _connect() -> sqlite3.Connection:
             computed_at TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS course_compose (
+            run_id TEXT NOT NULL,
+            course_idx INTEGER NOT NULL,
+            composed_json TEXT NOT NULL,
+            computed_at TEXT NOT NULL,
+            PRIMARY KEY (run_id, course_idx)
+        )
+    """)
     return conn
 
 
@@ -113,3 +122,44 @@ def delete_cuts(video_id: str) -> bool:
     with _connect() as conn:
         cur = conn.execute("DELETE FROM video_cuts WHERE video_id = ?", (video_id,))
         return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# course_compose: Phase 1 stores the FULL compose_full_course() output here
+# (curriculum, plan, science, testimonials, author bio, etc). Phase 2 reads
+# back and POSTs to NewMindStart admin without re-running Claude.
+# ---------------------------------------------------------------------------
+
+def save_course_compose(*, run_id: str, course_idx: int,
+                        composed: dict[str, Any]) -> None:
+    """Upsert composed course payload for (run_id, course_idx)."""
+    if not run_id or not course_idx:
+        log.warning("pipeline_db.save_course_compose: bad keys, skipping")
+        return
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    payload = json.dumps(composed or {}, ensure_ascii=False)
+    with _connect() as conn:
+        conn.execute("""
+            INSERT INTO course_compose(run_id, course_idx, composed_json, computed_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(run_id, course_idx) DO UPDATE SET
+                composed_json = excluded.composed_json,
+                computed_at = excluded.computed_at
+        """, (run_id, int(course_idx), payload, ts))
+
+
+def get_course_compose(*, run_id: str, course_idx: int) -> dict[str, Any] | None:
+    """Return composed payload or None."""
+    if not run_id or not course_idx:
+        return None
+    with _connect() as conn:
+        row = conn.execute("""
+            SELECT composed_json FROM course_compose
+             WHERE run_id = ? AND course_idx = ?
+        """, (run_id, int(course_idx))).fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row[0] or "{}")
+    except json.JSONDecodeError:
+        return None

@@ -1,4 +1,4 @@
-"""Phase 1: discovery pipeline.
+"""Phase 1: discovery + enrichment pipeline.
 
 Run in a background thread. Posts progress to Telegram, writes results to Google Sheet,
 updates wizard state. On completion, sends a message with the Sheet link + a "Запустить
@@ -11,8 +11,12 @@ Pipeline:
     4. Claude scores remaining channels for topical fit
     5. Take top N (one channel per course)
     6. For each channel: list recent videos (filtered by age), Claude picks 6-12
-    7. Append to Run-* tab + Runs index, mark "awaiting_approval"
-    8. Telegram message with Sheet link + "Запустить обработку" button
+    7. ENRICH (per course): parallel download → Whisper → mark cuts → describe →
+       research author (deep WebSearch) → compose full course payload. Cuts +
+       working transcript persisted to pipeline.db. Composed payload also saved.
+    8. Append fully-enriched rows to Lessons tab (real descriptions, ready to
+       review on a real landing page).
+    9. Telegram message with Sheet link + "Запустить обработку" button
 
 Errors at any step → Telegram message + wizard state set to "error". User can /cancel
 or click "Запустить обработку" anyway (will fail at Phase 2 if data is missing).
@@ -26,7 +30,9 @@ import time
 import traceback
 from typing import Any
 
-from . import _secrets, llm, sheets, state as _state, youtube_dl as ytdl
+from . import (_secrets, llm, phase1_enrich, proxy_pool, sheets,
+               state as _state, youtube_dl as ytdl)
+from .proxy_pool import CookiesNeededError
 
 log = logging.getLogger("gateway")
 
@@ -64,6 +70,21 @@ def _worker(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     onb = (cfg.get("onboarder") or {})
     try:
         _run(token, agent, cfg, chat_id, user_id, topic, count, onb)
+    except CookiesNeededError as e:
+        log.warning(f"phase1: cookies needed: {e}")
+        _state.update(agent, user_id, step="error", error=f"cookies_needed: {e}")
+        _send_with_buttons(
+            token, chat_id,
+            text=(
+                "⏸ <b>Phase 1 на паузе.</b>\n\n"
+                f"{_html_escape(str(e))[:500]}\n\n"
+                "Загрузи свежий cookies.txt с youtube.com, потом /menu → 🎓 Новый курс для перезапуска."
+            ),
+            buttons=[[
+                {"text": "📎 Загрузить cookies", "callback_data": "menu:cookies"},
+                {"text": "✖️ Отмена", "callback_data": "wiz:cancel"},
+            ]],
+        )
     except Exception as e:
         tb = traceback.format_exc()
         log.error(f"phase1 worker crashed: {e}\n{tb}")
@@ -82,6 +103,17 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     if not sheet_id:
         raise RuntimeError("config: onboarder.google_sheet_id not set")
 
+    # Phase 1 now downloads + transcribes + composes — needs Whisper key,
+    # cookies for YouTube downloads, and the proxy pool for rotating around
+    # bot-checks. Resolve early so we fail fast on misconfiguration.
+    openai_key = _secrets.resolve(onb, "openai_api_key", env="OPENAI_API_KEY")
+    youtube_cookies_file = onb.get("youtube_cookies_file") or None
+    proxy_pool_list = proxy_pool.normalise_pool(
+        onb.get("youtube_proxies") or onb.get("youtube_proxy")
+    )
+    parallel_per_course = int(onb.get("phase1_parallel_per_course") or 4)
+    compose_model = (onb.get("models") or {}).get("compose") or llm.DEFAULT_MODEL_QUALITY
+
     client = sheets.open_client(sa_path)
     criteria = sheets.read_criteria(client, sheet_id)
     log.info(f"phase1[{user_id}] criteria: {criteria}")
@@ -94,7 +126,35 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     run_id = sheets.make_run_id()
     _state.update(agent, user_id, run_id=run_id,
                   step="phase1_running",
+                  topic=topic, count=count,
                   sheet_url=sheets.sheet_url(sheet_id))
+
+    # ── 2.5 Init proxy rotator for downloads (same probe UX as Phase 2) ──
+    rotator = proxy_pool.ProxyRotator(proxy_pool_list, cookies_file=youtube_cookies_file)
+    if proxy_pool_list:
+        _send(token, chat_id,
+              f"🔍 Проверяю {len(proxy_pool_list)} прокси на YouTube…")
+        last_progress = [time.time()]
+        results: list[str] = []
+
+        def _on_probe(idx: int, total: int, name: str, ok: bool) -> None:
+            results.append(f"{'✅' if ok else '❌'} {idx}/{total} {name}")
+            now = time.time()
+            if ok or now - last_progress[0] > 15 or idx == total:
+                _send(token, chat_id, "\n".join(results[-12:]))
+                last_progress[0] = now
+
+        try:
+            rotator.init(on_progress=_on_probe)
+            _send(token, chat_id,
+                  f"✅ Прокси готов: <code>{proxy_pool._proxy_label(rotator.current)}</code>")
+        except proxy_pool.NoWorkingProxyError as e:
+            raise RuntimeError(
+                f"Ни один прокси не прошёл проверку YouTube.\n\n{str(e)[:600]}\n\n"
+                "Обнови cookies (/menu → 📎 Загрузить cookies) и попробуй ещё раз."
+            )
+    else:
+        _send(token, chat_id, "⚠️ Прокси не настроен — пробую напрямую с VPS-IP")
 
     # ── 3. yt-dlp search → unique channels ───────────────────────────────
     search_results = _criteria_int(criteria, "search_results", DEFAULT_SEARCH_RESULTS)
@@ -220,23 +280,79 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                   f"все {len(lessons)} видео уже обрабатывались.")
             continue
 
-        full_course_title = f"Курс {course_idx}: {ch_name} — {course_title}"
+        # ── 6a. ENRICH: download + transcribe + cuts + describe + compose ──
+        videos_metadata = {v["video_id"]: v for v in all_videos}
+        try:
+            enriched = phase1_enrich.enrich_course(
+                course_idx=course_idx, run_id=run_id,
+                channel_id=ch["channel_id"],
+                channel_name=ch_name,
+                channel_description=ch.get("description", ""),
+                course_topic_input=topic,
+                course_title_from_llm=course_title,
+                selected_videos=dedup_lessons,
+                videos_metadata=videos_metadata,
+                openai_key=openai_key,
+                cookies_file=youtube_cookies_file,
+                rotator=rotator,
+                on_progress=lambda msg: _send(token, chat_id, _html_escape(msg)),
+                max_parallel=parallel_per_course,
+                compose_model=compose_model,
+            )
+        except CookiesNeededError:
+            raise  # propagate to _worker for graceful pause
+        except Exception as e:
+            log.warning(f"phase1[{user_id}] enrich failed for course {course_idx}: {e}",
+                        exc_info=True)
+            _send(token, chat_id,
+                  f"⚠️ Курс {course_idx} ({_html_escape(ch_name)}): обогащение упало "
+                  f"(<code>{_html_escape(str(e))[:160]}</code>). Пропускаю курс.")
+            continue
+
+        if not enriched.get("videos"):
+            _send(token, chat_id,
+                  f"⚠️ Курс {course_idx}: ни одно видео не довелось до конца. Пропускаю.")
+            continue
+
+        # ── 6b. Build enriched lesson rows for the Sheet ────────────────────
+        final_course_title = enriched.get("course_title") or course_title
+        full_course_title = f"Курс {course_idx}: {ch_name} — {final_course_title}"
         summary_extra = f" (пропущено {course_skipped} дублей)" if course_skipped else ""
-        course_summaries.append(f"{course_idx}. {course_title} ({len(dedup_lessons)} уроков){summary_extra}")
-        videos_by_id = {v["video_id"]: v for v in all_videos}
-        for lesson_idx, lsn in enumerate(dedup_lessons, start=1):
-            vid = lsn.get("video_id")
-            v = videos_by_id.get(vid) or {}
+        course_summaries.append(
+            f"{course_idx}. {final_course_title} ({len(enriched['videos'])} уроков){summary_extra}"
+        )
+
+        course_desc = enriched.get("course_description", "")
+        course_tagline = enriched.get("course_tagline", "")
+        course_what = enriched.get("course_what_you_learn", "")
+        course_target = enriched.get("course_target_audience", "")
+        author_name = enriched.get("author_name", "") or ch_name
+        author_bio = enriched.get("author_bio", "")
+        author_expertise = enriched.get("author_expertise", "")
+
+        for v in enriched["videos"]:
+            is_first = (v["lesson_idx"] == 1)
             all_lesson_rows.append({
-                "course": full_course_title if lesson_idx == 1 else f"Курс {course_idx}",
-                "lesson_idx": lesson_idx,
+                "course": full_course_title if is_first else f"Курс {course_idx}",
+                "lesson_idx": v["lesson_idx"],
                 "channel": ch_name,
-                "lesson_title": lsn.get("title") or v.get("title", ""),
-                "url": v.get("url") or f"https://youtu.be/{vid}",
+                "lesson_title": v["title"],
+                "url": v["url"],
                 "duration_sec": v.get("duration_sec", 0),
-                "video_id": vid,
+                "video_id": v["video_id"],
                 "channel_id": ch["channel_id"],
                 "course_idx": course_idx,
+                "lesson_description": v.get("lesson_description", ""),
+                "transcript_excerpt": v.get("transcript_excerpt", ""),
+                # Course-level fields filled only on the first lesson row to
+                # avoid blasting the same paragraph across N rows in the Sheet.
+                "course_description": course_desc if is_first else "",
+                "course_tagline": course_tagline if is_first else "",
+                "course_what_you_learn": course_what if is_first else "",
+                "course_target_audience": course_target if is_first else "",
+                "author_name": author_name if is_first else "",
+                "author_bio": author_bio if is_first else "",
+                "author_expertise": author_expertise if is_first else "",
             })
 
     if not all_lesson_rows:

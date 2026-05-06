@@ -246,6 +246,159 @@ def mark_cuts(*, course_topic: str, transcript: dict[str, Any],
 
 
 # ---------------------------------------------------------------------------
+# Phase 1 (post-transcribe): per-lesson descriptions, batched per course
+# ---------------------------------------------------------------------------
+
+DESCRIBE_LESSONS_SYSTEM = """You write concise, landing-page-quality lesson descriptions for an online course.
+
+I will give you:
+- Course topic and title
+- A list of lessons in order, each with its title and transcript excerpt
+
+For each lesson, return a 2-4 sentence description that:
+- Tells a prospective student what they will learn or be able to do after the lesson
+- References at least one concrete concept, technique, or example from the transcript
+- Is written in plain English, third person, no fluff (no "in this lesson we will…")
+- Does not invent material that isn't in the transcript
+
+Return ONLY valid JSON, no prose:
+[
+  {"order": 0, "description": "Introduces the four-quadrant decision matrix used throughout the rest of the course, with a worked example on choosing between SEO and paid acquisition."},
+  ...
+]
+
+Keep order matching the input. Empty/garbage transcript → return a generic 1-sentence description rather than failing.
+"""
+
+
+def describe_lessons(*, course_topic: str, course_title: str,
+                     lessons: list[dict[str, Any]],
+                     model: str = DEFAULT_MODEL_FAST) -> list[dict[str, Any]]:
+    """Generate per-lesson descriptions in one batch call.
+
+    `lessons` items: {order: int, title: str, transcript: str}. Transcripts are
+    truncated to ~500 words inside this function to keep the prompt cheap.
+
+    Returns list of {order, description} aligned to input order.
+    """
+    if not lessons:
+        return []
+
+    trimmed: list[dict[str, Any]] = []
+    for l in lessons:
+        text = (l.get("transcript") or "").strip()
+        words = text.split()
+        trimmed.append({
+            "order": int(l.get("order", 0)),
+            "title": l.get("title", "")[:200],
+            "transcript_excerpt": " ".join(words[:500]),
+        })
+
+    user = json.dumps({
+        "course_topic": course_topic,
+        "course_title": course_title,
+        "lessons": trimmed,
+    }, ensure_ascii=False, indent=2)
+
+    parsed = _call_json(model=model, system=DESCRIBE_LESSONS_SYSTEM, user=user,
+                        max_tokens=4096)
+    if not isinstance(parsed, list):
+        raise ValueError(f"describe_lessons: expected list, got {type(parsed).__name__}")
+
+    # Defensive: backfill any missing entries
+    by_order = {int(p.get("order", -1)): str(p.get("description", "")).strip()
+                for p in parsed if isinstance(p, dict)}
+    out: list[dict[str, Any]] = []
+    for l in lessons:
+        order = int(l.get("order", 0))
+        out.append({"order": order,
+                    "description": by_order.get(order, "")})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: deep author research with WebSearch (Claude CLI tool)
+# ---------------------------------------------------------------------------
+
+RESEARCH_AUTHOR_SYSTEM = """You research public figures and online educators to produce trustworthy biographies.
+
+You will be given a YouTube channel name, the channel's about-text, sample video titles, and a course topic. Use the WebSearch tool freely to find:
+- The author's real first and last name (the channel may be a personal brand or a pseudonym)
+- LinkedIn profile, personal website, Wikipedia, faculty page, or major publications by them
+- Concrete credentials: degrees, employers, books, talks, peer-reviewed work, certifications
+- Recent activity that confirms they're still active in the field
+
+Synthesize the findings into a structured profile. If WebSearch returns nothing useful, fall back to what's evident from the channel description and titles, but flag that with `confidence: "low"`.
+
+Return ONLY valid JSON, no prose:
+{
+  "name": "Real full name (or best-effort guess; e.g. channel handle if unknown)",
+  "bio": "3-5 sentences, third person, factual, no links or URLs, no emojis. Markdown bold/italic OK. Specific credentials over generic praise.",
+  "expertise": "Comma-separated list of 3-6 expertise areas relevant to the course topic",
+  "confidence": "high | medium | low",
+  "sources": ["url1", "url2", ...]
+}
+
+Hard rules:
+- NEVER invent credentials, degrees, or affiliations. If unsure, omit.
+- NEVER include URLs or social handles in `bio` (sources go in the sources array).
+- If the channel is clearly a faceless brand, set name to the brand and write the bio in the brand's voice.
+"""
+
+
+def research_author(*, channel_name: str, channel_description: str,
+                    sample_video_titles: list[str], course_topic: str,
+                    model: str = DEFAULT_MODEL_QUALITY,
+                    timeout: int = 240) -> dict[str, Any]:
+    """Deep author research via Claude CLI (uses WebSearch under the hood when needed).
+
+    Returns {name, bio, expertise, confidence, sources}. On failure, returns a
+    low-confidence stub built from `channel_name` + `channel_description` so the
+    pipeline can keep going without aborting the whole course.
+    """
+    user_payload = {
+        "channel_name": channel_name,
+        "channel_description": (channel_description or "")[:1500],
+        "sample_video_titles": sample_video_titles[:8],
+        "course_topic": course_topic,
+    }
+    user = json.dumps(user_payload, ensure_ascii=False, indent=2)
+
+    try:
+        parsed = _call_json(model=model, system=RESEARCH_AUTHOR_SYSTEM, user=user,
+                            timeout=timeout)
+    except Exception as e:
+        log.warning(f"llm.research_author: failed for {channel_name}: {e}")
+        return _author_fallback(channel_name, channel_description)
+
+    if not isinstance(parsed, dict):
+        log.warning(f"llm.research_author: non-dict result for {channel_name}: {parsed!r}")
+        return _author_fallback(channel_name, channel_description)
+
+    return {
+        "name": str(parsed.get("name") or channel_name).strip(),
+        "bio": str(parsed.get("bio") or "").strip(),
+        "expertise": str(parsed.get("expertise") or "").strip(),
+        "confidence": str(parsed.get("confidence") or "low").strip().lower(),
+        "sources": [s for s in (parsed.get("sources") or []) if isinstance(s, str)][:10],
+    }
+
+
+def _author_fallback(channel_name: str, channel_description: str) -> dict[str, Any]:
+    """Cheap fallback when WebSearch / LLM fails — keeps pipeline alive."""
+    desc = (channel_description or "").strip()[:300]
+    bio = (desc if desc else
+           f"{channel_name} runs an educational YouTube channel covering this topic.")
+    return {
+        "name": channel_name,
+        "bio": bio,
+        "expertise": "",
+        "confidence": "low",
+        "sources": [],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Phase 2: full course composition via delimiter-based template
 # ---------------------------------------------------------------------------
 
