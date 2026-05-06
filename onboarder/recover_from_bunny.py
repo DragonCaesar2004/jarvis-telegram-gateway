@@ -65,38 +65,57 @@ def list_bunny_videos(library_id: str, api_key: str,
     return out
 
 
-def download_from_bunny(library_id: str, guid: str, output_path: Path) -> Path:
-    """Download an MP4 directly from Bunny Stream CDN to local disk."""
+def fetch_bunny_video_meta(library_id: str, api_key: str, guid: str) -> dict[str, Any]:
+    """GET /library/{lib}/videos/{guid} — full video metadata incl. captions/transcribing."""
     import requests
-    cdn_hostname = f"vz-{library_id}.b-cdn.net"  # standard Bunny CDN pattern
-    # Alternative: use signed direct URL via /play API
-    url = f"https://iframe.mediadelivery.net/play/{library_id}/{guid}"
-    # The /play page redirects; use the videos API to get original mp4 URL instead.
-    # Easiest: fetch via API which has originalFileName + presigned URL.
-    # Simpler still: use Bunny's per-video CDN URL pattern:
-    #   https://vz-{libid}.b-cdn.net/{guid}/play_720p.mp4 (or play.mp4 / original)
-    # Try a few common URL patterns:
-    candidates = [
-        f"https://vz-{library_id}.b-cdn.net/{guid}/play_480p.mp4",
-        f"https://vz-{library_id}.b-cdn.net/{guid}/play_720p.mp4",
-        f"https://vz-{library_id}.b-cdn.net/{guid}/play.mp4",
-        f"https://vz-{library_id}.b-cdn.net/{guid}/original",
-    ]
-    last_err = None
-    for cand in candidates:
-        try:
-            with requests.get(cand, stream=True, timeout=120) as r:
-                if r.status_code == 200:
-                    with output_path.open("wb") as f:
-                        for chunk in r.iter_content(chunk_size=1 << 20):
-                            if chunk:
-                                f.write(chunk)
-                    log.info(f"downloaded from {cand} → {output_path} ({output_path.stat().st_size//1024//1024} MB)")
-                    return output_path
-                last_err = f"{r.status_code} on {cand}"
-        except Exception as e:
-            last_err = f"{e} on {cand}"
-    raise RuntimeError(f"could not download Bunny video {guid}: {last_err}")
+    url = f"https://video.bunnycdn.com/library/{library_id}/videos/{guid}"
+    r = requests.get(url, headers={"AccessKey": api_key, "Accept": "application/json"}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_bunny_caption_text(library_id: str, api_key: str, guid: str,
+                             lang: str = "en") -> str:
+    """Read Bunny-generated VTT captions and return plain text.
+
+    Tries `lang` first, then falls back to whatever languages the video has.
+    Returns empty string if no captions are available yet.
+    """
+    import re
+    import requests
+
+    meta = fetch_bunny_video_meta(library_id, api_key, guid)
+    captions = meta.get("captions") or []
+    available = [c.get("srclang") for c in captions if c.get("srclang")]
+
+    # Pick best language: requested → en → en-US → first available
+    pick = None
+    for candidate in [lang, "en", "en-US", "en-GB"]:
+        if candidate in available:
+            pick = candidate
+            break
+    if not pick and available:
+        pick = available[0]
+    if not pick:
+        log.warning(f"no captions yet for {guid} (transcribing status: {meta.get('transcribingStatus')})")
+        return ""
+
+    url = f"https://video.bunnycdn.com/library/{library_id}/videos/{guid}/captions/{pick}"
+    r = requests.get(url, headers={"AccessKey": api_key}, timeout=30)
+    if r.status_code != 200:
+        log.warning(f"caption fetch failed {r.status_code}: {r.text[:200]}")
+        return ""
+
+    # VTT → plain text. Strip header, timestamps, cue numbers.
+    text_lines: list[str] = []
+    for line in r.text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("WEBVTT") or s.startswith("NOTE") or "-->" in s:
+            continue
+        if re.fullmatch(r"\d+", s):  # cue number
+            continue
+        text_lines.append(s)
+    return " ".join(text_lines).strip()
 
 
 def normalize_title(s: str) -> str:
@@ -179,29 +198,20 @@ def main(run_id: str | None = None) -> None:
                 duration = bunny_match.get("length", 0)
                 log.info(f"  → {lesson_title[:50]} → bunny:{guid}")
 
-                # Download MP4 from Bunny
-                mp4 = course_scratch / f"{guid}.mp4"
-                download_from_bunny(bunny_lib, guid, mp4)
-
-                # Final transcribe (EN — videos are already dubbed/cut)
-                tr = whisper.transcribe(api_key=openai_key, file_path=mp4,
-                                       language="en", with_word_timestamps=False)
+                # Use Bunny's auto-generated captions instead of downloading + Whisper
+                transcript = fetch_bunny_caption_text(bunny_lib, bunny_key, guid, lang="en")
+                if not transcript:
+                    log.warning(f"no captions ready for {guid}, using empty transcript")
 
                 processed.append({
                     "title": lesson_title,
                     "videoKey": guid,
                     "videoLibraryId": bunny_lib,
                     "duration": int(duration) or None,
-                    "transcriptEn": tr.get("text", ""),
+                    "transcriptEn": transcript,
                     "originalLang": "en",
-                    "wasDubbed": False,  # unknown post-hoc; safest default
+                    "wasDubbed": False,
                 })
-
-                # Free disk per video
-                try:
-                    mp4.unlink()
-                except Exception:
-                    pass
 
             if not processed:
                 log.error(f"course {course_idx}: no videos matched on Bunny")
