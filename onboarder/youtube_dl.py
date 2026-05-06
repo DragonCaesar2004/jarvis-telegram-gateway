@@ -168,19 +168,38 @@ def _count_channel_videos(channel_id_or_url: str, sample: int = 200) -> int:
     return -1
 
 
-def list_channel_videos(channel_id_or_url: str, max_results: int = 50,
-                        max_age_months: int | None = None) -> list[dict[str, Any]]:
-    """List recent videos from a channel. Flat listing — no per-video full metadata.
+def list_channel_videos(channel_id_or_url: str,
+                        max_results: int | None = None,
+                        max_age_months: int | None = None,
+                        safety_cap: int = 2000) -> list[dict[str, Any]]:
+    """List videos from a channel (flat metadata only, no per-video round-trips).
 
-    Returns up to `max_results` videos sorted newest-first. If `max_age_months`
-    is set, filter out videos older than that.
+    By default fetches the channel's ENTIRE catalog (up to `safety_cap` as a
+    sanity ceiling) and filters by `max_age_months` afterwards. This is much
+    cheaper than fetching mp4s — flat listing is just a few hundred bytes per
+    video — and gives Claude the widest possible candidate pool when picking a
+    course. Returns videos sorted newest-first.
+
+    Args:
+        max_results: hard cap on total entries returned (None = no explicit cap;
+                     yt-dlp + safety_cap still bound it). Set this if you want
+                     to limit prompt size for a specific call.
+        max_age_months: post-filter — drop videos older than this many months.
+                        Set in the operator's Criteria sheet.
+        safety_cap: absolute ceiling, applied even if max_results is None.
+                    Protects against pathological channels with 50k+ videos.
     """
     url = _channel_videos_url(channel_id_or_url)
     cutoff_ts: float | None = None
     if max_age_months:
         cutoff_ts = time.time() - (max_age_months * 30.4 * 24 * 3600)
 
-    with _ydl({"extract_flat": "in_playlist", "playlistend": max_results}) as ydl:
+    # `playlistend` of None lets yt-dlp pull the whole channel; we still cap at
+    # safety_cap below to avoid blowing up on news-channel-style firehoses.
+    fetch_cap = max_results if max_results is not None else safety_cap
+    fetch_cap = max(1, min(fetch_cap, safety_cap))
+
+    with _ydl({"extract_flat": "in_playlist", "playlistend": fetch_cap}) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
         except Exception as e:
