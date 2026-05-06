@@ -10,7 +10,7 @@ Pipeline:
     3. Top 3*N channels: fetch metadata, apply HARD filter (subs, video_count)
     4. Claude scores remaining channels for topical fit
     5. Take top N (one channel per course)
-    6. For each channel: list recent videos (filtered by age), Claude picks 6-12
+    6. For each channel: list recent videos (filtered by age), Claude picks 5-30
     7. ENRICH (per course): parallel download → Whisper → mark cuts → describe →
        research author (deep WebSearch) → compose full course payload. Cuts +
        working transcript persisted to pipeline.db. Composed payload also saved.
@@ -41,7 +41,7 @@ DEFAULT_SEARCH_RESULTS = 50   # criteria.search_results overrides
 TARGET_PASSING_PER_COURSE = 4  # try to get this many passing channels per course
 HARD_CAP_CHANNELS_TO_CHECK = 50  # absolute ceiling on metadata fetches
 MIN_LLM_SCORE = 0.5
-CHANNEL_VIDEOS_TO_LIST = 50
+CHANNEL_VIDEOS_TO_LIST = 100  # was 50; widened so Claude can pick up to 30 lessons
 PROGRESS_INTERVAL_SEC = 30  # don't spam Telegram
 
 
@@ -290,6 +290,18 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
             _send(token, chat_id,
                   f"⚠️ Курс {course_idx} ({_html_escape(ch_name)}) пропущен — "
                   f"все {len(lessons)} видео уже обрабатывались.")
+            continue
+
+        # Enforce the 5-video minimum AFTER dedup. Even if Claude picked 5+,
+        # earlier runs may have eaten some via the seen-videos dedup. A 1-3
+        # video "course" isn't a course — skip and let the operator find
+        # another channel.
+        MIN_LESSONS_PER_COURSE = 5
+        if len(dedup_lessons) < MIN_LESSONS_PER_COURSE:
+            _send(token, chat_id,
+                  f"⚠️ Курс {course_idx} ({_html_escape(ch_name)}) пропущен — "
+                  f"после дедупликации осталось только {len(dedup_lessons)} видео, "
+                  f"минимум {MIN_LESSONS_PER_COURSE}. Канал не годится для отдельного курса.")
             continue
 
         # ── 6a. ENRICH: download + transcribe + cuts + describe + compose ──

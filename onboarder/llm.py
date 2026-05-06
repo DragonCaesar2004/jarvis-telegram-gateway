@@ -2,7 +2,7 @@
 
 Four jobs:
     1. score_channels()   — rank candidate YouTube channels against criteria + topic
-    2. select_videos()    — pick a coherent course of 6-12 videos from one channel's video list
+    2. select_videos()    — pick a coherent course of 5-30 videos from one channel's video list
     3. mark_cuts()        — given a Whisper transcript with word timestamps, return [(start_s, end_s, reason)]
                             for intro/outro/promo/off-topic segments to remove
     4. compose_course()   — final course title, excerpt, aboutContent + author bio
@@ -244,26 +244,45 @@ def score_channels(*, topic: str, criteria: dict[str, Any],
 
 SELECT_VIDEOS_SYSTEM = """You build coherent online courses by curating videos from a single YouTube channel.
 
-Given a channel's recent video list and a course topic, select 6-12 videos that together form a logical learning progression on that topic. Skip:
-- Off-topic videos (channel may cover multiple themes)
-- Promotional/announcement videos
-- Live streams and Q&A sessions (unless clearly structured)
-- Videos shorter than preferred_video_length_min minutes or longer than preferred_video_length_max
-- Duplicates / reposts / "best of" compilations
+Given a channel's recent video list and a course topic, select 5-30 videos that together form a STRUCTURED LEARNING PROGRESSION on that exact topic.
 
-Order the selected videos for course delivery (basics → advanced).
+## Selection bar (be strict — quality matters far more than count)
+
+INCLUDE only videos that:
+1. **Directly serve the topic.** The title clearly signals it covers the core subject or a sub-topic any reasonable curriculum would include. "Tangentially related" is not enough — if a video would feel out of place in a paid course on this topic, exclude it.
+2. **Build on each other.** Taken together, the selected videos cover the topic from foundations to advanced application without major gaps. A reader who watches them in order should leave with a coherent mental model, not a grab-bag of tips.
+3. **Aren't redundant.** If two videos cover the same material, keep the better one (clearer title, longer/more thorough, more recent).
+
+EXCLUDE videos that are:
+- Off-topic (channels often cover multiple themes — only pick those that fit THIS course's topic)
+- Promotional / announcement-only (sponsorship reads, "I'm starting a new course", product launches)
+- Live streams, Q&As, podcasts, or unstructured interviews (unless they're explicitly framed as standalone lessons)
+- Outside preferred_video_length_min..preferred_video_length_max
+- Duplicates / reposts / "best of" compilations / Shorts (under ~3 min)
+
+## Sequencing
+
+Order the selected videos for course delivery. Default arc: foundations → core concepts → application → advanced. If a different ordering serves the topic better (chronological, problem-by-problem, anatomy-by-anatomy), use it — but justify it with the per-lesson `reason` field. Each `reason` should say WHAT this lesson contributes to the overall progression, not just describe the video.
+
+## Length rules
+
+- **Minimum: 5 videos.** If fewer than 5 on the channel meet the bar AND together form a coherent progression, return skip_reason with a null course_title. DO NOT pad with off-topic or low-quality videos to reach the minimum — better to skip the channel.
+- **Maximum: 30 videos.** If the channel has more on-topic material than fits, pick the strongest 30 that together still form a clean progression.
+- **Aim for the smallest count that COMPLETELY covers the topic.** Don't inflate the course with filler. A tight 8-video course beats a bloated 20-video one.
+
+## Output
 
 Return ONLY valid JSON, no prose:
 {
-  "course_title": "Short, descriptive course title (e.g. 'AI for marketers: practical foundations')",
+  "course_title": "Short, outcome-oriented course title (e.g. 'AI for marketers: practical foundations' — names what the student can do after)",
   "lessons": [
-    {"video_id": "abc123", "title": "(may keep original or improve)", "order": 0, "reason": "intro"},
+    {"video_id": "abc123", "title": "(may keep original or rewrite for clarity)", "order": 0, "reason": "What this lesson contributes to the progression — e.g. 'establishes the core decision-matrix used in lessons 4-7'"},
     ...
   ]
 }
 
-If the channel doesn't have enough on-topic material for a coherent 6+ video course, return:
-{"course_title": null, "lessons": [], "skip_reason": "..."}
+If the channel doesn't have enough on-topic material for a coherent 5+ video course, return:
+{"course_title": null, "lessons": [], "skip_reason": "Concrete reason — e.g. 'only 2 videos directly cover this topic; the rest are reaction/lifestyle content'"}
 """
 
 
