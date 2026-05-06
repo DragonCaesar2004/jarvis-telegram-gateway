@@ -22,6 +22,7 @@ import shutil
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -234,6 +235,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                 course_topic=clean_title,
                 youtube_cookies_file=youtube_cookies_file,
                 rotator=rotator,
+                parallel_videos=int(onb.get("phase2_parallel_videos", 1) or 1),
             )
         finally:
             # Free disk regardless of outcome
@@ -446,33 +448,88 @@ def _process_course_videos(*, token: str, chat_id: int, agent: str, user_id: int
                            get_elevenlabs_key, bunny_lib: str, bunny_key: str,
                            course_topic: str,
                            youtube_cookies_file: str | None = None,
-                           rotator=None) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    total = len(lessons)
-    for i, lesson in enumerate(lessons, start=1):
-        prefix = f"Курс {course_idx}, видео {i}/{total}"
-        try:
-            row = _process_one_video(
-                token=token, chat_id=chat_id, prefix=prefix,
-                lesson=lesson, scratch_dir=scratch_dir,
-                openai_key=openai_key, get_elevenlabs_key=get_elevenlabs_key,
-                bunny_lib=bunny_lib, bunny_key=bunny_key,
-                course_topic=course_topic,
-                youtube_cookies_file=youtube_cookies_file,
-                rotator=rotator,
-            )
+                           rotator=None,
+                           parallel_videos: int = 1) -> list[dict[str, Any]]:
+    """Process every approved video in a course → list of NMS lesson payloads.
 
-            out.append(row)
-        except CookiesNeededError:
-            # Pool exhausted — rethrow so the worker pauses Phase 2
-            raise
-        except Exception as e:
-            log.error(f"phase2: video {lesson.get('video_id')} failed: {e}", exc_info=True)
-            _send(token, chat_id,
-                  f"⚠️ {prefix}: <i>{_html_escape(lesson.get('title', '?'))[:50]}</i> — "
-                  f"<code>{_html_escape(str(e))[:200]}</code>\n"
-                  f"Видео пропущено, продолжаю с остальными.")
-    return out
+    `parallel_videos`: how many videos to process at once. Default 1 (sequential)
+    keeps the original behavior. Higher values speed things up linearly when
+    download / FFmpeg / upload aren't the bottleneck — but ElevenLabs dub is
+    serialized per-account by tier (Creator=1, Pro=3, Scale=5+), so set this
+    above your tier's concurrency only if most videos are already English
+    (no dub needed).
+    """
+    total = len(lessons)
+    parallel = max(1, min(int(parallel_videos or 1), total))
+
+    def _kwargs_for(i: int, lesson: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "token": token, "chat_id": chat_id,
+            "prefix": f"Курс {course_idx}, видео {i}/{total}",
+            "lesson": lesson, "scratch_dir": scratch_dir,
+            "openai_key": openai_key,
+            "get_elevenlabs_key": get_elevenlabs_key,
+            "bunny_lib": bunny_lib, "bunny_key": bunny_key,
+            "course_topic": course_topic,
+            "youtube_cookies_file": youtube_cookies_file,
+            "rotator": rotator,
+        }
+
+    # ── Sequential path (original behavior, default). ───────────────────
+    if parallel == 1:
+        out: list[dict[str, Any]] = []
+        for i, lesson in enumerate(lessons, start=1):
+            try:
+                out.append(_process_one_video(**_kwargs_for(i, lesson)))
+            except CookiesNeededError:
+                raise
+            except Exception as e:
+                log.error(f"phase2: video {lesson.get('video_id')} failed: {e}",
+                          exc_info=True)
+                _send(token, chat_id,
+                      f"⚠️ Курс {course_idx}, видео {i}/{total}: "
+                      f"<i>{_html_escape(lesson.get('title', '?'))[:50]}</i> — "
+                      f"<code>{_html_escape(str(e))[:200]}</code>\n"
+                      f"Видео пропущено, продолжаю с остальными.")
+        return out
+
+    # ── Parallel path. ──────────────────────────────────────────────────
+    _send(token, chat_id,
+          f"🔀 Курс {course_idx}: обрабатываю до {parallel} видео одновременно "
+          f"(всего {total}).")
+
+    cookies_needed: CookiesNeededError | None = None
+    by_idx: dict[int, dict[str, Any]] = {}
+
+    with ThreadPoolExecutor(max_workers=parallel) as ex:
+        futures: dict[Any, tuple[int, dict[str, Any]]] = {}
+        for i, lesson in enumerate(lessons, start=1):
+            fut = ex.submit(_process_one_video, **_kwargs_for(i, lesson))
+            futures[fut] = (i, lesson)
+
+        for fut in as_completed(futures):
+            i, lesson = futures[fut]
+            try:
+                by_idx[i] = fut.result()
+            except CookiesNeededError as e:
+                cookies_needed = e
+                # Cancel anything that hasn't started yet — proxies are dead.
+                for f in futures:
+                    f.cancel()
+                break
+            except Exception as e:
+                log.error(f"phase2: video {lesson.get('video_id')} failed: {e}",
+                          exc_info=True)
+                _send(token, chat_id,
+                      f"⚠️ Курс {course_idx}, видео {i}/{total}: "
+                      f"<i>{_html_escape(lesson.get('title', '?'))[:50]}</i> — "
+                      f"<code>{_html_escape(str(e))[:200]}</code>\n"
+                      f"Видео пропущено, продолжаю с остальными.")
+
+    if cookies_needed is not None:
+        raise cookies_needed
+
+    return [by_idx[i] for i in sorted(by_idx.keys())]
 
 
 def _is_bot_check_error(err: Exception) -> bool:

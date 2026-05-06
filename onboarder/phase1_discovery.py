@@ -29,6 +29,7 @@ import logging
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from . import (_secrets, llm, phase1_enrich, proxy_pool, sheets,
@@ -48,6 +49,8 @@ CHANNEL_VIDEOS_TO_LIST = None  # None = fetch the whole channel catalog (subject
                                # Flat metadata is cheap; bigger pool = better
                                # Claude selection.
 PROGRESS_INTERVAL_SEC = 30  # don't spam Telegram
+METADATA_BATCH_SIZE = 8     # how many channels to probe in parallel; tune via
+                            # onboarder.phase1_metadata_workers in config.json
 
 
 # ---------------------------------------------------------------------------
@@ -191,24 +194,42 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     rejected: list[dict[str, Any]] = []
     last_progress = time.time()
     checked = 0
-    for ch in candidates[:cap]:
-        meta = ytdl.get_channel_metadata(ch["channel_id"])
-        checked += 1
-        if not meta:
-            continue
-        if not _passes_hard_filter(meta, criteria):
-            log.info(f"phase1[{user_id}] filter out: {meta['channel_name']} "
-                     f"(subs={meta['subscribers']}, videos={meta['video_count']})")
-            rejected.append(meta)
-            continue
-        enriched.append({**meta, "votes": ch.get("votes", 0),
-                         "sample_titles": ch.get("sample_titles", [])})
+    metadata_workers = max(1, int(onb.get("phase1_metadata_workers")
+                                  or METADATA_BATCH_SIZE))
+    # Probe candidates in batches so we still get the early-exit benefit when
+    # `target_passing` channels pass the hard filter — but inside each batch
+    # the yt-dlp calls run concurrently, turning ~8 min sequential into ~1 min.
+    for batch_start in range(0, cap, metadata_workers):
+        batch = candidates[batch_start:batch_start + metadata_workers]
+        if not batch:
+            break
+
+        with ThreadPoolExecutor(max_workers=len(batch)) as ex:
+            metas = list(ex.map(
+                lambda c: ytdl.get_channel_metadata(c["channel_id"]),
+                batch,
+            ))
+
+        for ch, meta in zip(batch, metas):
+            checked += 1
+            if not meta:
+                continue
+            if not _passes_hard_filter(meta, criteria):
+                log.info(f"phase1[{user_id}] filter out: {meta['channel_name']} "
+                         f"(subs={meta['subscribers']}, videos={meta['video_count']})")
+                rejected.append(meta)
+                continue
+            enriched.append({**meta, "votes": ch.get("votes", 0),
+                             "sample_titles": ch.get("sample_titles", [])})
+
         if time.time() - last_progress > PROGRESS_INTERVAL_SEC:
             _send(token, chat_id,
                   f"… проверено {checked}/{cap}, прошло фильтр: {len(enriched)}")
             last_progress = time.time()
+
         if len(enriched) >= target_passing:
-            log.info(f"phase1[{user_id}] reached target {target_passing} passing channels, stop scanning")
+            log.info(f"phase1[{user_id}] reached target {target_passing} "
+                     f"passing channels, stop scanning")
             break
 
     if not enriched:
