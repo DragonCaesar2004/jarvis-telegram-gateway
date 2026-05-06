@@ -249,6 +249,36 @@ def get_active_video_ids(client: Any, sheet_id: str) -> set[str]:
     return out
 
 
+def get_seen_channel_ids(client: Any, sheet_id: str) -> set[str]:
+    """Return every channel_id that has appeared in the Lessons tab.
+
+    Used by Phase 1 to skip channels whose author already has a course on the
+    platform. The legacy import (import_existing_courses.py) seeds these rows
+    with run_id=legacy_import, so any channel that's already on truelifeflow
+    won't surface again in a new run's candidate list.
+    """
+    ws = ensure_lessons_tab(client, sheet_id)
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        return set()
+
+    header = rows[0]
+    try:
+        idx_channel_id = header.index("channel_id")
+    except ValueError:
+        log.warning("sheets: Lessons tab missing channel_id column")
+        return set()
+
+    out: set[str] = set()
+    for row in rows[1:]:
+        if len(row) <= idx_channel_id:
+            continue
+        cid = (row[idx_channel_id] or "").strip()
+        if cid:
+            out.add(cid)
+    return out
+
+
 def append_lesson_rows(client: Any, sheet_id: str, *, run_id: str,
                        rows: list[dict[str, Any]]) -> None:
     """Append new lesson candidates to the Lessons tab as `pending`.

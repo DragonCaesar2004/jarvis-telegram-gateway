@@ -134,11 +134,13 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     criteria = sheets.read_criteria(client, sheet_id)
     log.info(f"phase1[{user_id}] criteria: {criteria}")
 
-    # ── 2. Ensure unified Lessons tab + collect every previously-seen video_id
+    # ── 2. Ensure unified Lessons tab + collect previously-seen video_ids and channel_ids
     sheets.ensure_lessons_tab(client, sheet_id)
     active_video_ids = sheets.get_active_video_ids(client, sheet_id)
-    log.info(f"phase1[{user_id}] {len(active_video_ids)} videos previously seen in Sheet — "
-             f"deduping these (any status, including rejected/failed)")
+    blocked_channel_ids = sheets.get_seen_channel_ids(client, sheet_id)
+    log.info(f"phase1[{user_id}] {len(active_video_ids)} videos and "
+             f"{len(blocked_channel_ids)} channels previously seen in Sheet — "
+             f"deduping these (any status, including rejected/failed/legacy_import)")
 
     run_id = sheets.make_run_id()
     _state.update(agent, user_id, run_id=run_id,
@@ -213,6 +215,12 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         for ch, meta in zip(batch, metas):
             checked += 1
             if not meta:
+                continue
+            # Channel-level dedup — author already has a course on the
+            # platform, propose someone else instead.
+            if meta.get("channel_id") in blocked_channel_ids:
+                log.info(f"phase1[{user_id}] skip already-on-platform channel: "
+                         f"{meta.get('channel_name')!r} (id={meta.get('channel_id')})")
                 continue
             if not _passes_hard_filter(meta, criteria):
                 log.info(f"phase1[{user_id}] filter out: {meta['channel_name']} "
