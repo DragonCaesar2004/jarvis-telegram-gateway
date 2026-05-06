@@ -1,12 +1,15 @@
 """Google Sheets I/O for the onboarder pipeline.
 
-Layout (see SETUP.md for human setup):
+Layout (single source of truth for the operator):
     Tab `Criteria` -- Param/Value rows; bot reads at start of every run.
-    Tab `Runs`     -- one row per wizard run; bot writes status updates.
-    Tab `Run-{ts}` -- per-run sheet with course/lesson candidates and Approved checkbox.
+    Tab `Lessons`  -- ALL lesson candidates across all runs, with per-row
+                      status (pending|processing|done|failed|skipped_duplicate).
+                      Phase 1 appends new candidates (skipping duplicates by
+                      video_id). Phase 2 reads approved+pending rows, marks
+                      them processing → done.
 
-All functions take a `client` (authorized gspread.Client) and `sheet_id` (str) so
-they can be unit-tested with a fake client without touching the real Sheet.
+All functions take a `client` (authorized gspread.Client) and `sheet_id` (str)
+so they can be unit-tested with a fake client without touching the real Sheet.
 """
 
 from __future__ import annotations
@@ -14,28 +17,40 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 log = logging.getLogger("gateway")
 
-# Header rows (must match SETUP.md). Lowercase identifiers used internally.
-RUN_TAB_HEADER = [
-    "Курс",          # course title (e.g. "Курс 1: AI Hub — Основы AI для маркетинга")
-    "Lesson №",
-    "Канал",
-    "Название",
-    "Ссылка на видео",
-    "Длит",          # human-readable like "18 мин"
-    "Approved",      # TRUE / FALSE checkbox
-    # Hidden columns (after Approved) used by the bot for cross-step linking:
-    "_video_id",     # YouTube video id
-    "_channel_id",   # YouTube channel id
-    "_duration_sec", # numeric duration
-    "_course_idx",   # 1..N course index
-    "_lesson_idx",   # 1..M lesson index within course
+# Header for the unified Lessons tab. Columns ordered by user-facing
+# importance (status/approved/course/channel left, technical IDs right).
+LESSONS_HEADER = [
+    "status",            # A: pending | processing | done | failed | skipped_duplicate
+    "approved",          # B: TRUE / FALSE checkbox (user-edited)
+    "course",            # C: full "Course N: Channel — Title"
+    "channel",           # D: channel name
+    "lesson_idx",        # E: 1..M within course
+    "lesson_title",      # F: video title
+    "url",               # G: youtube link
+    "duration",          # H: human-readable "20 мин"
+    "course_admin_url",  # I: filled when status=done
+    "failure_reason",    # J: filled when status=failed
+    "timestamp",         # K: ISO datetime when added
+    "run_id",            # L: timestamp prefix for grouping
+    "video_id",          # M: youtube video id (used for dedup)
+    "channel_id",        # N: youtube channel id
+    "course_idx",        # O: 1..N within run
+    "duration_sec",      # P: numeric
 ]
 
-RUNS_INDEX_HEADER = ["timestamp", "topic", "count", "status", "sheet_tab", "courses"]
+# Status enum values
+STATUS_PENDING = "pending"
+STATUS_PROCESSING = "processing"
+STATUS_DONE = "done"
+STATUS_FAILED = "failed"
+STATUS_SKIPPED_DUPLICATE = "skipped_duplicate"
+
+# Statuses that mark a video as "owned" by another run/course (dedup gate)
+ACTIVE_STATUSES = {STATUS_PROCESSING, STATUS_DONE}
 
 CRITERIA_DEFAULTS: dict[str, Any] = {
     "min_subscribers": 5000,
@@ -47,6 +62,8 @@ CRITERIA_DEFAULTS: dict[str, Any] = {
     "preferred_video_length_min": 10,
     "preferred_video_length_max": 35,
 }
+
+LESSONS_TAB_NAME = "Lessons"
 
 
 # ---------------------------------------------------------------------------
@@ -76,16 +93,11 @@ def open_spreadsheet(client: Any, sheet_id: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Criteria tab
+# Criteria tab (unchanged from before)
 # ---------------------------------------------------------------------------
 
 def read_criteria(client: Any, sheet_id: str) -> dict[str, Any]:
-    """Read tab `Criteria` and merge with defaults. Missing keys fall back to defaults.
-
-    Type coercion:
-        - integer-looking strings → int
-        - comma-separated strings (preferred_languages) → list[str]
-    """
+    """Read tab `Criteria` and merge with defaults. Missing keys fall back to defaults."""
     ss = open_spreadsheet(client, sheet_id)
     try:
         ws = ss.worksheet("Criteria")
@@ -119,140 +131,175 @@ def _coerce(key: str, val: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Runs index tab
+# Unified Lessons tab
 # ---------------------------------------------------------------------------
 
-def append_run(client: Any, sheet_id: str, *, run_id: str, topic: str,
-               count: int, status: str, sheet_tab: str = "") -> int:
-    """Append a row to `Runs`. Returns 1-based row number."""
-    ss = open_spreadsheet(client, sheet_id)
-    ws = _ensure_ws(ss, "Runs", header=RUNS_INDEX_HEADER)
-    row = [run_id, topic, str(count), status, sheet_tab, ""]
-    ws.append_row(row, value_input_option="USER_ENTERED")
-    # gspread's append_row doesn't return the row index, so we approximate:
-    return len(ws.get_all_values())
-
-
-def update_run_status(client: Any, sheet_id: str, run_id: str, *,
-                      status: str | None = None,
-                      sheet_tab: str | None = None,
-                      courses: str | None = None) -> None:
-    """Find the run row by run_id and update specified columns. Silent if not found."""
+def ensure_lessons_tab(client: Any, sheet_id: str) -> Any:
+    """Return the Lessons worksheet, creating it with header if missing."""
     ss = open_spreadsheet(client, sheet_id)
     try:
-        ws = ss.worksheet("Runs")
+        return ss.worksheet(LESSONS_TAB_NAME)
     except Exception:
-        log.warning("sheets: Runs tab missing on update_run_status")
-        return
+        ws = ss.add_worksheet(title=LESSONS_TAB_NAME, rows=200, cols=len(LESSONS_HEADER))
+        ws.append_row(LESSONS_HEADER, value_input_option="USER_ENTERED")
+        return ws
+
+
+def get_active_video_ids(client: Any, sheet_id: str) -> set[str]:
+    """Return video_ids whose status is processing OR done.
+
+    Used by Phase 1 to skip duplicates — we never want to re-process a video
+    that's already in active state somewhere.
+    """
+    ws = ensure_lessons_tab(client, sheet_id)
     rows = ws.get_all_values()
-    for idx, row in enumerate(rows[1:], start=2):  # skip header, 1-based
-        if row and row[0] == run_id:
-            updates = []
-            if status is not None:
-                updates.append({"range": f"D{idx}", "values": [[status]]})
-            if sheet_tab is not None:
-                updates.append({"range": f"E{idx}", "values": [[sheet_tab]]})
-            if courses is not None:
-                updates.append({"range": f"F{idx}", "values": [[courses]]})
-            if updates:
-                ws.batch_update(updates, value_input_option="USER_ENTERED")
-            return
-    log.warning(f"sheets: run_id {run_id} not found in Runs tab")
+    if len(rows) < 2:
+        return set()
+
+    # Build column index map from header (resilient to column reordering)
+    header = rows[0]
+    try:
+        idx_status = header.index("status")
+        idx_video_id = header.index("video_id")
+    except ValueError:
+        log.warning("sheets: Lessons tab missing status/video_id columns")
+        return set()
+
+    out: set[str] = set()
+    for row in rows[1:]:
+        if len(row) <= max(idx_status, idx_video_id):
+            continue
+        status = (row[idx_status] or "").strip().lower()
+        vid = (row[idx_video_id] or "").strip()
+        if vid and status in ACTIVE_STATUSES:
+            out.add(vid)
+    return out
 
 
-# ---------------------------------------------------------------------------
-# Per-run tab (Run-{ts})
-# ---------------------------------------------------------------------------
-
-def create_run_tab(client: Any, sheet_id: str, tab_name: str) -> Any:
-    """Create the Run-* tab with header. If exists, returns existing worksheet."""
-    ss = open_spreadsheet(client, sheet_id)
-    return _ensure_ws(ss, tab_name, header=RUN_TAB_HEADER, rows=200, cols=12)
-
-
-def append_lesson_rows(client: Any, sheet_id: str, tab_name: str,
+def append_lesson_rows(client: Any, sheet_id: str, *, run_id: str,
                        rows: list[dict[str, Any]]) -> None:
-    """Append per-lesson rows to the Run-* tab.
+    """Append new lesson candidates to the Lessons tab as `pending`.
 
-    Each row dict keys (case-sensitive):
-        course, lesson_idx, channel, title, url, duration_sec,
-        video_id, channel_id, course_idx
-    The Approved column is auto-set to FALSE (user ticks via Sheet UI).
+    Each row dict (input) keys:
+        course, lesson_idx, channel, channel_id, lesson_title, url, video_id,
+        duration_sec, course_idx
     """
     if not rows:
         return
-    ss = open_spreadsheet(client, sheet_id)
-    ws = ss.worksheet(tab_name)
-    values = []
+    ws = ensure_lessons_tab(client, sheet_id)
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    values: list[list[Any]] = []
     for r in rows:
         dur_sec = int(r.get("duration_sec") or 0)
         values.append([
-            r.get("course", ""),
-            r.get("lesson_idx", ""),
-            r.get("channel", ""),
-            r.get("title", ""),
-            r.get("url", ""),
-            _format_duration(dur_sec),
-            "FALSE",
-            r.get("video_id", ""),
-            r.get("channel_id", ""),
-            dur_sec,
-            r.get("course_idx", ""),
-            r.get("lesson_idx", ""),
+            STATUS_PENDING,                         # A status
+            "FALSE",                                # B approved
+            r.get("course", ""),                    # C course
+            r.get("channel", ""),                   # D channel
+            r.get("lesson_idx", ""),                # E lesson_idx
+            r.get("lesson_title", r.get("title", "")),  # F lesson_title
+            r.get("url", ""),                       # G url
+            _format_duration(dur_sec),              # H duration
+            "",                                     # I course_admin_url
+            "",                                     # J failure_reason
+            ts,                                     # K timestamp
+            run_id,                                 # L run_id
+            r.get("video_id", ""),                  # M video_id
+            r.get("channel_id", ""),                # N channel_id
+            r.get("course_idx", ""),                # O course_idx
+            dur_sec,                                # P duration_sec
         ])
     ws.append_rows(values, value_input_option="USER_ENTERED")
 
 
-def read_approved_rows(client: Any, sheet_id: str, tab_name: str) -> list[dict[str, Any]]:
-    """Read the Run-* tab and return only rows where Approved column is truthy.
+def _row_to_dict(row: list[str], header: list[str]) -> dict[str, str]:
+    """Pad row to header length and zip into a dict keyed by header names."""
+    padded = row + [""] * (len(header) - len(row))
+    return {h: padded[i] for i, h in enumerate(header)}
 
-    Returns dicts with the same keys as append_lesson_rows() input, plus
-    the (possibly user-edited) `title`. Approval is checked case-insensitively
-    against TRUE / true / 1 / x / yes / да.
+
+def read_pending_approved_rows(client: Any, sheet_id: str,
+                               run_id: str | None = None) -> list[dict[str, Any]]:
+    """Return rows where Approved=TRUE AND status=pending.
+
+    Each item carries enough metadata for Phase 2 + a `_sheet_row` index for
+    later status updates. Filter by run_id if provided (otherwise all runs).
     """
-    ss = open_spreadsheet(client, sheet_id)
-    ws = ss.worksheet(tab_name)
+    ws = ensure_lessons_tab(client, sheet_id)
     rows = ws.get_all_values()
-    out: list[dict[str, Any]] = []
     if len(rows) < 2:
-        return out
-    for row in rows[1:]:
-        # pad to header length
-        padded = row + [""] * (len(RUN_TAB_HEADER) - len(row))
-        approved = (padded[6] or "").strip().lower()
-        if approved not in ("true", "1", "x", "yes", "да"):
+        return []
+    header = rows[0]
+    out: list[dict[str, Any]] = []
+    for i, raw in enumerate(rows[1:], start=2):  # 1-based, +1 for header
+        d = _row_to_dict(raw, header)
+        if (d.get("status", "").strip().lower() != STATUS_PENDING):
+            continue
+        if (d.get("approved", "").strip().lower() not in ("true", "1", "x", "yes", "да")):
+            continue
+        if run_id and d.get("run_id", "").strip() != run_id:
             continue
         try:
-            duration_sec = int(padded[9] or 0)
+            duration_sec = int(d.get("duration_sec") or 0)
         except ValueError:
             duration_sec = 0
         out.append({
-            "course": padded[0],
-            "lesson_idx_display": padded[1],
-            "channel": padded[2],
-            "title": padded[3],            # user may have edited
-            "url": padded[4],
-            "video_id": padded[7],
-            "channel_id": padded[8],
+            "course": d.get("course", ""),
+            "channel": d.get("channel", ""),
+            "channel_id": d.get("channel_id", ""),
+            "title": d.get("lesson_title", ""),
+            "url": d.get("url", ""),
+            "video_id": d.get("video_id", ""),
             "duration_sec": duration_sec,
-            "course_idx": _safe_int(padded[10]),
-            "lesson_idx": _safe_int(padded[11]),
+            "course_idx": _safe_int(d.get("course_idx", "")),
+            "lesson_idx": _safe_int(d.get("lesson_idx", "")),
+            "run_id": d.get("run_id", ""),
+            "_sheet_row": i,  # 1-based row index for batch_update
         })
     return out
+
+
+def update_status(client: Any, sheet_id: str, *, sheet_rows: list[int],
+                  new_status: str,
+                  course_admin_url: str | None = None,
+                  failure_reason: str | None = None) -> None:
+    """Bulk-update status (and optionally admin URL / failure reason) for rows by index.
+
+    `sheet_rows` are 1-based row numbers as returned by read_pending_approved_rows.
+    """
+    if not sheet_rows:
+        return
+    ws = ensure_lessons_tab(client, sheet_id)
+
+    # Map column letters from the canonical header
+    col_status = _col_letter("status")           # A
+    col_admin = _col_letter("course_admin_url")  # I
+    col_reason = _col_letter("failure_reason")   # J
+
+    updates: list[dict[str, Any]] = []
+    for r in sheet_rows:
+        updates.append({"range": f"{col_status}{r}", "values": [[new_status]]})
+        if course_admin_url is not None:
+            updates.append({"range": f"{col_admin}{r}", "values": [[course_admin_url]]})
+        if failure_reason is not None:
+            updates.append({"range": f"{col_reason}{r}", "values": [[failure_reason[:300]]]})
+    ws.batch_update(updates, value_input_option="USER_ENTERED")
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _ensure_ws(ss: Any, title: str, *, header: list[str], rows: int = 100, cols: int = 12) -> Any:
-    """Return existing worksheet by title, or create with header if missing."""
-    try:
-        return ss.worksheet(title)
-    except Exception:
-        ws = ss.add_worksheet(title=title, rows=rows, cols=cols)
-        ws.append_row(header, value_input_option="USER_ENTERED")
-        return ws
+def _col_letter(header_name: str) -> str:
+    """Header → A/B/C... column letter."""
+    idx = LESSONS_HEADER.index(header_name)
+    if idx < 26:
+        return chr(ord("A") + idx)
+    # Two-letter columns (AA, AB, ...). For our 16-col header we never need this,
+    # but keeping for safety:
+    first = idx // 26 - 1
+    second = idx % 26
+    return chr(ord("A") + first) + chr(ord("A") + second)
 
 
 def _format_duration(sec: int) -> str:
@@ -273,14 +320,10 @@ def _safe_int(v: str | int) -> int:
 
 
 def make_run_id() -> str:
-    """e.g. 2026-05-04T12-34-56"""
+    """e.g. 2026-05-05T12-34-56"""
     return time.strftime("%Y-%m-%dT%H-%M-%S")
 
 
-def run_tab_name(run_id: str) -> str:
-    return f"Run-{run_id}"
-
-
-def sheet_tab_url(sheet_id: str, gid: int | None = None) -> str:
+def sheet_url(sheet_id: str, gid: int | None = None) -> str:
     base = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
     return f"{base}#gid={gid}" if gid is not None else base

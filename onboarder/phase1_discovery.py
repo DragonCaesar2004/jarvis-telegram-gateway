@@ -86,15 +86,15 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     criteria = sheets.read_criteria(client, sheet_id)
     log.info(f"phase1[{user_id}] criteria: {criteria}")
 
-    # ── 2. Create Run row + Run-* tab ────────────────────────────────────
+    # ── 2. Ensure unified Lessons tab + collect already-processed video_ids
+    sheets.ensure_lessons_tab(client, sheet_id)
+    active_video_ids = sheets.get_active_video_ids(client, sheet_id)
+    log.info(f"phase1[{user_id}] {len(active_video_ids)} videos already in active state — skipping these")
+
     run_id = sheets.make_run_id()
-    tab_name = sheets.run_tab_name(run_id)
-    sheets.append_run(client, sheet_id, run_id=run_id, topic=topic,
-                      count=count, status="phase1_searching", sheet_tab=tab_name)
-    sheets.create_run_tab(client, sheet_id, tab_name)
-    _state.update(agent, user_id, run_id=run_id, sheet_tab=tab_name,
+    _state.update(agent, user_id, run_id=run_id,
                   step="phase1_running",
-                  sheet_url=sheets.sheet_tab_url(sheet_id))
+                  sheet_url=sheets.sheet_url(sheet_id))
 
     # ── 3. yt-dlp search → unique channels ───────────────────────────────
     search_results = _criteria_int(criteria, "search_results", DEFAULT_SEARCH_RESULTS)
@@ -157,7 +157,6 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
 
     # ── 5. Claude scores remaining channels ──────────────────────────────
     _send(token, chat_id, f"🤖 Оцениваю {len(enriched)} каналов через Claude…")
-    sheets.update_run_status(client, sheet_id, run_id, status="phase1_scoring")
     scored = llm.score_channels(topic=topic, criteria=criteria,
                                 channels=enriched)
     # Merge score into enriched lookup
@@ -171,10 +170,10 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         top_channels = enriched[:count]
     top_channels = top_channels[:count]
 
-    # ── 6. Per-channel: list videos + Claude select ──────────────────────
-    sheets.update_run_status(client, sheet_id, run_id, status="phase1_selecting")
+    # ── 6. Per-channel: list videos + Claude select + dedup ─────────────
     all_lesson_rows: list[dict[str, Any]] = []
     course_summaries: list[str] = []
+    skipped_total = 0
     for course_idx, ch in enumerate(top_channels, start=1):
         ch_name = ch.get("channel_name") or ch["channel_id"]
         _send(token, chat_id,
@@ -203,17 +202,36 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
             log.info(f"phase1[{user_id}] {ch_name} skipped: {sel.get('skip_reason')}")
             continue
 
+        # Dedup: drop any lesson whose video_id is already done/processing in any run
+        dedup_lessons = []
+        course_skipped = 0
+        for lsn in lessons:
+            vid = lsn.get("video_id")
+            if vid and vid in active_video_ids:
+                course_skipped += 1
+                log.info(f"phase1[{user_id}] dedup skip {vid} in {ch_name}")
+                continue
+            dedup_lessons.append(lsn)
+        skipped_total += course_skipped
+
+        if not dedup_lessons:
+            _send(token, chat_id,
+                  f"⚠️ Курс {course_idx} ({_html_escape(ch_name)}) пропущен — "
+                  f"все {len(lessons)} видео уже обрабатывались.")
+            continue
+
         full_course_title = f"Курс {course_idx}: {ch_name} — {course_title}"
-        course_summaries.append(f"{course_idx}. {course_title} ({len(lessons)} уроков)")
+        summary_extra = f" (пропущено {course_skipped} дублей)" if course_skipped else ""
+        course_summaries.append(f"{course_idx}. {course_title} ({len(dedup_lessons)} уроков){summary_extra}")
         videos_by_id = {v["video_id"]: v for v in all_videos}
-        for lesson_idx, lsn in enumerate(lessons, start=1):
+        for lesson_idx, lsn in enumerate(dedup_lessons, start=1):
             vid = lsn.get("video_id")
             v = videos_by_id.get(vid) or {}
             all_lesson_rows.append({
                 "course": full_course_title if lesson_idx == 1 else f"Курс {course_idx}",
                 "lesson_idx": lesson_idx,
                 "channel": ch_name,
-                "title": lsn.get("title") or v.get("title", ""),
+                "lesson_title": lsn.get("title") or v.get("title", ""),
                 "url": v.get("url") or f"https://youtu.be/{vid}",
                 "duration_sec": v.get("duration_sec", 0),
                 "video_id": vid,
@@ -222,26 +240,27 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
             })
 
     if not all_lesson_rows:
-        raise RuntimeError("Ни один канал не дал валидной подборки уроков. "
+        raise RuntimeError("Ни один канал не дал валидной подборки уроков "
+                           "(или все видео уже были обработаны раньше). "
                            "Попробуй другую тему или расширь критерии.")
 
-    # ── 7. Write to Sheet ────────────────────────────────────────────────
-    sheets.append_lesson_rows(client, sheet_id, tab_name, all_lesson_rows)
-    sheets.update_run_status(client, sheet_id, run_id, status="awaiting_approval")
+    # ── 7. Append to unified Lessons tab ──────────────────────────────────
+    sheets.append_lesson_rows(client, sheet_id, run_id=run_id, rows=all_lesson_rows)
     _state.update(agent, user_id, step="awaiting_approval",
                   courses_summary=course_summaries)
 
     # ── 8. Final Telegram message with action button ─────────────────────
-    sheet_url = sheets.sheet_tab_url(sheet_id)
+    sheet_url = sheets.sheet_url(sheet_id)
     summary_lines = "\n".join(course_summaries) if course_summaries else "(нет курсов)"
+    dedup_note = f"\n\n♻️ Пропущено как дубли: <b>{skipped_total}</b> видео." if skipped_total else ""
     _send_with_buttons(
         token, chat_id,
         text=(
             f"✅ <b>Phase 1 готов.</b>\n\n"
             f"Подборка ({len(all_lesson_rows)} видео в {len(course_summaries)} курсах):\n"
-            f"{_html_escape(summary_lines)}\n\n"
-            f"📋 Открой Sheet, проверь подборку, поставь галочки в колонке "
-            f"<b>Approved</b> у нужных строк, отредактируй названия если нужно:\n"
+            f"{_html_escape(summary_lines)}{dedup_note}\n\n"
+            f"📋 Открой таб <b>Lessons</b>, отметь <b>Approved=TRUE</b> "
+            f"у нужных строк (status=pending). Все запуски в одной таблице:\n"
             f"{sheet_url}\n\n"
             f"Когда готов — нажми кнопку:"
         ),

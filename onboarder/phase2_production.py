@@ -121,22 +121,31 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
     scratch_root = Path(onb.get("scratch_dir") or DEFAULT_SCRATCH_DIR)
     scratch_root.mkdir(parents=True, exist_ok=True)
 
-    # ── 2. Read approved rows from Sheet ─────────────────────────────────
+    # ── 2. Read approved+pending rows from unified Lessons tab ──────────
     st = _state.load(agent, user_id)
-    tab_name = st.get("sheet_tab")
     run_id = st.get("run_id")
-    if not tab_name or not run_id:
-        raise RuntimeError("wizard state missing sheet_tab/run_id — restart from /menu")
+    # run_id is optional now — Phase 2 picks up any approved+pending rows
+    # regardless of run, since user can mix-and-match across runs in the
+    # single tab. If run_id is set, we filter to that run for safety.
 
     client = sheets.open_client(sa_path)
-    approved = sheets.read_approved_rows(client, sheet_id, tab_name)
+    approved = sheets.read_pending_approved_rows(client, sheet_id, run_id=run_id)
     if not approved:
         raise RuntimeError(
-            f"В табе {tab_name} нет строк с Approved=TRUE. "
-            f"Открой Sheet, поставь галочки и нажми кнопку ещё раз."
+            "В табе Lessons нет строк со status=pending и approved=TRUE"
+            + (f" для run_id={run_id}" if run_id else "")
+            + ". Открой Sheet, отметь Approved=TRUE и нажми кнопку ещё раз."
         )
 
-    # Group approved lessons by course_idx
+    # Mark all selected rows as processing IMMEDIATELY — so a parallel run
+    # or a manual click doesn't try to grab them again.
+    sheets.update_status(
+        client, sheet_id,
+        sheet_rows=[r["_sheet_row"] for r in approved],
+        new_status=sheets.STATUS_PROCESSING,
+    )
+
+    # Group approved lessons by course_idx (within their run)
     courses: dict[int, list[dict[str, Any]]] = {}
     for row in approved:
         idx = int(row.get("course_idx") or 0)
@@ -149,10 +158,10 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
           f"🎬 <b>Phase 2 запущен.</b>\n\n"
           f"Курсов: <b>{len(courses)}</b>\n"
           f"Видео: <b>{total_videos}</b>\n"
-          f"~1-3 часа на курс. Можешь чатиться с агентом параллельно. "
-          f"Прогресс прилечу отдельными сообщениями.")
+          f"Все строки помечены status=processing — параллельные запуски не "
+          f"подхватят их повторно.\n"
+          f"~1-3 часа на курс.")
     _state.update(agent, user_id, step="phase2_running")
-    sheets.update_run_status(client, sheet_id, run_id, status="phase2_running")
 
     # ── 2.5 Initialize proxy rotator — pick first working proxy ─────────
     rotator = proxy_pool.ProxyRotator(proxy_pool_list, cookies_file=youtube_cookies_file)
@@ -319,6 +328,9 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
             }
             plan_sections, science_plan, testimonials, collection_name = [], None, [], None
 
+        # Sheet rows for this course (used for status updates)
+        course_sheet_rows = [r["_sheet_row"] for r in lessons]
+
         # ── 5. Push DRAFT course to NewMindStart ────────────────────────
         if nms_endpoint and nms_token:
             try:
@@ -336,6 +348,13 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                     "course_idx": course_idx, "title": clean_title,
                     "admin_url": resp["adminUrl"], "course_id": resp["courseId"],
                 })
+                # Mark all videos in this course as DONE with admin URL
+                sheets.update_status(
+                    client, sheet_id,
+                    sheet_rows=course_sheet_rows,
+                    new_status=sheets.STATUS_DONE,
+                    course_admin_url=resp["adminUrl"],
+                )
                 _send(token, chat_id,
                       f"✅ <b>Курс {course_idx} создан в админке (DRAFT):</b>\n"
                       f"<a href=\"{resp['adminUrl']}\">{_html_escape(course_payload['title'])}</a>\n\n"
@@ -343,11 +362,23 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                       f"Отзывы: {len(testimonials)} | Коллекция: {collection_name or '—'}")
             except Exception as e:
                 log.error(f"phase2: NMS push failed for course {course_idx}: {e}", exc_info=True)
+                # Mark videos failed (Bunny upload was OK but draft creation died)
+                sheets.update_status(
+                    client, sheet_id,
+                    sheet_rows=course_sheet_rows,
+                    new_status=sheets.STATUS_FAILED,
+                    failure_reason=f"NMS push: {str(e)[:280]}",
+                )
                 _send(token, chat_id,
                       f"⚠️ Курс {course_idx}: видео загружены на Bunny, "
                       f"но создание DRAFT не удалось:\n<code>{_html_escape(str(e))[:300]}</code>")
         else:
-            # No NMS configured — at least show where the videos went
+            # No NMS configured — mark done but with no admin URL
+            sheets.update_status(
+                client, sheet_id,
+                sheet_rows=course_sheet_rows,
+                new_status=sheets.STATUS_DONE,
+            )
             keys = "\n".join(f"  • {l['title'][:50]} → bunny:{l['videoKey']}"
                              for l in processed_lessons)
             _send(token, chat_id,
@@ -357,8 +388,6 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
 
     # ── 6. Final summary ─────────────────────────────────────────────────
     _state.update(agent, user_id, step="done", courses=course_results)
-    sheets.update_run_status(client, sheet_id, run_id, status="done",
-                             courses=", ".join(c.get("course_id", "") for c in course_results))
 
     if course_results:
         lines = [f"  • <a href=\"{c['admin_url']}\">{_html_escape(c['title'])}</a>"
