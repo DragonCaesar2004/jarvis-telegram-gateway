@@ -3170,6 +3170,8 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
 # ---------------------------------------------------------------------------
 
 _BOT_COMMANDS = [
+    {"command": "menu", "description": "Меню (Новый курс, статус, режим)"},
+    {"command": "cancel", "description": "Выход из wizard, обратно в чат"},
     {"command": "new", "description": "Новая сессия (полный handoff)"},
     {"command": "status", "description": "Статус сессии и памяти"},
     {"command": "stop", "description": "Остановить текущую задачу"},
@@ -3294,6 +3296,11 @@ def _init_bot_metadata(agent: str, cfg: dict, token: str) -> None:
             tg_api(token, "setMyCommands", commands=_BOT_COMMANDS)
         except Exception as e:
             log.warning(f"[{agent}] setMyCommands failed: {e}")
+        try:
+            tg_api(token, "setChatMenuButton",
+                   menu_button={"type": "commands"})
+        except Exception as e:
+            log.warning(f"[{agent}] setChatMenuButton failed: {e}")
     except Exception:
         pass
 
