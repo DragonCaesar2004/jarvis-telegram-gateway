@@ -215,32 +215,36 @@ def _migrate_header_if_needed(ws: Any) -> None:
 
 
 def get_active_video_ids(client: Any, sheet_id: str) -> set[str]:
-    """Return video_ids whose status is processing OR done.
+    """Return EVERY video_id that has appeared in the Lessons tab, regardless of status.
 
-    Used by Phase 1 to skip duplicates — we never want to re-process a video
-    that's already in active state somewhere.
+    Originally this only excluded `processing` / `done` videos so the operator
+    could re-surface rejected ones in a later run. In practice that meant videos
+    the operator had explicitly rejected (status=failed or skipped, approved=FALSE)
+    kept popping back up. We now treat any prior appearance as "seen" — if the
+    operator wants to retry a previously-skipped video, they can clear its row
+    in the sheet by hand.
+
+    The function name stays as `get_active_video_ids` for back-compat with
+    callers, but the semantics are now "all seen video_ids".
     """
     ws = ensure_lessons_tab(client, sheet_id)
     rows = ws.get_all_values()
     if len(rows) < 2:
         return set()
 
-    # Build column index map from header (resilient to column reordering)
     header = rows[0]
     try:
-        idx_status = header.index("status")
         idx_video_id = header.index("video_id")
     except ValueError:
-        log.warning("sheets: Lessons tab missing status/video_id columns")
+        log.warning("sheets: Lessons tab missing video_id column")
         return set()
 
     out: set[str] = set()
     for row in rows[1:]:
-        if len(row) <= max(idx_status, idx_video_id):
+        if len(row) <= idx_video_id:
             continue
-        status = (row[idx_status] or "").strip().lower()
         vid = (row[idx_video_id] or "").strip()
-        if vid and status in ACTIVE_STATUSES:
+        if vid:
             out.add(vid)
     return out
 

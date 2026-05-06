@@ -118,10 +118,11 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     criteria = sheets.read_criteria(client, sheet_id)
     log.info(f"phase1[{user_id}] criteria: {criteria}")
 
-    # ── 2. Ensure unified Lessons tab + collect already-processed video_ids
+    # ── 2. Ensure unified Lessons tab + collect every previously-seen video_id
     sheets.ensure_lessons_tab(client, sheet_id)
     active_video_ids = sheets.get_active_video_ids(client, sheet_id)
-    log.info(f"phase1[{user_id}] {len(active_video_ids)} videos already in active state — skipping these")
+    log.info(f"phase1[{user_id}] {len(active_video_ids)} videos previously seen in Sheet — "
+             f"deduping these (any status, including rejected/failed)")
 
     run_id = sheets.make_run_id()
     _state.update(agent, user_id, run_id=run_id,

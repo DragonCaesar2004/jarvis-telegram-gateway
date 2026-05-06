@@ -30,6 +30,54 @@ log = logging.getLogger("gateway")
 DEFAULT_MODEL_FAST = "sonnet"
 DEFAULT_MODEL_QUALITY = "opus"
 
+
+# ---------------------------------------------------------------------------
+# Output-language hints
+# ---------------------------------------------------------------------------
+# The operator (and Liza, who'll be running the bot day-to-day) reviews the
+# Sheet in Russian and the platform locale matches the customer's language.
+# When the topic the user typed is Cyrillic-heavy, we tell every Claude prompt
+# to write its user-facing text (descriptions, bios, titles, plans, taglines,
+# testimonials) in Russian. Default is English.
+
+def detect_topic_lang(*texts: str) -> str:
+    """Best-effort language detection from a few short strings.
+
+    Returns ISO code: 'ru' if any input is mostly Cyrillic, otherwise 'en'.
+    """
+    for t in texts:
+        if not t:
+            continue
+        letters = [c for c in t if c.isalpha()]
+        if not letters:
+            continue
+        cyr = sum(1 for c in letters if 'а' <= c.lower() <= 'я' or c.lower() == 'ё')
+        if cyr / len(letters) > 0.3:
+            return 'ru'
+    return 'en'
+
+
+def _lang_instruction(output_lang: str) -> str:
+    """Return an extra system-prompt block forcing the output language.
+
+    Empty string for 'en' (default behavior); explicit Russian instruction
+    otherwise. Caller appends the result to the system prompt.
+    """
+    if (output_lang or 'en').lower() == 'ru':
+        return (
+            "\n\nLANGUAGE REQUIREMENT (override examples below): write ALL "
+            "user-facing text in Russian (Cyrillic). This applies to: lesson "
+            "descriptions, course titles, taglines, excerpts, about content, "
+            "plan section titles and topics, science headline/subtitle, "
+            "curriculum lesson titles and descriptions, testimonials, author "
+            "name (transliterate if originally non-Russian — e.g. \"Greg "
+            "Doucette\" stays as is, but the bio is in Russian), author bio, "
+            "expertise. Keep technical identifiers (URLs, IDs, code) in their "
+            "original form. Russian examples / English examples in the prompt "
+            "below are STYLE references only — you must produce Russian output."
+        )
+    return ""
+
 # Default subprocess timeout — should fit longest prompt round-trip.
 # Channel scoring on 15 channels: ~15s. Video selection: ~30s. Course composition: ~60s.
 CLAUDE_CLI_TIMEOUT_SEC = 180
@@ -273,11 +321,15 @@ Keep order matching the input. Empty/garbage transcript → return a generic 1-s
 
 def describe_lessons(*, course_topic: str, course_title: str,
                      lessons: list[dict[str, Any]],
-                     model: str = DEFAULT_MODEL_FAST) -> list[dict[str, Any]]:
+                     model: str = DEFAULT_MODEL_FAST,
+                     output_lang: str = "en") -> list[dict[str, Any]]:
     """Generate per-lesson descriptions in one batch call.
 
     `lessons` items: {order: int, title: str, transcript: str}. Transcripts are
     truncated to ~500 words inside this function to keep the prompt cheap.
+
+    `output_lang`: 'en' (default) or 'ru'. Russian forces all description text
+    into Cyrillic for operator review.
 
     Returns list of {order, description} aligned to input order.
     """
@@ -300,7 +352,8 @@ def describe_lessons(*, course_topic: str, course_title: str,
         "lessons": trimmed,
     }, ensure_ascii=False, indent=2)
 
-    parsed = _call_json(model=model, system=DESCRIBE_LESSONS_SYSTEM, user=user,
+    system = DESCRIBE_LESSONS_SYSTEM + _lang_instruction(output_lang)
+    parsed = _call_json(model=model, system=system, user=user,
                         max_tokens=4096)
     if not isinstance(parsed, list):
         raise ValueError(f"describe_lessons: expected list, got {type(parsed).__name__}")
@@ -349,7 +402,8 @@ Hard rules:
 def research_author(*, channel_name: str, channel_description: str,
                     sample_video_titles: list[str], course_topic: str,
                     model: str = DEFAULT_MODEL_QUALITY,
-                    timeout: int = 240) -> dict[str, Any]:
+                    timeout: int = 240,
+                    output_lang: str = "en") -> dict[str, Any]:
     """Deep author research via Claude CLI (uses WebSearch under the hood when needed).
 
     Returns {name, bio, expertise, confidence, sources}. On failure, returns a
@@ -364,8 +418,9 @@ def research_author(*, channel_name: str, channel_description: str,
     }
     user = json.dumps(user_payload, ensure_ascii=False, indent=2)
 
+    system = RESEARCH_AUTHOR_SYSTEM + _lang_instruction(output_lang)
     try:
-        parsed = _call_json(model=model, system=RESEARCH_AUTHOR_SYSTEM, user=user,
+        parsed = _call_json(model=model, system=system, user=user,
                             timeout=timeout)
     except Exception as e:
         log.warning(f"llm.research_author: failed for {channel_name}: {e}")
@@ -751,7 +806,8 @@ def compose_full_course(*, course_topic: str, course_title: str,
                         channel_name: str, channel_description: str,
                         lesson_transcripts: list[str],
                         model: str = DEFAULT_MODEL_QUALITY,
-                        timeout: int = 600) -> dict[str, Any]:
+                        timeout: int = 600,
+                        output_lang: str = "en") -> dict[str, Any]:
     """Generate full course content via template + parser. Returns structured dict."""
     # Trim each transcript to ~700 words to stay within budget but keep enough context
     trimmed_lessons = []
@@ -769,7 +825,8 @@ def compose_full_course(*, course_topic: str, course_title: str,
         + "\n\n".join(trimmed_lessons)
     )
 
-    full_prompt = COMPOSE_FULL_SYSTEM + "\n\n---\n\n## MATERIALS\n\n" + materials
+    system = COMPOSE_FULL_SYSTEM + _lang_instruction(output_lang)
+    full_prompt = system + "\n\n---\n\n## MATERIALS\n\n" + materials
 
     # Use the same _call subprocess machinery as _call_json, but expect plain text (template).
     import os, subprocess, tempfile

@@ -180,8 +180,14 @@ def enrich_course(*, course_idx: int, run_id: str,
             "compose_ok": False,
         }
 
+    # Detect output language ONCE per course from the topic + course title.
+    # This drives whether descriptions, bios, plans, etc. come back in
+    # Russian or English. Operator types Cyrillic → Russian everywhere.
+    output_lang = llm.detect_topic_lang(course_topic_input, course_title_from_llm)
+    _emit(f"🌐 Язык вывода: {output_lang}")
+
     # ── 2. Per-lesson descriptions (single batched Claude call) ──────────
-    _emit(f"📝 Пишу описания {len(processed)} уроков (Claude)…")
+    _emit(f"📝 Пишу описания {len(processed)} уроков (Claude, {output_lang})…")
     lesson_descriptions: dict[str, str] = {}
     try:
         descs = llm.describe_lessons(
@@ -191,6 +197,7 @@ def enrich_course(*, course_idx: int, run_id: str,
                 {"order": i, "title": p["title"], "transcript": p["working_transcript"]}
                 for i, p in enumerate(processed)
             ],
+            output_lang=output_lang,
         )
         for i, d in enumerate(descs):
             if i < len(processed):
@@ -199,17 +206,18 @@ def enrich_course(*, course_idx: int, run_id: str,
         log.warning(f"phase1_enrich: describe_lessons failed: {e}")
 
     # ── 3. Author research (deep, with WebSearch) ────────────────────────
-    _emit(f"🔍 Ищу информацию об авторе «{channel_name}» (Claude WebSearch)…")
+    _emit(f"🔍 Ищу информацию об авторе «{channel_name}» (Claude WebSearch, {output_lang})…")
     author = llm.research_author(
         channel_name=channel_name,
         channel_description=channel_description,
         sample_video_titles=[p["title"] for p in processed[:8]],
         course_topic=course_title_from_llm or course_topic_input,
+        output_lang=output_lang,
     )
     _emit(f"  ✓ author: {author.get('name')} (confidence={author.get('confidence')})")
 
     # ── 4. Full course compose (curriculum/plan/science/testimonials/...) ─
-    _emit(f"✍️  Собираю полное описание курса (Claude)…")
+    _emit(f"✍️  Собираю полное описание курса (Claude, {output_lang})…")
     composed_full: dict[str, Any] | None = None
     compose_ok = False
     try:
@@ -220,6 +228,7 @@ def enrich_course(*, course_idx: int, run_id: str,
             channel_description=channel_description,
             lesson_transcripts=[p["working_transcript"] for p in processed],
             model=compose_model,
+            output_lang=output_lang,
         )
         compose_ok = True
     except Exception as e:
