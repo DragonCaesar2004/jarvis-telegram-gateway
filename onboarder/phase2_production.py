@@ -25,8 +25,9 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from . import (_secrets, bunny, elevenlabs_dub, ffmpeg_cut, llm, nms_client,
-               proxy_pool, sheets, state as _state, whisper)
+from . import (_secrets, bunny, cache, elevenlabs_dub, ffmpeg_cut, llm,
+               nms_client, pipeline_db, proxy_pool, sheets,
+               state as _state, whisper)
 from .proxy_pool import CookiesNeededError
 
 log = logging.getLogger("gateway")
@@ -155,18 +156,28 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
         courses[idx].sort(key=lambda r: int(r.get("lesson_idx") or 0))
 
     total_videos = sum(len(v) for v in courses.values())
+    cached_count = sum(1 for c in courses.values() for r in c
+                       if cache.is_cached(r.get("video_id", "")))
     _send(token, chat_id,
           f"🎬 <b>Phase 2 запущен.</b>\n\n"
           f"Курсов: <b>{len(courses)}</b>\n"
-          f"Видео: <b>{total_videos}</b>\n"
+          f"Видео: <b>{total_videos}</b> (из них {cached_count} с кешем из Phase 1 — "
+          f"скачивать не нужно)\n"
           f"Все строки помечены status=processing — параллельные запуски не "
           f"подхватят их повторно.\n"
-          f"~1-3 часа на курс.")
+          f"~30-90 мин на курс (большую часть времени съест дубляж, если есть не-EN видео).")
     _state.update(agent, user_id, step="phase2_running")
 
     # ── 2.5 Initialize proxy rotator — pick first working proxy ─────────
+    # Skip the probe entirely if every approved video already has a cached
+    # MP4 (Phase 1 typically downloads them all). Phase 2 in that case never
+    # touches YouTube — no point burning 10 sec × 30 proxies.
     rotator = proxy_pool.ProxyRotator(proxy_pool_list, cookies_file=youtube_cookies_file)
-    if proxy_pool_list:
+    needs_youtube = any(
+        not cache.is_cached(r.get("video_id", ""))
+        for c in courses.values() for r in c
+    )
+    if needs_youtube and proxy_pool_list:
         _send(token, chat_id,
               f"🔍 Проверяю {len(proxy_pool_list)} прокси на YouTube (~10 сек на каждый)…")
 
@@ -191,6 +202,9 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                 f"YouTube ужесточил защиту. Попробуй: обновить cookies, "
                 f"добавить новые прокси в config.json, подождать 1-2 часа."
             )
+    elif not needs_youtube:
+        _send(token, chat_id,
+              "📦 Все видео уже в кеше Phase 1 — пропускаю проверку прокси.")
     else:
         _send(token, chat_id, "⚠️ Прокси не настроен — пробую напрямую с VPS-IP")
 
@@ -233,22 +247,37 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                   f"⚠️ Курс {course_idx} пропущен — ни одно видео не обработалось до конца.")
             continue
 
-        # ── 4. Compose full course (template-based) via Claude ──────────
-        _send(token, chat_id, f"✍️ Курс {course_idx}: пишу описание, план, science, отзывы через Claude…")
+        # ── 4. Compose payload — prefer Phase 1's pre-composed record ───
         composed_full: dict[str, Any] | None = None
-        compose_model = (onb.get("models") or {}).get("compose") or llm.DEFAULT_MODEL_QUALITY
-        try:
-            composed_full = llm.compose_full_course(
-                course_topic=clean_title,
-                course_title=clean_title,
-                channel_name=ch_name,
-                channel_description="",
-                lesson_transcripts=[l["transcriptEn"] for l in processed_lessons],
-                model=compose_model,
-            )
-        except Exception as e:
-            log.warning(f"phase2: compose_full_course failed: {e}; falling back to minimal compose")
-            composed_full = None
+        cached_compose = None
+        if run_id:
+            try:
+                cached_compose = pipeline_db.get_course_compose(
+                    run_id=run_id, course_idx=course_idx)
+            except Exception as e:
+                log.warning(f"phase2: pipeline_db.get_course_compose failed: {e}")
+
+        if cached_compose:
+            _send(token, chat_id,
+                  f"📋 Курс {course_idx}: использую описания из Phase 1 (без повторного Claude)")
+            composed_full = cached_compose
+        else:
+            _send(token, chat_id,
+                  f"✍️ Курс {course_idx}: composed payload не найден в pipeline.db, "
+                  f"запускаю Claude compose как fallback…")
+            compose_model = (onb.get("models") or {}).get("compose") or llm.DEFAULT_MODEL_QUALITY
+            try:
+                composed_full = llm.compose_full_course(
+                    course_topic=clean_title,
+                    course_title=clean_title,
+                    channel_name=ch_name,
+                    channel_description="",
+                    lesson_transcripts=[l["transcriptEn"] for l in processed_lessons],
+                    model=compose_model,
+                )
+            except Exception as e:
+                log.warning(f"phase2: compose_full_course fallback failed: {e}")
+                composed_full = None
 
         # Build the curriculum: zip LLM lesson titles with our processed video metadata.
         # LLM curriculum may have multiple sections — we map ALL its lessons in order
@@ -491,62 +520,82 @@ def _process_one_video(*, token: str, chat_id: int, prefix: str,
                        course_topic: str,
                        youtube_cookies_file: str | None = None,
                        rotator=None) -> dict[str, Any]:
+    """Phase 2 happy path: cached MP4 + pre-computed cuts + skip working Whisper.
+
+    Falls back to the legacy download+transcribe+mark_cuts flow only if the
+    Phase 1 handoff is missing (e.g. video added manually to the Sheet).
+    """
+    from .elevenlabs_dub import _iso as _lang_iso
+
     video_id = lesson["video_id"]
     title = lesson["title"]
     url = lesson["url"]
 
-    raw_path = scratch_dir / f"{video_id}.raw.mp4"
     cleaned_path = scratch_dir / f"{video_id}.cleaned.mp4"
     final_path = scratch_dir / f"{video_id}.final.mp4"
 
-    # 1. Download (with proxy rotation on bot-check)
-    _send(token, chat_id, f"⏳ {prefix}: скачивание <i>{_html_escape(title)[:50]}</i>…")
-    raw_path = _download_with_rotation(
-        token=token, chat_id=chat_id, prefix=prefix,
-        url=url, output_path=raw_path,
-        cookies_file=youtube_cookies_file,
-        rotator=rotator,
-    )
+    # ── 1. Source MP4: prefer cache from Phase 1, otherwise download ─────
+    cached_path = cache.cached_path(video_id)
+    if cache.is_cached(video_id):
+        _send(token, chat_id,
+              f"📦 {prefix}: использую кешированный MP4 из Phase 1 "
+              f"<i>{_html_escape(title)[:50]}</i>")
+        raw_path = cached_path
+    else:
+        _send(token, chat_id,
+              f"⏳ {prefix}: кеша нет — скачиваю <i>{_html_escape(title)[:50]}</i>…")
+        raw_path = _download_with_rotation(
+            token=token, chat_id=chat_id, prefix=prefix,
+            url=url, output_path=cached_path,
+            cookies_file=youtube_cookies_file,
+            rotator=rotator,
+        )
 
-    # 2. Working transcribe (find cuts)
-    _send(token, chat_id, f"📝 {prefix}: транскрибация для разметки вырезок…")
-    working = whisper.transcribe(api_key=openai_key, file_path=raw_path,
-                                 with_word_timestamps=True)
-    # Normalise full language name → ISO 639-1 ("english" → "en", "russian" → "ru")
-    from .elevenlabs_dub import _iso as _lang_iso
-    detected_lang = _lang_iso((working.get("language") or "").lower())
+    # ── 2. Cuts + detected language: prefer Phase 1's pipeline_db record ─
+    db_record = pipeline_db.get_cuts(video_id)
+    if db_record is not None:
+        cuts = db_record.get("cuts") or []
+        detected_lang = db_record.get("detected_lang") or ""
+        _send(token, chat_id,
+              f"📋 {prefix}: cuts из Phase 1 ({len(cuts)} кусков, lang={detected_lang or '?'})")
+    else:
+        # Fallback: video has no Phase 1 handoff — recompute on the fly.
+        _send(token, chat_id,
+              f"📝 {prefix}: нет данных в pipeline.db — транскрибирую и размечаю…")
+        working = whisper.transcribe(api_key=openai_key, file_path=raw_path,
+                                     with_word_timestamps=True)
+        detected_lang = _lang_iso((working.get("language") or "").lower())
+        cuts = llm.mark_cuts(course_topic=course_topic, transcript=working) or []
 
-    # 3. LLM marks cuts
-    cuts = llm.mark_cuts(course_topic=course_topic, transcript=working)
-    cuts_summary = (f"{len(cuts)} кусков" if cuts else "нет вырезок")
+    cuts_summary = f"{len(cuts)} кусков" if cuts else "нет вырезок"
 
-    # 4. Cut
+    # ── 3. Cut ───────────────────────────────────────────────────────────
     _send(token, chat_id, f"✂️ {prefix}: вырезка ({cuts_summary})…")
     cleaned_path = ffmpeg_cut.cut_segments(input_path=raw_path, cuts=cuts,
                                            output_path=cleaned_path)
 
-    # 5. Dub if not English
+    # ── 4. Dub if not English ────────────────────────────────────────────
     if detected_lang == "en":
         _send(token, chat_id, f"🇬🇧 {prefix}: уже на английском, дубляж пропускаем")
         final_path = cleaned_path
         was_dubbed = False
     else:
         _send(token, chat_id,
-              f"🇬🇧 {prefix}: дубляж {detected_lang} → en (ElevenLabs, ~5-15 мин)…")
+              f"🇬🇧 {prefix}: дубляж {detected_lang or '?'} → en (ElevenLabs, ~5-15 мин)…")
         elevenlabs_key = get_elevenlabs_key()
         elevenlabs_dub.dub_video(
             api_key=elevenlabs_key, file_path=cleaned_path,
-            source_lang=detected_lang, target_lang="en",
+            source_lang=detected_lang or "auto", target_lang="en",
             output_path=final_path, name=title[:80],
         )
         was_dubbed = True
 
-    # 6. Final transcribe (EN, no word timestamps needed)
+    # ── 5. Final transcribe of the post-edit video (text goes into admin) ─
     _send(token, chat_id, f"📝 {prefix}: финальная транскрибация (EN)…")
     final_transcript = whisper.transcribe(api_key=openai_key, file_path=final_path,
                                           language="en", with_word_timestamps=False)
 
-    # 7. Upload to Bunny
+    # ── 6. Upload to Bunny ───────────────────────────────────────────────
     duration_sec = int(ffmpeg_cut.probe_duration(final_path))
     _send(token, chat_id, f"☁️ {prefix}: загрузка на Bunny ({duration_sec}s)…")
     bunny_meta = bunny.upload_video(
@@ -554,14 +603,17 @@ def _process_one_video(*, token: str, chat_id: int, prefix: str,
         file_path=final_path, title=title,
     )
 
-    # 8. Clean up local video files immediately — don't wait for course cleanup
-    for f in (raw_path, cleaned_path, final_path):
+    # ── 7. Cleanup ───────────────────────────────────────────────────────
+    # Always remove transient cleaned/final files. Cache MP4 only goes once
+    # Bunny upload succeeds (which it has if we got here).
+    for f in (cleaned_path, final_path):
         try:
             p = Path(f)
-            if p.exists():
+            if p.exists() and p != cached_path:
                 p.unlink()
         except Exception as e:
             log.warning(f"cleanup: could not delete {f}: {e}")
+    cache.delete_cached(video_id)
 
     _send(token, chat_id, f"✅ {prefix}: готово")
 
@@ -573,6 +625,7 @@ def _process_one_video(*, token: str, chat_id: int, prefix: str,
         "transcriptEn": final_transcript.get("text", ""),
         "originalLang": detected_lang,
         "wasDubbed": was_dubbed,
+        "lessonDescription": lesson.get("lesson_description", ""),
     }
 
 
@@ -582,12 +635,19 @@ def _process_one_video(*, token: str, chat_id: int, prefix: str,
 
 def _lesson_payload(video: dict[str, Any], order: int,
                     title: str, description: str) -> dict[str, Any]:
-    """Build per-lesson payload dict for the NMS API from a processed video + LLM-given title/desc."""
+    """Build per-lesson payload dict for the NMS API from a processed video + LLM-given title/desc.
+
+    Description preference order: explicit `description` → Sheet's
+    `lessonDescription` (set by Phase 1 enrichment) → first 500 chars of
+    transcript as a last-resort fallback.
+    """
     transcript = video.get("transcriptEn") or ""
+    sheet_desc = video.get("lessonDescription") or ""
+    final_desc = description or sheet_desc or transcript[:500]
     return {
         "title": title or video.get("title", f"Lesson {order + 1}"),
         "order": order,
-        "description": description or transcript[:500],
+        "description": final_desc,
         "videoKey": video["videoKey"],
         "videoLibraryId": video["videoLibraryId"],
         "duration": video.get("duration"),
