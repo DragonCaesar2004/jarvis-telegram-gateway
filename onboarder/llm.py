@@ -78,6 +78,32 @@ def _lang_instruction(output_lang: str) -> str:
         )
     return ""
 
+
+def _pain_audience_block(pain: str, audience: str) -> str:
+    """Return an extra system-prompt block describing the customer pain and
+    target audience the course must address. Empty when both are blank.
+
+    The operator decides if the LLM gets these signals via the wizard's
+    optional pain / audience steps. When both are empty we make no claim
+    about the customer profile and the model treats the topic generically.
+    """
+    pain = (pain or "").strip()
+    audience = (audience or "").strip()
+    if not pain and not audience:
+        return ""
+    parts = ["\n\n## TARGET PAIN AND AUDIENCE (operator-specified)\n"]
+    if pain:
+        parts.append(f"- Customer pain the course MUST solve: \"{pain}\"")
+    if audience:
+        parts.append(f"- Target audience: \"{audience}\"")
+    parts.append(
+        "- Bias EVERY judgment (channel scoring, video selection, lesson "
+        "descriptions, course title/excerpt/about, curriculum structure, "
+        "author bio framing, testimonials voice) toward solving this exact "
+        "pain for this exact audience. Penalize generic/off-segment material."
+    )
+    return "\n".join(parts)
+
 # Default subprocess timeout — should fit longest prompt round-trip.
 # Channel scoring on 15 channels: ~15s. Video selection: ~30s. Course composition: ~60s.
 CLAUDE_CLI_TIMEOUT_SEC = 180
@@ -189,7 +215,8 @@ Return ONLY valid JSON, no prose:
 
 
 def score_channels(*, topic: str, criteria: dict[str, Any],
-                   channels: list[dict[str, Any]], model: str = DEFAULT_MODEL_FAST) -> list[dict[str, Any]]:
+                   channels: list[dict[str, Any]], model: str = DEFAULT_MODEL_FAST,
+                   pain: str = "", audience: str = "") -> list[dict[str, Any]]:
     """Return list of {channel_id, score, reason} sorted by score desc.
 
     `channels` items shape (from yt-dlp metadata):
@@ -197,9 +224,14 @@ def score_channels(*, topic: str, criteria: dict[str, Any],
          "description": str, "language": str | None,
          "recent_videos": [{"title": str, "published_at": str}, ...]}
     """
-    user = json.dumps({"topic": topic, "criteria": criteria, "channels": channels},
-                      ensure_ascii=False, indent=2)
-    parsed = _call_json(model=model, system=SCORE_CHANNELS_SYSTEM, user=user)
+    payload: dict[str, Any] = {"topic": topic, "criteria": criteria, "channels": channels}
+    if pain:
+        payload["target_pain"] = pain
+    if audience:
+        payload["target_audience"] = audience
+    user = json.dumps(payload, ensure_ascii=False, indent=2)
+    system = SCORE_CHANNELS_SYSTEM + _pain_audience_block(pain, audience)
+    parsed = _call_json(model=model, system=system, user=user)
     if not isinstance(parsed, list):
         raise ValueError(f"score_channels: expected list, got {type(parsed).__name__}")
     parsed.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -237,18 +269,25 @@ If the channel doesn't have enough on-topic material for a coherent 6+ video cou
 
 def select_videos(*, topic: str, criteria: dict[str, Any],
                   channel_name: str, videos: list[dict[str, Any]],
-                  model: str = DEFAULT_MODEL_FAST) -> dict[str, Any]:
+                  model: str = DEFAULT_MODEL_FAST,
+                  pain: str = "", audience: str = "") -> dict[str, Any]:
     """Return {course_title, lessons[]} or {course_title: null, lessons: [], skip_reason}.
 
     `videos` items shape (yt-dlp listing):
         {"video_id": str, "title": str, "duration_sec": int, "published_at": str,
          "view_count": int, "description": str (truncated)}
     """
-    user = json.dumps({
+    payload: dict[str, Any] = {
         "topic": topic, "criteria": criteria,
         "channel_name": channel_name, "videos": videos,
-    }, ensure_ascii=False, indent=2)
-    parsed = _call_json(model=model, system=SELECT_VIDEOS_SYSTEM, user=user,
+    }
+    if pain:
+        payload["target_pain"] = pain
+    if audience:
+        payload["target_audience"] = audience
+    user = json.dumps(payload, ensure_ascii=False, indent=2)
+    system = SELECT_VIDEOS_SYSTEM + _pain_audience_block(pain, audience)
+    parsed = _call_json(model=model, system=system, user=user,
                         max_tokens=8192)
     if not isinstance(parsed, dict):
         raise ValueError(f"select_videos: expected dict, got {type(parsed).__name__}")
@@ -322,7 +361,8 @@ Keep order matching the input. Empty/garbage transcript → return a generic 1-s
 def describe_lessons(*, course_topic: str, course_title: str,
                      lessons: list[dict[str, Any]],
                      model: str = DEFAULT_MODEL_FAST,
-                     output_lang: str = "en") -> list[dict[str, Any]]:
+                     output_lang: str = "en",
+                     pain: str = "", audience: str = "") -> list[dict[str, Any]]:
     """Generate per-lesson descriptions in one batch call.
 
     `lessons` items: {order: int, title: str, transcript: str}. Transcripts are
@@ -330,6 +370,8 @@ def describe_lessons(*, course_topic: str, course_title: str,
 
     `output_lang`: 'en' (default) or 'ru'. Russian forces all description text
     into Cyrillic for operator review.
+    `pain` / `audience`: optional targeting strings — when provided, every
+    description should be framed in terms of solving that pain for that audience.
 
     Returns list of {order, description} aligned to input order.
     """
@@ -346,13 +388,20 @@ def describe_lessons(*, course_topic: str, course_title: str,
             "transcript_excerpt": " ".join(words[:500]),
         })
 
-    user = json.dumps({
+    payload: dict[str, Any] = {
         "course_topic": course_topic,
         "course_title": course_title,
         "lessons": trimmed,
-    }, ensure_ascii=False, indent=2)
+    }
+    if pain:
+        payload["target_pain"] = pain
+    if audience:
+        payload["target_audience"] = audience
+    user = json.dumps(payload, ensure_ascii=False, indent=2)
 
-    system = DESCRIBE_LESSONS_SYSTEM + _lang_instruction(output_lang)
+    system = (DESCRIBE_LESSONS_SYSTEM
+              + _pain_audience_block(pain, audience)
+              + _lang_instruction(output_lang))
     parsed = _call_json(model=model, system=system, user=user,
                         max_tokens=4096)
     if not isinstance(parsed, list):
@@ -403,22 +452,29 @@ def research_author(*, channel_name: str, channel_description: str,
                     sample_video_titles: list[str], course_topic: str,
                     model: str = DEFAULT_MODEL_QUALITY,
                     timeout: int = 240,
-                    output_lang: str = "en") -> dict[str, Any]:
+                    output_lang: str = "en",
+                    pain: str = "", audience: str = "") -> dict[str, Any]:
     """Deep author research via Claude CLI (uses WebSearch under the hood when needed).
 
     Returns {name, bio, expertise, confidence, sources}. On failure, returns a
     low-confidence stub built from `channel_name` + `channel_description` so the
     pipeline can keep going without aborting the whole course.
     """
-    user_payload = {
+    user_payload: dict[str, Any] = {
         "channel_name": channel_name,
         "channel_description": (channel_description or "")[:1500],
         "sample_video_titles": sample_video_titles[:8],
         "course_topic": course_topic,
     }
+    if pain:
+        user_payload["target_pain"] = pain
+    if audience:
+        user_payload["target_audience"] = audience
     user = json.dumps(user_payload, ensure_ascii=False, indent=2)
 
-    system = RESEARCH_AUTHOR_SYSTEM + _lang_instruction(output_lang)
+    system = (RESEARCH_AUTHOR_SYSTEM
+              + _pain_audience_block(pain, audience)
+              + _lang_instruction(output_lang))
     try:
         parsed = _call_json(model=model, system=system, user=user,
                             timeout=timeout)
@@ -807,17 +863,30 @@ def compose_full_course(*, course_topic: str, course_title: str,
                         lesson_transcripts: list[str],
                         model: str = DEFAULT_MODEL_QUALITY,
                         timeout: int = 600,
-                        output_lang: str = "en") -> dict[str, Any]:
-    """Generate full course content via template + parser. Returns structured dict."""
+                        output_lang: str = "en",
+                        pain: str = "", audience: str = "") -> dict[str, Any]:
+    """Generate full course content via template + parser. Returns structured dict.
+
+    `pain` / `audience`: when provided, the course title, excerpt, about, plan,
+    and curriculum should all foreground how the course solves this pain for
+    this audience (instead of producing a generic course on the topic).
+    """
     # Trim each transcript to ~700 words to stay within budget but keep enough context
     trimmed_lessons = []
     for i, t in enumerate(lesson_transcripts, start=1):
         words = (t or "").split()
         trimmed_lessons.append(f"--- Video {i} transcript ---\n" + " ".join(words[:700]))
 
+    pain_audience_lines = ""
+    if pain:
+        pain_audience_lines += f"TARGET PAIN: {pain}\n"
+    if audience:
+        pain_audience_lines += f"TARGET AUDIENCE: {audience}\n"
+
     materials = (
         f"COURSE TOPIC: {course_topic}\n"
         f"COURSE TITLE (use exactly if you keep one): {course_title}\n"
+        f"{pain_audience_lines}"
         f"INSTRUCTOR / CHANNEL: {channel_name}\n"
         f"CHANNEL DESCRIPTION: {channel_description[:500] if channel_description else '(none)'}\n\n"
         f"NUMBER OF VIDEO LESSONS: {len(lesson_transcripts)} "
@@ -825,7 +894,9 @@ def compose_full_course(*, course_topic: str, course_title: str,
         + "\n\n".join(trimmed_lessons)
     )
 
-    system = COMPOSE_FULL_SYSTEM + _lang_instruction(output_lang)
+    system = (COMPOSE_FULL_SYSTEM
+              + _pain_audience_block(pain, audience)
+              + _lang_instruction(output_lang))
     full_prompt = system + "\n\n---\n\n## MATERIALS\n\n" + materials
 
     # Use the same _call subprocess machinery as _call_json, but expect plain text (template).

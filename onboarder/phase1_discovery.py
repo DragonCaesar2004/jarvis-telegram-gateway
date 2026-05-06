@@ -50,11 +50,17 @@ PROGRESS_INTERVAL_SEC = 30  # don't spam Telegram
 # ---------------------------------------------------------------------------
 
 def launch(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
-           topic: str, count: int) -> None:
-    """Spawn the Phase 1 worker in a background daemon thread."""
+           topic: str, count: int,
+           *, pain: str = "", audience: str = "") -> None:
+    """Spawn the Phase 1 worker in a background daemon thread.
+
+    `pain` and `audience` are optional pain-point + target-audience strings
+    captured by the wizard. When empty, scoring/selection/composition fall
+    back to topic-only behavior.
+    """
     thr = threading.Thread(
         target=_worker,
-        args=(token, agent, cfg, chat_id, user_id, topic, count),
+        args=(token, agent, cfg, chat_id, user_id, topic, count, pain, audience),
         name=f"phase1-{agent}-{user_id}",
         daemon=True,
     )
@@ -66,10 +72,11 @@ def launch(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
 # ---------------------------------------------------------------------------
 
 def _worker(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
-            topic: str, count: int) -> None:
+            topic: str, count: int, pain: str = "", audience: str = "") -> None:
     onb = (cfg.get("onboarder") or {})
     try:
-        _run(token, agent, cfg, chat_id, user_id, topic, count, onb)
+        _run(token, agent, cfg, chat_id, user_id, topic, count, onb,
+             pain=pain, audience=audience)
     except CookiesNeededError as e:
         log.warning(f"phase1: cookies needed: {e}")
         _state.update(agent, user_id, step="error", error=f"cookies_needed: {e}")
@@ -95,7 +102,8 @@ def _worker(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
 
 
 def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
-         topic: str, count: int, onb: dict) -> None:
+         topic: str, count: int, onb: dict,
+         *, pain: str = "", audience: str = "") -> None:
     # ── 1. Resolve secrets and open Sheet ────────────────────────────────
     # Anthropic API key not needed: llm.py uses `claude -p` CLI via Max OAuth.
     sa_path = _secrets.resolve_path(onb, "google_service_account")
@@ -128,6 +136,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     _state.update(agent, user_id, run_id=run_id,
                   step="phase1_running",
                   topic=topic, count=count,
+                  pain=pain, audience=audience,
                   sheet_url=sheets.sheet_url(sheet_id))
 
     # ── 2.5 Init proxy rotator for downloads (same probe UX as Phase 2) ──
@@ -219,7 +228,8 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     # ── 5. Claude scores remaining channels ──────────────────────────────
     _send(token, chat_id, f"🤖 Оцениваю {len(enriched)} каналов через Claude…")
     scored = llm.score_channels(topic=topic, criteria=criteria,
-                                channels=enriched)
+                                channels=enriched,
+                                pain=pain, audience=audience)
     # Merge score into enriched lookup
     score_by_id = {s["channel_id"]: s for s in scored}
     enriched.sort(key=lambda c: score_by_id.get(c["channel_id"], {}).get("score", 0),
@@ -253,7 +263,8 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
 
         try:
             sel = llm.select_videos(topic=topic, criteria=criteria,
-                                    channel_name=ch_name, videos=videos_for_llm)
+                                    channel_name=ch_name, videos=videos_for_llm,
+                                    pain=pain, audience=audience)
         except Exception as e:
             log.warning(f"phase1[{user_id}] select_videos failed for {ch_name}: {e}")
             continue
@@ -299,6 +310,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                 on_progress=lambda msg: _send(token, chat_id, _html_escape(msg)),
                 max_parallel=parallel_per_course,
                 compose_model=compose_model,
+                pain=pain, audience=audience,
             )
         except CookiesNeededError:
             raise  # propagate to _worker for graceful pause

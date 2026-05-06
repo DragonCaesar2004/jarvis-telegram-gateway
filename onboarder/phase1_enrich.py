@@ -64,6 +64,8 @@ def enrich_course(*, course_idx: int, run_id: str,
                   on_progress: Callable[[str], None] | None = None,
                   max_parallel: int = DEFAULT_PARALLEL_PER_COURSE,
                   compose_model: str = llm.DEFAULT_MODEL_QUALITY,
+                  pain: str = "",
+                  audience: str = "",
                   ) -> dict[str, Any]:
     """Heavy lift: download, transcribe, mark cuts, describe, research author, compose.
 
@@ -180,10 +182,10 @@ def enrich_course(*, course_idx: int, run_id: str,
             "compose_ok": False,
         }
 
-    # Detect output language ONCE per course from the topic + course title.
-    # This drives whether descriptions, bios, plans, etc. come back in
-    # Russian or English. Operator types Cyrillic → Russian everywhere.
-    output_lang = llm.detect_topic_lang(course_topic_input, course_title_from_llm)
+    # Detect output language ONCE per course from topic + pain + course title.
+    # Pain is often the most descriptive — operator types it in their own
+    # language, so it's the strongest signal.
+    output_lang = llm.detect_topic_lang(pain, course_topic_input, course_title_from_llm)
     _emit(f"🌐 Язык вывода: {output_lang}")
 
     # ── 2. Per-lesson descriptions (single batched Claude call) ──────────
@@ -198,6 +200,7 @@ def enrich_course(*, course_idx: int, run_id: str,
                 for i, p in enumerate(processed)
             ],
             output_lang=output_lang,
+            pain=pain, audience=audience,
         )
         for i, d in enumerate(descs):
             if i < len(processed):
@@ -213,6 +216,7 @@ def enrich_course(*, course_idx: int, run_id: str,
         sample_video_titles=[p["title"] for p in processed[:8]],
         course_topic=course_title_from_llm or course_topic_input,
         output_lang=output_lang,
+        pain=pain, audience=audience,
     )
     _emit(f"  ✓ author: {author.get('name')} (confidence={author.get('confidence')})")
 
@@ -229,6 +233,7 @@ def enrich_course(*, course_idx: int, run_id: str,
             lesson_transcripts=[p["working_transcript"] for p in processed],
             model=compose_model,
             output_lang=output_lang,
+            pain=pain, audience=audience,
         )
         compose_ok = True
     except Exception as e:
