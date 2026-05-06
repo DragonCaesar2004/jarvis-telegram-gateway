@@ -105,27 +105,35 @@ def handle_wizard_message(token: str, agent: str, cfg: dict, chat_id: int,
         if not topic:
             _send(token, chat_id, "Тема не может быть пустой. Попробуй ещё раз.")
             return
-        _state.update(agent, user_id, topic=topic, step=STEP_ASK_PAIN)
+        # Pain step intentionally skipped — operator decided not to ask for it.
+        # The infra (state field, llm helpers' `pain=` kwargs) is kept so we can
+        # reinstate the step later by flipping `STEP_ASK_AUDIENCE` back to
+        # `STEP_ASK_PAIN` here. Until then `pain` stays an empty string.
+        _state.update(agent, user_id, topic=topic, step=STEP_ASK_AUDIENCE)
         _send(token, chat_id,
               f"Тема: <b>{_html_escape(topic)}</b>\n\n"
-              "Какую конкретную <b>боль клиента</b> курс решает? "
-              "Например: «не могу присесть из-за боли в колене после 45 лет».\n\n"
-              "Это нужно, чтобы Claude отбирал каналы/видео и писал описания "
-              "под эту боль, а не делал общий курс.\n\n"
-              "<i>Пропустить — отправь <code>-</code> или <code>/skip</code>.</i>")
-        return
-
-    if step == STEP_ASK_PAIN:
-        pain_raw = text.strip()
-        pain = "" if pain_raw.lower() in _SKIP_TOKENS else pain_raw
-        _state.update(agent, user_id, pain=pain, step=STEP_ASK_AUDIENCE)
-        shown_pain = _html_escape(pain) if pain else "<i>(пропущено)</i>"
-        _send(token, chat_id,
-              f"Боль: <b>{shown_pain}</b>\n\n"
               "Кто <b>целевая аудитория</b>? "
               "Например: «мужчины 45+ с малоподвижным образом жизни» или "
               "«предприниматели B2B, которые хотят масштабироваться через AI».\n\n"
               "<i>Пропустить — отправь <code>-</code> или <code>/skip</code>.</i>")
+        return
+
+    if step == STEP_ASK_PAIN:
+        # Legacy: a wizard from before we removed the pain step might still
+        # have its state file pointing here. Treat the input as audience to
+        # keep the user moving forward instead of force-restarting them.
+        log.info(f"[{agent}] wizard advancing legacy STEP_ASK_PAIN state to audience")
+        _state.update(agent, user_id, step=STEP_ASK_AUDIENCE)
+        # fall through by re-routing to the audience handler
+        # (treat the user's reply as the audience answer, not a pain answer).
+        # Easiest way: synthesize the same logic inline below.
+        aud_raw = text.strip()
+        audience = "" if aud_raw.lower() in _SKIP_TOKENS else aud_raw
+        _state.update(agent, user_id, audience=audience, step=STEP_ASK_COUNT)
+        shown_aud = _html_escape(audience) if audience else "<i>(пропущено)</i>"
+        _send(token, chat_id,
+              f"Аудитория: <b>{shown_aud}</b>\n\n"
+              "Сколько курсов сделать? (число от 1 до 5)")
         return
 
     if step == STEP_ASK_AUDIENCE:
@@ -148,15 +156,12 @@ def handle_wizard_message(token: str, agent: str, cfg: dict, chat_id: int,
             return
         st = _state.update(agent, user_id, count=count, step=STEP_CONFIRM)
         topic = st.get("topic", "")
-        pain = st.get("pain", "")
         audience = st.get("audience", "")
-        pain_line = _html_escape(pain) if pain else "<i>(не указана)</i>"
         aud_line = _html_escape(audience) if audience else "<i>(не указана)</i>"
         _send_with_buttons(
             token, chat_id,
             f"<b>Подтверждение:</b>\n\n"
             f"Тема: <b>{_html_escape(topic)}</b>\n"
-            f"Боль: {pain_line}\n"
             f"Аудитория: {aud_line}\n"
             f"Кол-во курсов: <b>{count}</b>\n\n"
             f"Запустить Phase 1 (поиск каналов и видео)?",
@@ -222,7 +227,6 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
         st = _state.load(agent, user_id)
         topic = st.get("topic")
         count = st.get("count")
-        pain = st.get("pain", "")
         audience = st.get("audience", "")
         if not topic or not count:
             answer_callback_query(token, cq_id, "Состояние формы потеряно", show_alert=True)
@@ -230,14 +234,13 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
             return
         _state.update(agent, user_id, step=STEP_PHASE1_RUNNING)
         answer_callback_query(token, cq_id, "Phase 1 запущен")
-        pain_line = f"\nБоль: <b>{_html_escape(pain)}</b>" if pain else ""
         aud_line = f"\nАудитория: <b>{_html_escape(audience)}</b>" if audience else ""
         try:
             tg_api(token, "sendMessage", chat_id=chat_id,
                    text=(
                        "🔍 <b>Phase 1 запущен.</b>\n\n"
                        f"Тема: <b>{_html_escape(topic)}</b>"
-                       f"{pain_line}{aud_line}\n"
+                       f"{aud_line}\n"
                        f"Курсов: <b>{count}</b>\n\n"
                        "Phase 1 теперь делает всю тяжёлую работу: ищет каналы, "
                        "скачивает видео, транскрибирует, размечает вырезки, "
@@ -254,7 +257,7 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
             from . import phase1_discovery
             phase1_discovery.launch(token, agent, cfg, chat_id, user_id,
                                     topic, count,
-                                    pain=pain, audience=audience)
+                                    audience=audience)
         except Exception as e:
             log.exception(f"[{agent}] failed to launch phase1: {e}")
             try:
