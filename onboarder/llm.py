@@ -438,6 +438,86 @@ def describe_lessons(*, course_topic: str, course_title: str,
 
 
 # ---------------------------------------------------------------------------
+# Phase 1: batch translation to Russian for the Sheet review pass
+# ---------------------------------------------------------------------------
+# Operator reviews the Sheet in Russian. When the source language of a course
+# is English (or any non-Russian), we ALSO need a Russian rendering of every
+# lesson description, the course description, and the author bio so the
+# operator can sanity-check what's about to land on the platform without
+# bouncing through Google Translate.
+#
+# Stored format in the Sheet: original + a separator + Russian, so a reviewer
+# sees both in a single cell. When the source is already Russian we skip the
+# duplication.
+
+TRANSLATE_BATCH_SYSTEM = """You translate landing-page copy from any source language into natural Russian.
+
+You will receive a JSON array of items, each with `id` and `text`. Translate every `text` into Russian and return a JSON array with the same `id`s in the same order. Strictly preserve markdown formatting (**bold**, *italic*, ### headings, bullet lists), URLs (don't translate), and proper names (people, brands, institutions — transliterate only when the Russian convention does so). Don't summarize or shorten — translate fully. Don't add commentary.
+
+Output ONLY valid JSON in this exact shape:
+[
+  {"id": "lesson_1", "text": "<Russian translation>"},
+  {"id": "course_description", "text": "<...>"},
+  ...
+]
+"""
+
+
+_RU_TRANSLATION_SEP = "\n\n— Перевод на русский —\n\n"
+
+
+def translate_batch_to_russian(items: list[dict[str, str]],
+                               model: str = DEFAULT_MODEL_FAST,
+                               timeout: int = 180) -> dict[str, str]:
+    """Translate many short texts in one Claude call.
+
+    `items`: [{"id": str, "text": str}, ...]. Empty texts are skipped.
+
+    Returns a {id: russian_text} dict. On failure / partial misses, the missing
+    ids are absent — caller should fall back to the source text.
+    """
+    payload = [{"id": str(it["id"]), "text": str(it.get("text") or "").strip()}
+               for it in items if (it.get("text") or "").strip()]
+    if not payload:
+        return {}
+    user = json.dumps(payload, ensure_ascii=False, indent=2)
+    try:
+        parsed = _call_json(model=model, system=TRANSLATE_BATCH_SYSTEM, user=user,
+                            timeout=timeout, max_tokens=8192)
+    except Exception as e:
+        log.warning(f"translate_batch_to_russian failed: {e}")
+        return {}
+    if not isinstance(parsed, list):
+        log.warning(f"translate_batch_to_russian: non-list result: {parsed!r}")
+        return {}
+    out: dict[str, str] = {}
+    for p in parsed:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("id") or "").strip()
+        ptext = str(p.get("text") or "").strip()
+        if pid and ptext:
+            out[pid] = ptext
+    return out
+
+
+def join_with_russian(original: str, russian: str | None) -> str:
+    """Combine source text and its Russian translation into one Sheet cell.
+
+    If the russian field is missing or equals the original (translation
+    failed), returns the original alone. Otherwise returns
+    "original<sep>russian".
+    """
+    original = (original or "").strip()
+    russian = (russian or "").strip()
+    if not original:
+        return russian or ""
+    if not russian or russian == original:
+        return original
+    return f"{original}{_RU_TRANSLATION_SEP}{russian}"
+
+
+# ---------------------------------------------------------------------------
 # Phase 1: deep author research with WebSearch (Claude CLI tool)
 # ---------------------------------------------------------------------------
 

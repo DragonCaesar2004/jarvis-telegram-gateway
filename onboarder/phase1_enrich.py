@@ -270,9 +270,53 @@ def enrich_course(*, course_idx: int, run_id: str,
     course_what_you_learn = _extract_what_you_learn(composed_full)
     course_target_audience = _extract_target_audience(course_about)
 
+    # ── 5.5. Russian translations for operator review ───────────────────
+    # If the source language is already Russian, skip — the originals are
+    # already in Russian. Otherwise batch every description / bio / tagline
+    # / what-you-learn into a single Claude translate call to keep latency
+    # and quota cost low.
+    russian_map: dict[str, str] = {}
+    if output_lang != "ru":
+        translation_items: list[dict[str, str]] = []
+        if course_description:
+            translation_items.append({"id": "course_description",
+                                      "text": course_description})
+        if course_tagline:
+            translation_items.append({"id": "course_tagline",
+                                      "text": course_tagline})
+        if course_what_you_learn:
+            translation_items.append({"id": "course_what_you_learn",
+                                      "text": course_what_you_learn})
+        if course_target_audience:
+            translation_items.append({"id": "course_target_audience",
+                                      "text": course_target_audience})
+        author_bio_src = (author.get("bio") or "")
+        if author_bio_src:
+            translation_items.append({"id": "author_bio", "text": author_bio_src})
+        author_expertise_src = (author.get("expertise") or "")
+        if author_expertise_src:
+            translation_items.append({"id": "author_expertise",
+                                      "text": author_expertise_src})
+        for p in processed:
+            ld = lesson_descriptions.get(p["video_id"], "")
+            if ld:
+                translation_items.append({"id": f"lesson_{p['video_id']}",
+                                          "text": ld})
+
+        if translation_items:
+            _emit(f"🌐 Перевожу {len(translation_items)} описаний на русский (один батч)…")
+            try:
+                russian_map = llm.translate_batch_to_russian(translation_items)
+                _emit(f"  ✓ переведено: {len(russian_map)}/{len(translation_items)}")
+            except Exception as e:
+                log.warning(f"phase1_enrich: russian batch translate failed: {e}")
+
     enriched_videos: list[dict[str, Any]] = []
     for lesson_idx, p in enumerate(processed, start=1):
         excerpt = (p["working_transcript"] or "")[:TRANSCRIPT_EXCERPT_CHARS]
+        ld_src = lesson_descriptions.get(p["video_id"], "")
+        ld_combined = llm.join_with_russian(
+            ld_src, russian_map.get(f"lesson_{p['video_id']}"))
         enriched_videos.append({
             "video_id": p["video_id"],
             "title": p["title"],
@@ -280,7 +324,7 @@ def enrich_course(*, course_idx: int, run_id: str,
             "duration_sec": p["duration_sec"],
             "lesson_idx": lesson_idx,
             "transcript_excerpt": excerpt,
-            "lesson_description": lesson_descriptions.get(p["video_id"], ""),
+            "lesson_description": ld_combined,
             "detected_lang": p["detected_lang"],
             "cuts_count": p["cuts_count"],
         })
@@ -292,13 +336,19 @@ def enrich_course(*, course_idx: int, run_id: str,
     return {
         "videos": enriched_videos,
         "course_title": final_course_title,
-        "course_description": course_description,
-        "course_tagline": course_tagline,
-        "course_what_you_learn": course_what_you_learn,
-        "course_target_audience": course_target_audience,
+        "course_description": llm.join_with_russian(
+            course_description, russian_map.get("course_description")),
+        "course_tagline": llm.join_with_russian(
+            course_tagline, russian_map.get("course_tagline")),
+        "course_what_you_learn": llm.join_with_russian(
+            course_what_you_learn, russian_map.get("course_what_you_learn")),
+        "course_target_audience": llm.join_with_russian(
+            course_target_audience, russian_map.get("course_target_audience")),
         "author_name": author.get("name") or channel_name,
-        "author_bio": author.get("bio") or "",
-        "author_expertise": author.get("expertise") or "",
+        "author_bio": llm.join_with_russian(
+            author.get("bio") or "", russian_map.get("author_bio")),
+        "author_expertise": llm.join_with_russian(
+            author.get("expertise") or "", russian_map.get("author_expertise")),
         "compose_ok": compose_ok,
     }
 
