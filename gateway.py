@@ -780,8 +780,35 @@ def _resolve_groq_key(cfg: dict) -> str | None:
 
 _MAX_DOCUMENT_BYTES = 50 * 1024 * 1024  # Telegram sendDocument limit: 50 MB
 
+# Per-request thread-local context. The message dispatcher sets `thread_id`
+# at the start of each incoming-update handler so that downstream sends
+# (handle_command, menu callbacks, anywhere that calls tg_api(..., sendMessage, ...))
+# auto-route into the originating Telegram forum topic. Without this, replies
+# from /menu typed in topic X land back in General.
+_REQUEST_TLS = threading.local()
+
+# Telegram methods that accept message_thread_id. Other methods (getFile,
+# editMessageText, deleteMessage, …) ignore it, so we only inject for these.
+_THREAD_AWARE_METHODS = {
+    "sendMessage", "sendDocument", "sendPhoto", "sendVideo", "sendAudio",
+    "sendVoice", "sendVideoNote", "sendAnimation", "sendSticker",
+    "sendMediaGroup", "sendPoll", "sendDice", "sendLocation", "sendVenue",
+    "sendContact",
+}
+
+
 def tg_api(token: str, method: str, retry: int = 2, **params: Any) -> dict:
-    """Telegram API call with retry on 429/5xx/network errors."""
+    """Telegram API call with retry on 429/5xx/network errors.
+
+    For message-sending methods, auto-injects `message_thread_id` from the
+    active producer-thread TLS when the caller didn't pass one explicitly.
+    Set TLS at the top of the message dispatcher to flow the originating
+    forum topic into every reply by default.
+    """
+    if method in _THREAD_AWARE_METHODS and "message_thread_id" not in params:
+        tid = int(getattr(_REQUEST_TLS, "thread_id", 0) or 0)
+        if tid:
+            params["message_thread_id"] = tid
     url = f"https://api.telegram.org/bot{token}/{method}"
     last_exc: Any = None
     for attempt in range(retry + 1):
@@ -1052,18 +1079,28 @@ def register_callback_handler(prefix: str, handler: Any) -> None:
 
 
 def dispatch_callback_query(token: str, agent: str, cfg: dict, cq: dict) -> None:
-    """Route a callback_query to the appropriate handler."""
+    """Route a callback_query to the appropriate handler.
+
+    Sets the per-request TLS thread_id from the callback's underlying message
+    so that tg_api auto-routes any downstream replies back into the same
+    forum topic the button was clicked in.
+    """
     data = cq.get("data", "")
-    for prefix, handler in _CALLBACK_HANDLERS.items():
-        if data.startswith(prefix):
-            try:
-                handler(token, agent, cfg, cq)
-            except Exception as e:
-                log.exception(f"callback handler error ({prefix}): {e}")
-                answer_callback_query(token, cq["id"], f"Error: {e}", show_alert=True)
-            return
-    # No handler matched -- acknowledge silently
-    answer_callback_query(token, cq["id"])
+    cq_msg = cq.get("message") or {}
+    _REQUEST_TLS.thread_id = int(cq_msg.get("message_thread_id") or 0)
+    try:
+        for prefix, handler in _CALLBACK_HANDLERS.items():
+            if data.startswith(prefix):
+                try:
+                    handler(token, agent, cfg, cq)
+                except Exception as e:
+                    log.exception(f"callback handler error ({prefix}): {e}")
+                    answer_callback_query(token, cq["id"], f"Error: {e}", show_alert=True)
+                return
+        # No handler matched -- acknowledge silently
+        answer_callback_query(token, cq["id"])
+    finally:
+        _REQUEST_TLS.thread_id = 0
 
 
 # ---------------------------------------------------------------------------
@@ -2850,6 +2887,19 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
     if not msg:
         return
 
+    # Forum-topic context for the duration of this dispatch — so every
+    # downstream tg_api(... sendMessage ...) call routes back into the same
+    # topic the user typed in. Cleared in the finally below.
+    _REQUEST_TLS.thread_id = int(msg.get("message_thread_id") or 0)
+    try:
+        return _process_update_impl(agent, cfg, token, update, allowlist, msg, is_webhook)
+    finally:
+        _REQUEST_TLS.thread_id = 0
+
+
+def _process_update_impl(agent: str, cfg: dict, token: str, update: dict,
+                         allowlist: list[int], msg: dict, is_webhook: bool) -> None:
+
     # Group/supergroup gating: check chat_id against allowlist_group_ids
     chat_type = (msg.get("chat") or {}).get("type", "private")
     is_group = chat_type in ("group", "supergroup")
@@ -3451,12 +3501,16 @@ def polling_producer(
                     msg_queue.put(upd)
                     continue
 
+                # Forum topic context for any sends inside the OOB handler
+                _REQUEST_TLS.thread_id = int(msg.get("message_thread_id") or 0)
                 try:
                     _handle_oob_command(agent, token, chat_id, text, cfg=cfg)
                 except Exception:
                     log.exception(
                         f"[{agent}] OOB command failed: {text}"
                     )
+                finally:
+                    _REQUEST_TLS.thread_id = 0
                 continue
 
             # Regular message -> queue for consumer
