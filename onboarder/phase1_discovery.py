@@ -440,11 +440,35 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                            "(или все видео уже были обработаны раньше). "
                            "Попробуй другую тему или расширь критерии.")
 
-    # ── 7. Append to unified Lessons tab ──────────────────────────────────
-    sheets.append_lesson_rows(client, sheet_id, run_id=run_id, rows=all_lesson_rows)
+    # ── 7. Append to unified Lessons tab (atomic re-check + write) ──────
+    # Two parallel wizards (one per forum topic) might both reach this point
+    # holding rows they each consider "new". Take the sheet lock, re-read
+    # the dedup set under the lock to catch anything the other worker
+    # appended while we were enriching, filter again, then commit.
+    with sheets.sheet_lock():
+        latest_seen = sheets.get_active_video_ids(client, sheet_id)
+        latest_blocked = sheets.get_seen_channel_ids(client, sheet_id)
+        rows_to_write: list[dict[str, Any]] = []
+        late_dedup_skipped = 0
+        for r in all_lesson_rows:
+            if r.get("video_id") in latest_seen:
+                late_dedup_skipped += 1
+                continue
+            if r.get("channel_id") in latest_blocked:
+                late_dedup_skipped += 1
+                continue
+            rows_to_write.append(r)
+        if late_dedup_skipped:
+            log.info(f"phase1[{user_id}] late dedup under sheet lock: "
+                     f"dropped {late_dedup_skipped} rows that another worker had committed")
+        if rows_to_write:
+            sheets.append_lesson_rows(client, sheet_id, run_id=run_id,
+                                      rows=rows_to_write)
     _state.update(agent, user_id, thread_id=int(thread_id or 0),
                   step="awaiting_approval",
                   courses_summary=course_summaries)
+    if late_dedup_skipped:
+        skipped_total += late_dedup_skipped
 
     # ── 8. Final Telegram message with action button ─────────────────────
     sheet_url = sheets.sheet_url(sheet_id)

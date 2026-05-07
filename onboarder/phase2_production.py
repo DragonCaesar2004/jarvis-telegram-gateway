@@ -149,21 +149,24 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
     # single tab. If run_id is set, we filter to that run for safety.
 
     client = sheets.open_client(sa_path)
-    approved = sheets.read_pending_approved_rows(client, sheet_id, run_id=run_id)
-    if not approved:
-        raise RuntimeError(
-            "В табе Lessons нет строк со status=pending и approved=TRUE"
-            + (f" для run_id={run_id}" if run_id else "")
-            + ". Открой Sheet, отметь Approved=TRUE и нажми кнопку ещё раз."
+    # Atomic claim under the sheet lock: read approved+pending rows AND
+    # immediately stamp them as `processing` in one critical section. A
+    # second Phase 2 worker that opens the lock right after will see those
+    # same rows as already-processing and skip them — no two workers ever
+    # process the same lesson.
+    with sheets.sheet_lock():
+        approved = sheets.read_pending_approved_rows(client, sheet_id, run_id=run_id)
+        if not approved:
+            raise RuntimeError(
+                "В табе Lessons нет строк со status=pending и approved=TRUE"
+                + (f" для run_id={run_id}" if run_id else "")
+                + ". Открой Sheet, отметь Approved=TRUE и нажми кнопку ещё раз."
+            )
+        sheets.update_status(
+            client, sheet_id,
+            sheet_rows=[r["_sheet_row"] for r in approved],
+            new_status=sheets.STATUS_PROCESSING,
         )
-
-    # Mark all selected rows as processing IMMEDIATELY — so a parallel run
-    # or a manual click doesn't try to grab them again.
-    sheets.update_status(
-        client, sheet_id,
-        sheet_rows=[r["_sheet_row"] for r in approved],
-        new_status=sheets.STATUS_PROCESSING,
-    )
 
     # Group approved lessons by course_idx (within their run)
     courses: dict[int, list[dict[str, Any]]] = {}

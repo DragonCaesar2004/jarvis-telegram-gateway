@@ -15,11 +15,41 @@ so they can be unit-tested with a fake client without touching the real Sheet.
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("gateway")
+
+# Module-level mutex for the Lessons tab. Multiple parallel wizards (one per
+# Telegram forum topic) can finish Phase 1 around the same time or grab
+# approved rows in Phase 2 simultaneously — without this, the sheet would
+# see interleaved appends or two workers fighting over the same row.
+#
+# RLock so the same thread can re-acquire (e.g. when an outer "read → write"
+# critical section calls a helper that also takes the lock internally).
+_SHEET_LOCK = threading.RLock()
+
+
+@contextmanager
+def sheet_lock():
+    """Context manager around the Lessons-tab mutex.
+
+    Wrap any read-then-write critical section in this:
+        with sheets.sheet_lock():
+            seen = sheets.get_active_video_ids(...)
+            new = [r for r in rows if r["video_id"] not in seen]
+            sheets.append_lesson_rows(..., rows=new)
+
+    Phase 1 uses it for the final dedup re-check + append; Phase 2 uses it
+    for the read-approved-rows + mark-processing step. Per-video status
+    updates inside Phase 2 (marking done/failed for one row) are always
+    bounded to that worker's own rows and don't need the lock.
+    """
+    with _SHEET_LOCK:
+        yield
 
 # Header for the unified Lessons tab. Columns ordered by user-facing
 # importance (status/approved/course/channel left, technical IDs right).
@@ -395,24 +425,27 @@ def update_status(client: Any, sheet_id: str, *, sheet_rows: list[int],
     """Bulk-update status (and optionally admin URL / failure reason) for rows by index.
 
     `sheet_rows` are 1-based row numbers as returned by read_pending_approved_rows.
+    Acquires the module sheet lock briefly so concurrent writers don't step
+    on each other's HTTP calls.
     """
     if not sheet_rows:
         return
-    ws = ensure_lessons_tab(client, sheet_id)
+    with _SHEET_LOCK:
+        ws = ensure_lessons_tab(client, sheet_id)
 
-    # Map column letters from the canonical header
-    col_status = _col_letter("status")           # A
-    col_admin = _col_letter("course_admin_url")  # I
-    col_reason = _col_letter("failure_reason")   # J
+        # Map column letters from the canonical header
+        col_status = _col_letter("status")           # A
+        col_admin = _col_letter("course_admin_url")  # I
+        col_reason = _col_letter("failure_reason")   # J
 
-    updates: list[dict[str, Any]] = []
-    for r in sheet_rows:
-        updates.append({"range": f"{col_status}{r}", "values": [[new_status]]})
-        if course_admin_url is not None:
-            updates.append({"range": f"{col_admin}{r}", "values": [[course_admin_url]]})
-        if failure_reason is not None:
-            updates.append({"range": f"{col_reason}{r}", "values": [[failure_reason[:300]]]})
-    ws.batch_update(updates, value_input_option="USER_ENTERED")
+        updates: list[dict[str, Any]] = []
+        for r in sheet_rows:
+            updates.append({"range": f"{col_status}{r}", "values": [[new_status]]})
+            if course_admin_url is not None:
+                updates.append({"range": f"{col_admin}{r}", "values": [[course_admin_url]]})
+            if failure_reason is not None:
+                updates.append({"range": f"{col_reason}{r}", "values": [[failure_reason[:300]]]})
+        ws.batch_update(updates, value_input_option="USER_ENTERED")
 
 
 # ---------------------------------------------------------------------------
