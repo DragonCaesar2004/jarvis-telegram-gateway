@@ -2895,6 +2895,10 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
     if text.startswith("/"):
         parts = text.split(None, 1)
         cmd = parts[0].lower()
+        # In groups Telegram appends @botname to commands ("/menu@my_bot").
+        # Strip it so the dispatch matches the bare command name.
+        if "@" in cmd:
+            cmd = cmd.split("@", 1)[0]
         args = parts[1] if len(parts) > 1 else ""
         if handle_command(token, chat_id, agent, cmd, args, cfg):
             log.info(f"[{agent}] command: {cmd} {args}".strip())
