@@ -319,22 +319,35 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     score_by_id = {s["channel_id"]: s for s in scored}
     enriched.sort(key=lambda c: score_by_id.get(c["channel_id"], {}).get("score", 0),
                   reverse=True)
-    top_channels = [c for c in enriched
-                    if score_by_id.get(c["channel_id"], {}).get("score", 0) >= MIN_LLM_SCORE]
-    if len(top_channels) < count:
-        # Fall back to best available even if below threshold
-        top_channels = enriched[:count]
-    top_channels = top_channels[:count]
+    # Candidate pool for the per-channel loop: every channel that passed both
+    # the hard filter (subs/videos) and the Claude scoring threshold, ordered
+    # best-first. We DO NOT truncate to `count` here — the loop below builds
+    # courses one at a time and stops once `count` succeed. If a top-scored
+    # channel turns out to have no on-topic videos (select_videos skip), we
+    # roll down to the next-best candidate instead of aborting Phase 1.
+    candidate_channels = [c for c in enriched
+                          if score_by_id.get(c["channel_id"], {}).get("score", 0) >= MIN_LLM_SCORE]
+    if not candidate_channels:
+        # Threshold too tight — fall back to whatever we have, ranked.
+        candidate_channels = list(enriched)
+    log.info(f"phase1[{user_id}] {len(candidate_channels)} channels above scoring "
+             f"threshold; will try them in order until {count} courses succeed")
 
     # ── 6. Per-channel: list videos + Claude select + dedup ─────────────
     all_lesson_rows: list[dict[str, Any]] = []
     course_summaries: list[str] = []
     skipped_total = 0
-    for course_idx, ch in enumerate(top_channels, start=1):
+    course_idx = 0
+    successful_courses = 0
+    skip_reasons: list[str] = []  # for the final failure message if zero succeed
+    for ch in candidate_channels:
+        if successful_courses >= count:
+            break
+        course_idx += 1
         ch_name = ch.get("channel_name") or ch["channel_id"]
         _send(token, chat_id,
-              f"🎬 Курс {course_idx}/{count} — канал «{_html_escape(ch_name)}»: "
-              f"тяну видео и отбираю…")
+              f"🎬 Курс {course_idx} (нужно {count}, успешных {successful_courses}) — "
+              f"канал «{_html_escape(ch_name)}»: тяну видео и отбираю…")
 
         all_videos = ytdl.list_channel_videos(
             ch["channel_id"],
@@ -344,6 +357,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         videos_for_llm = [_compact_video_for_llm(v) for v in all_videos]
         if not videos_for_llm:
             log.warning(f"phase1[{user_id}] channel {ch_name} has no videos in age window")
+            skip_reasons.append(f"{ch_name}: no videos in age window")
             continue
 
         try:
@@ -352,11 +366,14 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                                     pain=pain, audience=audience)
         except Exception as e:
             log.warning(f"phase1[{user_id}] select_videos failed for {ch_name}: {e}")
+            skip_reasons.append(f"{ch_name}: select_videos error: {str(e)[:80]}")
             continue
         course_title = sel.get("course_title")
         lessons = sel.get("lessons") or []
         if not course_title or not lessons:
-            log.info(f"phase1[{user_id}] {ch_name} skipped: {sel.get('skip_reason')}")
+            reason = (sel.get("skip_reason") or "no course_title/lessons")[:120]
+            log.info(f"phase1[{user_id}] {ch_name} skipped: {reason}")
+            skip_reasons.append(f"{ch_name}: {reason}")
             continue
 
         # Dedup: drop any lesson whose video_id is already done/processing in any run
@@ -375,6 +392,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
             _send(token, chat_id,
                   f"⚠️ Курс {course_idx} ({_html_escape(ch_name)}) пропущен — "
                   f"все {len(lessons)} видео уже обрабатывались.")
+            skip_reasons.append(f"{ch_name}: all {len(lessons)} videos were duplicates")
             continue
 
         # Enforce the 5-video minimum AFTER dedup. Even if Claude picked 5+,
@@ -387,6 +405,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                   f"⚠️ Курс {course_idx} ({_html_escape(ch_name)}) пропущен — "
                   f"после дедупликации осталось только {len(dedup_lessons)} видео, "
                   f"минимум {MIN_LESSONS_PER_COURSE}. Канал не годится для отдельного курса.")
+            skip_reasons.append(f"{ch_name}: only {len(dedup_lessons)}/5 unique videos after dedup")
             continue
 
         # ── 6a. ENRICH: download + transcribe + cuts + describe + compose ──
@@ -417,11 +436,13 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
             _send(token, chat_id,
                   f"⚠️ Курс {course_idx} ({_html_escape(ch_name)}): обогащение упало "
                   f"(<code>{_html_escape(str(e))[:160]}</code>). Пропускаю курс.")
+            skip_reasons.append(f"{ch_name}: enrich error: {str(e)[:80]}")
             continue
 
         if not enriched.get("videos"):
             _send(token, chat_id,
                   f"⚠️ Курс {course_idx}: ни одно видео не довелось до конца. Пропускаю.")
+            skip_reasons.append(f"{ch_name}: no videos survived enrichment")
             continue
 
         # ── 6b. Build enriched lesson rows for the Sheet ────────────────────
@@ -464,11 +485,23 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                 "author_bio": author_bio if is_first else "",
                 "author_expertise": author_expertise if is_first else "",
             })
+        # Course built successfully; advance the success counter so the loop
+        # exits after `count` good ones, not after `count` attempts.
+        successful_courses += 1
 
     if not all_lesson_rows:
-        raise RuntimeError("Ни один канал не дал валидной подборки уроков "
-                           "(или все видео уже были обработаны раньше). "
-                           "Попробуй другую тему или расширь критерии.")
+        # Surface concrete skip reasons so the operator knows which channels
+        # tried what and why nothing made it through.
+        diag = ""
+        if skip_reasons:
+            diag = "\n\nПроверенные каналы и причины пропуска:\n" + "\n".join(
+                f"  • {r}" for r in skip_reasons[:10]
+            )
+        raise RuntimeError(
+            "Ни один из проверенных каналов не дал валидной подборки уроков "
+            "(или все видео уже были обработаны раньше). "
+            "Попробуй другую тему или расширь критерии." + diag
+        )
 
     # ── 7. Append to unified Lessons tab (atomic re-check + write) ──────
     # Two parallel wizards (one per forum topic) might both reach this point
