@@ -47,6 +47,12 @@ def _ydl(extra_opts: dict | None = None) -> Any:
         "skip_download": True,
         "extract_flat": False,
         "nocheckcertificate": True,
+        # Hard cap on each network round-trip. Without this, a single slow
+        # YouTube response stalls the whole metadata batch (Phase 1 froze
+        # silently after the unique-channels message — one channel hung
+        # the executor.map and nothing else made progress).
+        "socket_timeout": 15,
+        "extractor_retries": 1,
     }
     if extra_opts:
         opts.update(extra_opts)

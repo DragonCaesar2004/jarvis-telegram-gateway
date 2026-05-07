@@ -29,7 +29,7 @@ import logging
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import Any
 
 from . import (_secrets, llm, phase1_enrich, proxy_pool, sheets,
@@ -219,38 +219,59 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     checked = 0
     metadata_workers = max(1, int(onb.get("phase1_metadata_workers")
                                   or METADATA_BATCH_SIZE))
+    # Per-channel hard timeout. yt-dlp's socket_timeout caps individual HTTP
+    # round-trips, but a channel page can issue many requests; this cap is
+    # the outer bound. Anything past this is treated as "channel unreachable"
+    # and skipped so the executor can move on.
+    per_call_timeout_sec = 35
     # Probe candidates in batches so we still get the early-exit benefit when
     # `target_passing` channels pass the hard filter — but inside each batch
-    # the yt-dlp calls run concurrently, turning ~8 min sequential into ~1 min.
+    # the yt-dlp calls run concurrently with as_completed + per-future
+    # timeout (used to be ex.map, which blocked on the slowest one and
+    # silently froze Phase 1 if a channel page hung).
     for batch_start in range(0, cap, metadata_workers):
         batch = candidates[batch_start:batch_start + metadata_workers]
         if not batch:
             break
 
         with ThreadPoolExecutor(max_workers=len(batch)) as ex:
-            metas = list(ex.map(
-                lambda c: ytdl.get_channel_metadata(c["channel_id"]),
-                batch,
-            ))
+            futures: dict[Any, dict[str, Any]] = {
+                ex.submit(ytdl.get_channel_metadata, c["channel_id"]): c
+                for c in batch
+            }
+            try:
+                for fut in as_completed(futures, timeout=per_call_timeout_sec * 2):
+                    ch = futures[fut]
+                    checked += 1
+                    try:
+                        meta = fut.result(timeout=per_call_timeout_sec)
+                    except (FuturesTimeoutError, Exception) as e:
+                        log.warning(f"phase1[{user_id}] metadata probe timed out / "
+                                    f"failed for {ch.get('channel_id')}: {e}")
+                        continue
+                    if not meta:
+                        continue
+                    # Channel-level dedup — author already on platform.
+                    if meta.get("channel_id") in blocked_channel_ids:
+                        log.info(f"phase1[{user_id}] skip already-on-platform channel: "
+                                 f"{meta.get('channel_name')!r} (id={meta.get('channel_id')})")
+                        continue
+                    if not _passes_hard_filter(meta, criteria):
+                        log.info(f"phase1[{user_id}] filter out: {meta['channel_name']} "
+                                 f"(subs={meta['subscribers']}, videos={meta['video_count']})")
+                        rejected.append(meta)
+                        continue
+                    enriched.append({**meta, "votes": ch.get("votes", 0),
+                                     "sample_titles": ch.get("sample_titles", [])})
+            except FuturesTimeoutError:
+                # Outer timeout: the whole batch took longer than 2× per-call.
+                # Cancel remaining futures and proceed — better partial than stuck.
+                for f in futures:
+                    f.cancel()
+                log.warning(f"phase1[{user_id}] metadata batch outer timeout, "
+                            f"continuing with what completed ({checked} checked so far)")
 
-        for ch, meta in zip(batch, metas):
-            checked += 1
-            if not meta:
-                continue
-            # Channel-level dedup — author already has a course on the
-            # platform, propose someone else instead.
-            if meta.get("channel_id") in blocked_channel_ids:
-                log.info(f"phase1[{user_id}] skip already-on-platform channel: "
-                         f"{meta.get('channel_name')!r} (id={meta.get('channel_id')})")
-                continue
-            if not _passes_hard_filter(meta, criteria):
-                log.info(f"phase1[{user_id}] filter out: {meta['channel_name']} "
-                         f"(subs={meta['subscribers']}, videos={meta['video_count']})")
-                rejected.append(meta)
-                continue
-            enriched.append({**meta, "votes": ch.get("votes", 0),
-                             "sample_titles": ch.get("sample_titles", [])})
-
+        # Progress message after each batch (executor scope ended).
         if time.time() - last_progress > PROGRESS_INTERVAL_SEC:
             _send(token, chat_id,
                   f"… проверено {checked}/{cap}, прошло фильтр: {len(enriched)}")
