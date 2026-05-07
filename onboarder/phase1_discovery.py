@@ -234,7 +234,15 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         if not batch:
             break
 
-        with ThreadPoolExecutor(max_workers=len(batch)) as ex:
+        # Don't use `with ThreadPoolExecutor():` — its __exit__ calls
+        # shutdown(wait=True), which blocks on any worker still running
+        # yt-dlp (Python threads can't be killed; future.cancel() is a no-op
+        # once a task has started). When a single channel page hung we'd
+        # freeze the whole Phase 1. We use shutdown(wait=False, cancel_futures=True)
+        # in finally — the stuck thread leaks for now (eventually finishes via
+        # yt-dlp's socket_timeout), but the run keeps moving.
+        ex = ThreadPoolExecutor(max_workers=len(batch))
+        try:
             futures: dict[Any, dict[str, Any]] = {
                 ex.submit(ytdl.get_channel_metadata, c["channel_id"]): c
                 for c in batch
@@ -264,12 +272,13 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                     enriched.append({**meta, "votes": ch.get("votes", 0),
                                      "sample_titles": ch.get("sample_titles", [])})
             except FuturesTimeoutError:
-                # Outer timeout: the whole batch took longer than 2× per-call.
-                # Cancel remaining futures and proceed — better partial than stuck.
-                for f in futures:
-                    f.cancel()
+                # Outer timeout: at least one channel hung. Move on — the
+                # stuck future will eventually clean itself up via
+                # yt-dlp's socket_timeout.
                 log.warning(f"phase1[{user_id}] metadata batch outer timeout, "
                             f"continuing with what completed ({checked} checked so far)")
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
 
         # Progress message after each batch (executor scope ended).
         if time.time() - last_progress > PROGRESS_INTERVAL_SEC:
