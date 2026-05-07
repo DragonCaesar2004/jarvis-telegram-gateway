@@ -57,19 +57,29 @@ METADATA_BATCH_SIZE = 8     # how many channels to probe in parallel; tune via
 # Public entry point (called from wizard's wiz:start_phase1 callback)
 # ---------------------------------------------------------------------------
 
+# Thread-local context for the running worker — lets _send pick up the right
+# Telegram forum topic without updating every call site in this module.
+_TLS = threading.local()
+
+
 def launch(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
            topic: str, count: int,
-           *, pain: str = "", audience: str = "") -> None:
+           *, pain: str = "", audience: str = "",
+           thread_id: int = 0) -> None:
     """Spawn the Phase 1 worker in a background daemon thread.
 
     `pain` and `audience` are optional pain-point + target-audience strings
     captured by the wizard. When empty, scoring/selection/composition fall
     back to topic-only behavior.
+
+    `thread_id` (forum topic id) is preserved through to all status messages
+    so the run posts back into the topic where the operator started it.
     """
     thr = threading.Thread(
         target=_worker,
-        args=(token, agent, cfg, chat_id, user_id, topic, count, pain, audience),
-        name=f"phase1-{agent}-{user_id}",
+        args=(token, agent, cfg, chat_id, user_id, topic, count,
+              pain, audience, int(thread_id or 0)),
+        name=f"phase1-{agent}-{user_id}-{int(thread_id or 0)}",
         daemon=True,
     )
     thr.start()
@@ -80,14 +90,19 @@ def launch(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
 # ---------------------------------------------------------------------------
 
 def _worker(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
-            topic: str, count: int, pain: str = "", audience: str = "") -> None:
+            topic: str, count: int, pain: str = "", audience: str = "",
+            thread_id: int = 0) -> None:
     onb = (cfg.get("onboarder") or {})
+    # Stash thread_id so _send / _send_with_buttons (defined below) route to
+    # the right forum topic without every call site needing the kwarg.
+    _TLS.thread_id = int(thread_id or 0)
     try:
         _run(token, agent, cfg, chat_id, user_id, topic, count, onb,
-             pain=pain, audience=audience)
+             pain=pain, audience=audience, thread_id=int(thread_id or 0))
     except CookiesNeededError as e:
         log.warning(f"phase1: cookies needed: {e}")
-        _state.update(agent, user_id, step="error", error=f"cookies_needed: {e}")
+        _state.update(agent, user_id, thread_id=int(thread_id or 0),
+                      step="error", error=f"cookies_needed: {e}")
         _send_with_buttons(
             token, chat_id,
             text=(
@@ -103,15 +118,19 @@ def _worker(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     except Exception as e:
         tb = traceback.format_exc()
         log.error(f"phase1 worker crashed: {e}\n{tb}")
-        _state.update(agent, user_id, step="error", error=str(e))
+        _state.update(agent, user_id, thread_id=int(thread_id or 0),
+                      step="error", error=str(e))
         _send(token, chat_id,
               f"⚠️ <b>Phase 1 упал.</b>\n\n<code>{_html_escape(str(e))[:500]}</code>\n\n"
               "Используй /cancel для возврата в чат или /menu → 🎓 Новый курс для повтора.")
+    finally:
+        _TLS.thread_id = 0
 
 
 def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
          topic: str, count: int, onb: dict,
-         *, pain: str = "", audience: str = "") -> None:
+         *, pain: str = "", audience: str = "",
+         thread_id: int = 0) -> None:
     # ── 1. Resolve secrets and open Sheet ────────────────────────────────
     # Anthropic API key not needed: llm.py uses `claude -p` CLI via Max OAuth.
     sa_path = _secrets.resolve_path(onb, "google_service_account")
@@ -143,10 +162,12 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
              f"deduping these (any status, including rejected/failed/legacy_import)")
 
     run_id = sheets.make_run_id()
-    _state.update(agent, user_id, run_id=run_id,
+    _state.update(agent, user_id, thread_id=int(thread_id or 0),
+                  run_id=run_id,
                   step="phase1_running",
                   topic=topic, count=count,
                   pain=pain, audience=audience,
+                  chat_id=chat_id,
                   sheet_url=sheets.sheet_url(sheet_id))
 
     # ── 2.5 Init proxy rotator for downloads (same probe UX as Phase 2) ──
@@ -421,7 +442,8 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
 
     # ── 7. Append to unified Lessons tab ──────────────────────────────────
     sheets.append_lesson_rows(client, sheet_id, run_id=run_id, rows=all_lesson_rows)
-    _state.update(agent, user_id, step="awaiting_approval",
+    _state.update(agent, user_id, thread_id=int(thread_id or 0),
+                  step="awaiting_approval",
                   courses_summary=course_summaries)
 
     # ── 8. Final Telegram message with action button ─────────────────────
@@ -508,10 +530,18 @@ def _compact_video_for_llm(v: dict[str, Any]) -> dict[str, Any]:
 
 
 def _send(token: str, chat_id: int, text: str) -> None:
-    """Use gateway's tg_api lazily so we honor its retries / chunking conventions."""
+    """Use gateway's tg_api lazily so we honor its retries / chunking conventions.
+
+    Reads the active forum topic from `_TLS.thread_id` (set by `_worker` at
+    start) so callers don't have to pass thread_id explicitly.
+    """
     from gateway import tg_api  # type: ignore
+    thread_id = int(getattr(_TLS, "thread_id", 0) or 0)
+    kwargs: dict[str, Any] = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if thread_id:
+        kwargs["message_thread_id"] = thread_id
     try:
-        tg_api(token, "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML")
+        tg_api(token, "sendMessage", **kwargs)
     except Exception as e:
         log.warning(f"phase1 _send failed: {e}")
 
@@ -519,7 +549,9 @@ def _send(token: str, chat_id: int, text: str) -> None:
 def _send_with_buttons(token: str, chat_id: int, text: str,
                        buttons: list[list[dict[str, str]]]) -> None:
     from gateway import send_message_with_buttons  # type: ignore
-    send_message_with_buttons(token, chat_id, text, buttons)
+    thread_id = int(getattr(_TLS, "thread_id", 0) or 0)
+    send_message_with_buttons(token, chat_id, text, buttons,
+                              message_thread_id=thread_id)
 
 
 def _html_escape(s: str) -> str:

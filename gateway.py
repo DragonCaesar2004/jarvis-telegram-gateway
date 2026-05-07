@@ -913,12 +913,16 @@ def send_message_with_buttons(
     buttons: list[list[dict[str, str]]],
     reply_to: int | None = None,
     html: bool = True,
+    message_thread_id: int = 0,
 ) -> dict | None:
     """Send message with inline keyboard buttons.
 
     Args:
         buttons: 2D list of button rows, each button is {"text": "...", "callback_data": "..."}
                  or {"text": "...", "url": "..."} for URL buttons.
+        message_thread_id: when set (non-zero), routes the message into a
+            forum topic. Pass through from incoming-message context so replies
+            land back in the same topic.
     Returns:
         Telegram API response dict or None on error.
     """
@@ -934,6 +938,8 @@ def send_message_with_buttons(
         params["allow_sending_without_reply"] = True
     if html:
         params["parse_mode"] = "HTML"
+    if message_thread_id:
+        params["message_thread_id"] = int(message_thread_id)
     try:
         return tg_api(token, "sendMessage", **params)
     except requests.HTTPError as e:
@@ -1314,23 +1320,28 @@ MODE_CHAT = "chat"
 MODE_WIZARD = "wizard"
 
 
-def _mode_file(agent: str, user_id: int) -> Path:
+def _mode_file(agent: str, user_id: int, thread_id: int = 0) -> Path:
+    """Per-(user, thread) mode file. Falsy thread_id keeps the legacy
+    DM/group filename so existing state files keep working without migration.
+    """
+    if thread_id:
+        return STATE_DIR / f"mode-{agent}-{user_id}-{int(thread_id)}.txt"
     return STATE_DIR / f"mode-{agent}-{user_id}.txt"
 
 
-def get_user_mode(agent: str, user_id: int) -> str:
-    """Return current mode for a user. Default: chat (existing Claude behavior)."""
-    f = _mode_file(agent, user_id)
+def get_user_mode(agent: str, user_id: int, thread_id: int = 0) -> str:
+    """Return current mode for a (user, thread). Default: chat."""
+    f = _mode_file(agent, user_id, thread_id)
     if not f.exists():
         return MODE_CHAT
     val = f.read_text().strip()
     return val if val in (MODE_CHAT, MODE_WIZARD) else MODE_CHAT
 
 
-def set_user_mode(agent: str, user_id: int, mode: str) -> None:
+def set_user_mode(agent: str, user_id: int, mode: str, thread_id: int = 0) -> None:
     if mode not in (MODE_CHAT, MODE_WIZARD):
         raise ValueError(f"invalid mode: {mode}")
-    f = _mode_file(agent, user_id)
+    f = _mode_file(agent, user_id, thread_id)
     if mode == MODE_CHAT:
         f.unlink(missing_ok=True)
     else:
@@ -2892,16 +2903,21 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
 
     # Mode router: if user is in wizard mode, dispatch to onboarder, skip Claude.
     # Default mode is chat (existing behavior).
+    # Forum-thread aware: each topic in a Telegram supergroup forum is its own
+    # parallel context, so mode + wizard state are keyed by (user, thread).
     if user_id is not None:
-        mode = get_user_mode(agent, user_id)
+        thread_id = int(msg.get("message_thread_id") or 0)
+        mode = get_user_mode(agent, user_id, thread_id)
         if mode == MODE_WIZARD:
             try:
                 from onboarder import wizard as _wizard
-                _wizard.handle_wizard_message(token, agent, cfg, chat_id, user_id, text, msg)
+                _wizard.handle_wizard_message(token, agent, cfg, chat_id, user_id,
+                                              text, msg, thread_id=thread_id)
             except Exception as e:
                 log.exception(f"[{agent}] wizard handler error: {e}")
                 try:
                     tg_api(token, "sendMessage", chat_id=chat_id,
+                           message_thread_id=thread_id or None,
                            text=f"⚠️ Wizard error: {e}\nUse /cancel to return to chat.")
                 except Exception:
                     pass
@@ -3589,6 +3605,8 @@ def _menu_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> None:
     msg = cq.get("message") or {}
     chat_id = (msg.get("chat") or {}).get("id")
     user_id = (cq.get("from") or {}).get("id")
+    # Topic the button was clicked in (forum support). 0 = main thread / DM.
+    thread_id = int(msg.get("message_thread_id") or 0)
     if chat_id is None or user_id is None:
         answer_callback_query(token, cq_id)
         return
@@ -3596,15 +3614,16 @@ def _menu_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> None:
     action = data.split(":", 1)[1] if ":" in data else ""
 
     if action == "chat":
-        set_user_mode(agent, user_id, MODE_CHAT)
+        set_user_mode(agent, user_id, MODE_CHAT, thread_id)
         try:
             from onboarder import wizard as _wiz
-            _wiz.clear_wizard_state(agent, user_id)
+            _wiz.clear_wizard_state(agent, user_id, thread_id)
         except Exception:
             pass
         answer_callback_query(token, cq_id, "Режим: чат с агентом")
         try:
             tg_api(token, "sendMessage", chat_id=chat_id,
+                   message_thread_id=thread_id or None,
                    text="<b>💬 Чат с агентом активен.</b>\nПиши как обычно.",
                    parse_mode="HTML")
         except Exception:
@@ -3615,15 +3634,16 @@ def _menu_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> None:
         if not (cfg.get("onboarder") or {}).get("enabled"):
             answer_callback_query(token, cq_id, "Онбордер выключен в config.json", show_alert=True)
             return
-        set_user_mode(agent, user_id, MODE_WIZARD)
+        set_user_mode(agent, user_id, MODE_WIZARD, thread_id)
         answer_callback_query(token, cq_id, "Запускаю wizard…")
         try:
             from onboarder import wizard as _wiz
-            _wiz.start_wizard(token, agent, cfg, chat_id, user_id)
+            _wiz.start_wizard(token, agent, cfg, chat_id, user_id, thread_id=thread_id)
         except Exception as e:
             log.exception(f"[{agent}] start_wizard failed: {e}")
             try:
                 tg_api(token, "sendMessage", chat_id=chat_id,
+                       message_thread_id=thread_id or None,
                        text=f"⚠️ Не удалось запустить wizard: {e}")
             except Exception:
                 pass
@@ -3633,15 +3653,16 @@ def _menu_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> None:
         if not (cfg.get("onboarder") or {}).get("enabled"):
             answer_callback_query(token, cq_id, "Онбордер выключен в config.json", show_alert=True)
             return
-        set_user_mode(agent, user_id, MODE_WIZARD)
+        set_user_mode(agent, user_id, MODE_WIZARD, thread_id)
         answer_callback_query(token, cq_id, "Жду файл cookies.txt…")
         try:
             from onboarder import wizard as _wiz
-            _wiz.start_cookies_upload(token, agent, cfg, chat_id, user_id)
+            _wiz.start_cookies_upload(token, agent, cfg, chat_id, user_id, thread_id=thread_id)
         except Exception as e:
             log.exception(f"[{agent}] start_cookies_upload failed: {e}")
             try:
                 tg_api(token, "sendMessage", chat_id=chat_id,
+                       message_thread_id=thread_id or None,
                        text=f"⚠️ Не удалось запустить загрузку cookies: {e}")
             except Exception:
                 pass

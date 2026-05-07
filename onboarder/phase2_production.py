@@ -36,17 +36,27 @@ log = logging.getLogger("gateway")
 DEFAULT_SCRATCH_DIR = "/tmp/onboarder"
 PROGRESS_INTERVAL_SEC = 60
 
+# Thread-local context — set at the start of each background worker so the
+# module-level _send / _send_with_buttons helpers can route status messages
+# to the right Telegram forum topic without each call site forwarding it.
+_TLS = threading.local()
+
 
 # ---------------------------------------------------------------------------
 # Public entry point (called from wizard's wiz:start_phase2 callback)
 # ---------------------------------------------------------------------------
 
-def launch(token: str, agent: str, cfg: dict, chat_id: int, user_id: int) -> None:
-    """Spawn the Phase 2 worker in a background daemon thread."""
+def launch(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
+           *, thread_id: int = 0) -> None:
+    """Spawn the Phase 2 worker in a background daemon thread.
+
+    `thread_id` is the Telegram forum topic the run was started in. 0 means
+    DM / non-forum group, preserving the original behavior.
+    """
     thr = threading.Thread(
         target=_worker,
-        args=(token, agent, cfg, chat_id, user_id),
-        name=f"phase2-{agent}-{user_id}",
+        args=(token, agent, cfg, chat_id, user_id, int(thread_id or 0)),
+        name=f"phase2-{agent}-{user_id}-{int(thread_id or 0)}",
         daemon=True,
     )
     thr.start()
@@ -56,17 +66,20 @@ def launch(token: str, agent: str, cfg: dict, chat_id: int, user_id: int) -> Non
 # Worker
 # ---------------------------------------------------------------------------
 
-def _worker(token: str, agent: str, cfg: dict, chat_id: int, user_id: int) -> None:
+def _worker(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
+            thread_id: int = 0) -> None:
     onb = (cfg.get("onboarder") or {})
+    _TLS.thread_id = int(thread_id or 0)
     try:
-        _run(token, agent, cfg, chat_id, user_id, onb)
+        _run(token, agent, cfg, chat_id, user_id, onb, thread_id=int(thread_id or 0))
     except CookiesNeededError as e:
         # Pool exhausted — pause Phase 2 and ask user to upload fresh cookies
         log.warning(f"phase2: cookies needed: {e}")
-        _state.update(agent, user_id, step="awaiting_cookies_pre_phase2")
+        _state.update(agent, user_id, thread_id=int(thread_id or 0),
+                      step="awaiting_cookies_pre_phase2")
         try:
             from gateway import set_user_mode, MODE_WIZARD  # type: ignore
-            set_user_mode(agent, user_id, MODE_WIZARD)
+            set_user_mode(agent, user_id, MODE_WIZARD, int(thread_id or 0))
         except Exception:
             pass
         _send_with_buttons(
@@ -85,13 +98,17 @@ def _worker(token: str, agent: str, cfg: dict, chat_id: int, user_id: int) -> No
     except Exception as e:
         tb = traceback.format_exc()
         log.error(f"phase2 worker crashed: {e}\n{tb}")
-        _state.update(agent, user_id, step="error", error=str(e))
+        _state.update(agent, user_id, thread_id=int(thread_id or 0),
+                      step="error", error=str(e))
         _send(token, chat_id,
               f"⚠️ <b>Phase 2 упал.</b>\n\n<code>{_html_escape(str(e))[:600]}</code>\n\n"
               "Используй /cancel для возврата в чат.")
+    finally:
+        _TLS.thread_id = 0
 
 
-def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dict) -> None:
+def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dict,
+         *, thread_id: int = 0) -> None:
     # ── 1. Resolve secrets and config ────────────────────────────────────
     sa_path = _secrets.resolve_path(onb, "google_service_account")
     sheet_id = onb.get("google_sheet_id") or ""
@@ -125,7 +142,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
     scratch_root.mkdir(parents=True, exist_ok=True)
 
     # ── 2. Read approved+pending rows from unified Lessons tab ──────────
-    st = _state.load(agent, user_id)
+    st = _state.load(agent, user_id, int(thread_id or 0))
     run_id = st.get("run_id")
     # run_id is optional now — Phase 2 picks up any approved+pending rows
     # regardless of run, since user can mix-and-match across runs in the
@@ -167,7 +184,8 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
           f"Все строки помечены status=processing — параллельные запуски не "
           f"подхватят их повторно.\n"
           f"~30-90 мин на курс (большую часть времени съест дубляж, если есть не-EN видео).")
-    _state.update(agent, user_id, step="phase2_running")
+    _state.update(agent, user_id, thread_id=int(thread_id or 0),
+                  step="phase2_running", chat_id=chat_id)
 
     # ── 2.5 Initialize proxy rotator — pick first working proxy ─────────
     # Skip the probe entirely if every approved video already has a cached
@@ -419,7 +437,8 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                   f"<i>NMS endpoint/token не настроен — DRAFT в админке не создан.</i>")
 
     # ── 6. Final summary ─────────────────────────────────────────────────
-    _state.update(agent, user_id, step="done", courses=course_results)
+    _state.update(agent, user_id, thread_id=int(thread_id or 0),
+                  step="done", courses=course_results)
 
     if course_results:
         lines = [f"  • <a href=\"{c['admin_url']}\">{_html_escape(c['title'])}</a>"
@@ -729,11 +748,25 @@ def _strip_course_prefix(s: str, idx: int) -> str:
 
 
 def _send(token: str, chat_id: int, text: str) -> None:
+    """Send to Telegram, routing via _TLS.thread_id when in a forum topic."""
     from gateway import tg_api  # type: ignore
+    thread_id = int(getattr(_TLS, "thread_id", 0) or 0)
+    kwargs: dict[str, Any] = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if thread_id:
+        kwargs["message_thread_id"] = thread_id
     try:
-        tg_api(token, "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML")
+        tg_api(token, "sendMessage", **kwargs)
     except Exception as e:
         log.warning(f"phase2 _send failed: {e}")
+
+
+def _send_with_buttons(token: str, chat_id: int, text: str,
+                       buttons: list[list[dict[str, str]]]) -> None:
+    """Send inline-keyboard message into the active forum topic (if any)."""
+    from gateway import send_message_with_buttons  # type: ignore
+    thread_id = int(getattr(_TLS, "thread_id", 0) or 0)
+    send_message_with_buttons(token, chat_id, text, buttons,
+                              message_thread_id=thread_id)
 
 
 def _html_escape(s: str) -> str:

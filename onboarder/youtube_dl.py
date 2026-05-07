@@ -227,10 +227,26 @@ def list_channel_videos(channel_id_or_url: str,
     return out
 
 
-def get_video_metadata(video_id: str) -> dict[str, Any]:
-    """Full metadata for one video (description, language, etc.)."""
+def get_video_metadata(video_id: str, *,
+                       cookies_file: str | None = None,
+                       proxy: str | None = None) -> dict[str, Any]:
+    """Full metadata for one video (description, language, etc.).
+
+    `cookies_file` / `proxy` are forwarded to yt-dlp — required for any video
+    where YouTube has flagged datacenter IPs ("Sign in to confirm you're not
+    a bot"). Pass them through whenever the caller already has the gateway's
+    cookies path / a working proxy from the rotator.
+    """
     url = f"https://youtu.be/{video_id}"
-    with _ydl() as ydl:
+    extra: dict[str, Any] = {}
+    if cookies_file:
+        from pathlib import Path as _P
+        cp = _P(cookies_file).expanduser()
+        if cp.exists():
+            extra["cookiefile"] = str(cp)
+    if proxy:
+        extra["proxy"] = proxy
+    with _ydl(extra) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
         except Exception as e:
