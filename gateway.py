@@ -3485,9 +3485,14 @@ def polling_producer(
                         if transcript:
                             msg["_voice_transcript"] = transcript
 
-            # Group-chat gating
+            # Group-chat gating: skip if not addressed to the bot — UNLESS
+            # the (user, forum_thread) is currently in MODE_WIZARD, where we
+            # need to capture every plain-text reply for the form.
             bot_username = cfg.get("_bot_username")
-            if not is_addressed_to_agent(agent, msg, bot_username, cfg):
+            producer_thread_id = int(msg.get("message_thread_id") or 0)
+            in_wizard = (user_id is not None and
+                         get_user_mode(agent, user_id, producer_thread_id) == MODE_WIZARD)
+            if not in_wizard and not is_addressed_to_agent(agent, msg, bot_username, cfg):
                 continue
 
             chat_id = msg["chat"]["id"]
