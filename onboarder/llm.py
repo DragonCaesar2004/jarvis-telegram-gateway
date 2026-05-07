@@ -21,6 +21,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -108,6 +109,23 @@ def _pain_audience_block(pain: str, audience: str) -> str:
 # Channel scoring on 15 channels: ~15s. Video selection: ~30s. Course composition: ~60s.
 CLAUDE_CLI_TIMEOUT_SEC = 180
 
+# Retry budget for transient Anthropic API errors (503/529/timeout/network).
+# Anthropic occasionally returns 503 under load — without retries, the whole
+# Phase 1 / Phase 2 worker dies. With these we wait, retry, and only surface
+# the error if all attempts fail.
+_CLI_RETRYABLE_MARKERS = (
+    "503", "529", "Service is currently unavailable", "rate_limit_error",
+    "Internal server error", "Overloaded", "overloaded_error", "EAI_AGAIN",
+    "Connection reset", "Connection aborted", "ConnectTimeout",
+    "Read timed out", "API_ERROR_500", "APIError",
+)
+_CLI_RETRY_BACKOFFS = (5, 15, 45)  # seconds; total ~65s of waiting before failing
+
+
+def _is_retryable_cli_failure(stderr: str, stdout: str) -> bool:
+    blob = (stderr or "") + "\n" + (stdout or "")
+    return any(m in blob for m in _CLI_RETRYABLE_MARKERS)
+
 
 # ---------------------------------------------------------------------------
 # Subprocess wrapper
@@ -126,40 +144,49 @@ def _call_json(*, model: str, system: str, user: str,
     del max_tokens  # CLI handles token budget itself
     full_prompt = f"{system.strip()}\n\n---\n\n{user.strip()}\n\nReturn ONLY the JSON, no commentary."
 
-    # Run from an isolated tmpdir so Claude Code doesn't pick up workspace state.
-    with tempfile.TemporaryDirectory(prefix="onboarder-claude-") as tmpdir:
-        env = os.environ.copy()
-        env.setdefault("PATH", f"{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
-        # Pipe prompt via stdin to avoid OS ARG_MAX limit on long transcripts.
-        # claude -p reads stdin when no positional prompt argument is given.
-        try:
-            r = subprocess.run(
-                [
-                    "claude", "-p",
-                    "--model", model,
-                    "--output-format", "text",
-                    "--permission-mode", "bypassPermissions",
-                ],
-                input=full_prompt,
-                cwd=tmpdir,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired as e:
-            raise RuntimeError(f"claude CLI timed out after {timeout}s") from e
-        except FileNotFoundError as e:
-            raise RuntimeError(
-                "claude CLI not found in PATH. Ensure Claude Code is installed "
-                "and CLAUDE_CODE_OAUTH_TOKEN is set in the gateway's env."
-            ) from e
+    last_err: str = ""
+    for attempt, backoff in enumerate([0] + list(_CLI_RETRY_BACKOFFS)):
+        if backoff:
+            log.warning(f"llm._call_json retry {attempt} after {backoff}s "
+                        f"(prev error: {last_err[:200]})")
+            time.sleep(backoff)
+        # Run from an isolated tmpdir so Claude Code doesn't pick up workspace state.
+        with tempfile.TemporaryDirectory(prefix="onboarder-claude-") as tmpdir:
+            env = os.environ.copy()
+            env.setdefault("PATH", f"{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+            try:
+                r = subprocess.run(
+                    [
+                        "claude", "-p",
+                        "--model", model,
+                        "--output-format", "text",
+                        "--permission-mode", "bypassPermissions",
+                    ],
+                    input=full_prompt,
+                    cwd=tmpdir,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                last_err = f"claude CLI timed out after {timeout}s"
+                continue  # retry on timeout — Anthropic might just be slow
+            except FileNotFoundError as e:
+                raise RuntimeError(
+                    "claude CLI not found in PATH. Ensure Claude Code is installed "
+                    "and CLAUDE_CODE_OAUTH_TOKEN is set in the gateway's env."
+                ) from e
 
-        if r.returncode != 0:
-            raise RuntimeError(
-                f"claude CLI exit {r.returncode}: stderr={r.stderr[:500]!r} "
-                f"stdout={r.stdout[:500]!r}"
-            )
+        if r.returncode == 0 and (r.stdout or "").strip():
+            break  # success
+        last_err = f"exit {r.returncode}: stderr={r.stderr[:300]} stdout={r.stdout[:200]}"
+        # Only retry on transient API errors. Permanent failures (auth, schema)
+        # surface immediately so we don't waste a minute on something doomed.
+        if not _is_retryable_cli_failure(r.stderr or "", r.stdout or ""):
+            raise RuntimeError(f"claude CLI {last_err}")
+    else:
+        raise RuntimeError(f"claude CLI exhausted retries: {last_err}")
 
     text = (r.stdout or "").strip()
     if not text:
@@ -1070,28 +1097,43 @@ def compose_full_course(*, course_topic: str, course_title: str,
               + _lang_instruction(output_lang))
     full_prompt = system + "\n\n---\n\n## MATERIALS\n\n" + materials
 
-    # Use the same _call subprocess machinery as _call_json, but expect plain text (template).
+    # Same retry-on-503/timeout machinery as _call_json, but we expect plain
+    # text (the template), not JSON.
     import os, subprocess, tempfile
     from pathlib import Path
 
-    with tempfile.TemporaryDirectory(prefix="onboarder-claude-") as tmpdir:
-        env = os.environ.copy()
-        env.setdefault("PATH", f"{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
-        try:
-            r = subprocess.run(
-                ["claude", "-p",
-                 "--model", model,
-                 "--output-format", "text",
-                 "--permission-mode", "bypassPermissions"],
-                input=full_prompt,
-                cwd=tmpdir, env=env,
-                capture_output=True, text=True, timeout=timeout,
-            )
-        except subprocess.TimeoutExpired as e:
-            raise RuntimeError(f"compose_full_course: claude CLI timed out after {timeout}s") from e
-
-    if r.returncode != 0 or not (r.stdout or "").strip():
-        raise RuntimeError(f"compose_full_course: claude exit {r.returncode}, stderr={r.stderr[:300]!r}")
+    last_err: str = ""
+    r = None
+    for attempt, backoff in enumerate([0] + list(_CLI_RETRY_BACKOFFS)):
+        if backoff:
+            log.warning(f"compose_full_course retry {attempt} after {backoff}s "
+                        f"(prev error: {last_err[:200]})")
+            time.sleep(backoff)
+        with tempfile.TemporaryDirectory(prefix="onboarder-claude-") as tmpdir:
+            env = os.environ.copy()
+            env.setdefault("PATH", f"{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+            try:
+                r = subprocess.run(
+                    ["claude", "-p",
+                     "--model", model,
+                     "--output-format", "text",
+                     "--permission-mode", "bypassPermissions"],
+                    input=full_prompt,
+                    cwd=tmpdir, env=env,
+                    capture_output=True, text=True, timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                last_err = f"compose_full_course timed out after {timeout}s"
+                continue
+        if r is not None and r.returncode == 0 and (r.stdout or "").strip():
+            break
+        last_err = (f"exit {r.returncode if r else '?'}: "
+                    f"stderr={(r.stderr if r else '')[:300]} "
+                    f"stdout={(r.stdout if r else '')[:200]}")
+        if r is None or not _is_retryable_cli_failure(r.stderr or "", r.stdout or ""):
+            raise RuntimeError(f"compose_full_course: {last_err}")
+    else:
+        raise RuntimeError(f"compose_full_course exhausted retries: {last_err}")
 
     text = r.stdout.strip()
     # Strip optional code fences
