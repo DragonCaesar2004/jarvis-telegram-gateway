@@ -2928,8 +2928,17 @@ def _process_update_impl(agent: str, cfg: dict, token: str, update: dict,
                     msg["_voice_transcript"] = transcript
 
     # Group-chat gating: only respond if addressed via @mention, name, or reply
+    # — UNLESS the user is in wizard mode for this (user, thread) context, in
+    # which case we want to capture every plain text reply (the wizard form
+    # asks for a topic, audience, count, etc., none of which require @-pinging
+    # the bot).
     bot_username = cfg.get("_bot_username")
-    if not is_webhook and not is_addressed_to_agent(agent, msg, bot_username, cfg):
+    user_id_for_mode = (msg.get("from") or {}).get("id")
+    thread_id_for_mode = int(msg.get("message_thread_id") or 0)
+    in_wizard = (user_id_for_mode is not None
+                 and get_user_mode(agent, user_id_for_mode, thread_id_for_mode) == MODE_WIZARD)
+    if (not is_webhook and not in_wizard
+            and not is_addressed_to_agent(agent, msg, bot_username, cfg)):
         chat_type = (msg.get("chat") or {}).get("type", "?")
         log.info(f"[{agent}] group chat {chat_type}, not addressed, skip")
         return
