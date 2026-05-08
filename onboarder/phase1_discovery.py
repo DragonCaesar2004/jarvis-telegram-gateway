@@ -40,9 +40,13 @@ log = logging.getLogger("gateway")
 
 # Tuning knobs (some now overridable via Criteria)
 DEFAULT_SEARCH_RESULTS = 50   # criteria.search_results overrides
-TARGET_PASSING_PER_COURSE = 4  # try to get this many passing channels per course
-HARD_CAP_CHANNELS_TO_CHECK = 50  # absolute ceiling on metadata fetches
-MIN_LLM_SCORE = 0.5
+TARGET_PASSING_PER_COURSE = 4  # legacy soft target; no longer used as early-exit
+HARD_CAP_CHANNELS_TO_CHECK = 100  # absolute ceiling on metadata fetches
+MIN_LLM_SCORE = 0.4  # lowered from 0.5: more channels pass scoring → more
+                     # candidates for the per-channel loop, less chance of
+                     # Phase 1 failing because the top-3 didn't have on-topic
+                     # content. Threshold-failed channels still fall back via
+                     # the unconditional ranked list further down anyway.
 CHANNEL_VIDEOS_TO_LIST = None  # None = fetch the whole channel catalog (subject
                                # to youtube_dl.list_channel_videos safety cap),
                                # then filter by max_age_months in Criteria.
@@ -206,12 +210,18 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     candidates = ytdl.unique_channels_from_search(videos)
     log.info(f"phase1[{user_id}] {len(candidates)} unique channel candidates from {len(videos)} videos")
 
-    # ── 4. Greedy filter: scan candidates until we have enough passing ───
-    target_passing = max(count * TARGET_PASSING_PER_COURSE, count + 3)
+    # ── 4. Probe metadata for ALL candidates (up to HARD_CAP) ────────────
+    # We used to early-exit once `target_passing` channels passed the hard
+    # filter. That made Phase 1 fail too easily — if those few candidates
+    # had no on-topic videos, there was no fallback. Now we always scan
+    # the full candidate pool (capped at HARD_CAP_CHANNELS_TO_CHECK), then
+    # let Claude score and the per-channel loop iterate down the ranked
+    # list until a usable channel is found. yt-dlp metadata is free, so
+    # the only cost is wall time (~30-90s for 100 channels in batches of 8).
     cap = min(len(candidates), HARD_CAP_CHANNELS_TO_CHECK)
     _send(token, chat_id,
           f"📊 Найдено {len(candidates)} каналов в выдаче. "
-          f"Проверяю метаданные (цель: {target_passing} прошедших фильтр, лимит: {cap})…")
+          f"Проверяю метаданные у всех (лимит {cap})…")
 
     enriched: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
@@ -286,10 +296,9 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                   f"… проверено {checked}/{cap}, прошло фильтр: {len(enriched)}")
             last_progress = time.time()
 
-        if len(enriched) >= target_passing:
-            log.info(f"phase1[{user_id}] reached target {target_passing} "
-                     f"passing channels, stop scanning")
-            break
+        # Note: no early-exit on `target_passing` anymore. We scan the full
+        # candidate pool so Claude's scoring + the per-channel fallback loop
+        # has the widest possible bench.
 
     if not enriched:
         diag = ""
