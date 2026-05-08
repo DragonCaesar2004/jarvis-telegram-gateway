@@ -319,6 +319,20 @@ If the channel doesn't have enough on-topic material for a coherent 5+ video cou
 """
 
 
+SELECT_VIDEOS_VIDEO_CAP = 300
+"""Hard upper bound on how many videos we hand to Claude per channel.
+
+Beyond ~300 entries the prompt grows into the 50k+ token range, which is
+fine for Claude's context window but reliably pushes the per-call latency
+past our 5-minute timeout when Anthropic is under load. Channels with
+fewer videos pass through untouched; channels with more get the freshest
+SELECT_VIDEOS_VIDEO_CAP videos (yt-dlp returns newest-first), which is
+plenty of material for picking a coherent 5-30 lesson course.
+"""
+
+SELECT_VIDEOS_TIMEOUT_SEC = 300
+
+
 def select_videos(*, topic: str, criteria: dict[str, Any],
                   channel_name: str, videos: list[dict[str, Any]],
                   model: str = DEFAULT_MODEL_FAST,
@@ -329,9 +343,16 @@ def select_videos(*, topic: str, criteria: dict[str, Any],
         {"video_id": str, "title": str, "duration_sec": int, "published_at": str,
          "view_count": int, "description": str (truncated)}
     """
+    # Cap the candidate list to keep prompt size and round-trip time sane.
+    # yt-dlp returns newest-first; trim the tail.
+    capped_videos = videos[:SELECT_VIDEOS_VIDEO_CAP]
+    if len(videos) > SELECT_VIDEOS_VIDEO_CAP:
+        log.info(f"select_videos: capping {len(videos)} → "
+                 f"{SELECT_VIDEOS_VIDEO_CAP} videos for channel {channel_name!r}")
+
     payload: dict[str, Any] = {
         "topic": topic, "criteria": criteria,
-        "channel_name": channel_name, "videos": videos,
+        "channel_name": channel_name, "videos": capped_videos,
     }
     if pain:
         payload["target_pain"] = pain
@@ -340,7 +361,8 @@ def select_videos(*, topic: str, criteria: dict[str, Any],
     user = json.dumps(payload, ensure_ascii=False, indent=2)
     system = SELECT_VIDEOS_SYSTEM + _pain_audience_block(pain, audience)
     parsed = _call_json(model=model, system=system, user=user,
-                        max_tokens=8192)
+                        max_tokens=8192,
+                        timeout=SELECT_VIDEOS_TIMEOUT_SEC)
     if not isinstance(parsed, dict):
         raise ValueError(f"select_videos: expected dict, got {type(parsed).__name__}")
     return parsed
