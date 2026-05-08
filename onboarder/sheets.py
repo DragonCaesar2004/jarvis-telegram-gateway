@@ -71,9 +71,12 @@ LESSONS_HEADER = [
     "channel_id",               # N: youtube channel id
     "course_idx",               # O: 1..N within run
     "duration_sec",             # P: numeric
-    # ── Extended fields written by Phase 1 after download+transcribe+compose ──
-    "lesson_description",       # Q: 3-5 sentences (final, goes to admin)
-    "course_description",       # R: course-level description (filled on lesson_idx=1)
+    # ── Original-language fields (Phase 1 fills them in source language) ──
+    # These are the SOURCE OF TRUTH for the landing. If the operator edits
+    # any of these in the Sheet, Phase 2 sends the edit to the admin API
+    # (overriding the cached compose payload in pipeline.db).
+    "lesson_description",       # Q: 3-5 sentences in source lang
+    "course_description",       # R: course excerpt (lesson_idx=1)
     "course_tagline",           # S: short slogan (lesson_idx=1)
     "course_what_you_learn",    # T: bullet points (lesson_idx=1)
     "course_target_audience",   # U: who it's for (lesson_idx=1)
@@ -81,6 +84,19 @@ LESSONS_HEADER = [
     "author_bio",               # W: 3-5 sentence bio (lesson_idx=1)
     "author_expertise",         # X: areas of expertise (lesson_idx=1)
     "transcript_excerpt",       # Y: first ~500 chars of transcript (review aid)
+    # ── Russian translations (review-only, do NOT go to landing) ──
+    # When the source language is non-Russian, Phase 1 also generates a
+    # Russian rendering of every translatable field so the operator can
+    # sanity-check what's about to ship without leaving the Sheet. These
+    # cells are reference-only — the operator's edits to them are ignored
+    # by Phase 2 (the *_orig column is what gets pushed to the admin).
+    "lesson_description_ru",    # Z
+    "course_description_ru",    # AA
+    "course_tagline_ru",        # AB
+    "course_what_you_learn_ru", # AC
+    "course_target_audience_ru",# AD
+    "author_bio_ru",            # AE
+    "author_expertise_ru",      # AF
 ]
 
 # Status enum values
@@ -331,7 +347,7 @@ def append_lesson_rows(client: Any, sheet_id: str, *, run_id: str,
 
 
 def _lesson_row_to_values(r: dict[str, Any], *, run_id: str, ts: str) -> list[Any]:
-    """Build a 25-element row in canonical LESSONS_HEADER order from a dict."""
+    """Build a row in canonical LESSONS_HEADER order from a dict."""
     dur_sec = int(r.get("duration_sec") or 0)
     return [
         STATUS_PENDING,                                     # A status
@@ -350,6 +366,7 @@ def _lesson_row_to_values(r: dict[str, Any], *, run_id: str, ts: str) -> list[An
         r.get("channel_id", ""),                            # N channel_id
         r.get("course_idx", ""),                            # O course_idx
         dur_sec,                                            # P duration_sec
+        # Original-language source-of-truth fields (Q-Y)
         r.get("lesson_description", ""),                    # Q lesson_description
         r.get("course_description", ""),                    # R course_description
         r.get("course_tagline", ""),                        # S course_tagline
@@ -359,6 +376,14 @@ def _lesson_row_to_values(r: dict[str, Any], *, run_id: str, ts: str) -> list[An
         r.get("author_bio", ""),                            # W author_bio
         r.get("author_expertise", ""),                      # X author_expertise
         r.get("transcript_excerpt", ""),                    # Y transcript_excerpt
+        # Russian translations (Z-AF) — review aid only, not used by Phase 2
+        r.get("lesson_description_ru", ""),                 # Z
+        r.get("course_description_ru", ""),                 # AA
+        r.get("course_tagline_ru", ""),                     # AB
+        r.get("course_what_you_learn_ru", ""),              # AC
+        r.get("course_target_audience_ru", ""),             # AD
+        r.get("author_bio_ru", ""),                         # AE
+        r.get("author_expertise_ru", ""),                   # AF
     ]
 
 
@@ -404,7 +429,9 @@ def read_pending_approved_rows(client: Any, sheet_id: str,
             "course_idx": _safe_int(d.get("course_idx", "")),
             "lesson_idx": _safe_int(d.get("lesson_idx", "")),
             "run_id": d.get("run_id", ""),
-            # Extended fields produced by Phase 1 (used by Phase 2 → admin payload)
+            # Source-of-truth original-language fields. Phase 2 prefers these
+            # over pipeline.db when non-empty so operator edits in the Sheet
+            # flow straight to the landing.
             "lesson_description": d.get("lesson_description", ""),
             "course_description": d.get("course_description", ""),
             "course_tagline": d.get("course_tagline", ""),
@@ -413,6 +440,16 @@ def read_pending_approved_rows(client: Any, sheet_id: str,
             "author_name": d.get("author_name", ""),
             "author_bio": d.get("author_bio", ""),
             "author_expertise": d.get("author_expertise", ""),
+            # Russian translations (review-only). Returned for completeness so
+            # callers can show them in operator-facing diagnostics, but Phase 2
+            # never sends them to the admin API — *_orig is the canon.
+            "lesson_description_ru": d.get("lesson_description_ru", ""),
+            "course_description_ru": d.get("course_description_ru", ""),
+            "course_tagline_ru": d.get("course_tagline_ru", ""),
+            "course_what_you_learn_ru": d.get("course_what_you_learn_ru", ""),
+            "course_target_audience_ru": d.get("course_target_audience_ru", ""),
+            "author_bio_ru": d.get("author_bio_ru", ""),
+            "author_expertise_ru": d.get("author_expertise_ru", ""),
             "_sheet_row": i,  # 1-based row index for batch_update
         })
     return out

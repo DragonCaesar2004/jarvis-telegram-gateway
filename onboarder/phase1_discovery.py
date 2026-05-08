@@ -460,6 +460,14 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         author_name = enriched.get("author_name", "") or ch_name
         author_bio = enriched.get("author_bio", "")
         author_expertise = enriched.get("author_expertise", "")
+        # Russian translations (review-only; Phase 2 ignores them when
+        # building the admin payload — the *_orig columns are canon).
+        course_desc_ru = enriched.get("course_description_ru", "")
+        course_tagline_ru = enriched.get("course_tagline_ru", "")
+        course_what_ru = enriched.get("course_what_you_learn_ru", "")
+        course_target_ru = enriched.get("course_target_audience_ru", "")
+        author_bio_ru = enriched.get("author_bio_ru", "")
+        author_expertise_ru = enriched.get("author_expertise_ru", "")
 
         for v in enriched["videos"]:
             is_first = (v["lesson_idx"] == 1)
@@ -474,6 +482,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                 "channel_id": ch["channel_id"],
                 "course_idx": course_idx,
                 "lesson_description": v.get("lesson_description", ""),
+                "lesson_description_ru": v.get("lesson_description_ru", ""),
                 "transcript_excerpt": v.get("transcript_excerpt", ""),
                 # Course-level fields filled only on the first lesson row to
                 # avoid blasting the same paragraph across N rows in the Sheet.
@@ -484,6 +493,13 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                 "author_name": author_name if is_first else "",
                 "author_bio": author_bio if is_first else "",
                 "author_expertise": author_expertise if is_first else "",
+                # Russian counterparts (also lesson_idx=1 only for course-level).
+                "course_description_ru": course_desc_ru if is_first else "",
+                "course_tagline_ru": course_tagline_ru if is_first else "",
+                "course_what_you_learn_ru": course_what_ru if is_first else "",
+                "course_target_audience_ru": course_target_ru if is_first else "",
+                "author_bio_ru": author_bio_ru if is_first else "",
+                "author_expertise_ru": author_expertise_ru if is_first else "",
             })
         # Course built successfully; advance the success counter so the loop
         # exits after `count` good ones, not after `count` attempts.

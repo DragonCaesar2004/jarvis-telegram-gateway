@@ -355,15 +355,31 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                 "lessons": [_lesson_payload(v, idx, v["title"], "") for idx, v in enumerate(processed_lessons)],
             }]
 
-        # Author / course fields with fallbacks
+        # Sheet override: any non-empty *_orig column on the lesson_idx=1 row
+        # for this course is treated as an operator edit and wins over the
+        # pipeline.db cached compose. Empty cell → fall back to the cached
+        # compose value, then to a generic stub.
+        first_lesson_row = next((r for r in lessons if r.get("lesson_idx") == 1),
+                                lessons[0] if lessons else {})
+        sheet_excerpt = (first_lesson_row.get("course_description") or "").strip()
+        sheet_author_name = (first_lesson_row.get("author_name") or "").strip()
+        sheet_author_bio = (first_lesson_row.get("author_bio") or "").strip()
+
+        # Author / course fields with sheet-overrides + fallbacks
         if composed_full:
             author_payload = {
-                "name": composed_full["author"]["name"] or ch_name,
-                "bio": composed_full["author"]["bio"],
+                "name": (sheet_author_name
+                         or composed_full["author"].get("name")
+                         or ch_name),
+                "bio": (sheet_author_bio
+                        or composed_full["author"].get("bio")
+                        or ""),
             }
             course_payload = {
                 "title": composed_full["course"]["title"] or clean_title,
-                "excerpt": composed_full["course"]["excerpt"],
+                "excerpt": (sheet_excerpt
+                            or composed_full["course"].get("excerpt")
+                            or ""),
                 "aboutContent": composed_full["course"]["aboutContent"],
                 "isAdult": composed_full["course"]["isAdult"],
             }
@@ -372,10 +388,13 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
             testimonials = composed_full.get("testimonials") or []
             collection_name = composed_full.get("collectionName") or None
         else:
-            author_payload = {"name": ch_name, "bio": f"{ch_name} — educator on YouTube."}
+            author_payload = {
+                "name": sheet_author_name or ch_name,
+                "bio": sheet_author_bio or f"{ch_name} — educator on YouTube.",
+            }
             course_payload = {
                 "title": clean_title,
-                "excerpt": f"A practical course on {clean_title}.",
+                "excerpt": sheet_excerpt or f"A practical course on {clean_title}.",
                 "aboutContent": f"Curated lessons from {ch_name} on {clean_title}.",
                 "isAdult": False,
             }
@@ -716,13 +735,16 @@ def _lesson_payload(video: dict[str, Any], order: int,
                     title: str, description: str) -> dict[str, Any]:
     """Build per-lesson payload dict for the NMS API from a processed video + LLM-given title/desc.
 
-    Description preference order: explicit `description` → Sheet's
-    `lessonDescription` (set by Phase 1 enrichment) → first 500 chars of
-    transcript as a last-resort fallback.
+    Description preference (most-trusted first):
+      1. Sheet's `lessonDescription` if non-empty — this is the operator's
+         source-of-truth column. If they edit it, the edit ships.
+      2. The `description` arg (from compose_full_course curriculum).
+      3. First 500 chars of the final EN transcript as a last-resort stub.
     """
     transcript = video.get("transcriptEn") or ""
-    sheet_desc = video.get("lessonDescription") or ""
-    final_desc = description or sheet_desc or transcript[:500]
+    sheet_desc = (video.get("lessonDescription") or "").strip()
+    compose_desc = (description or "").strip()
+    final_desc = sheet_desc or compose_desc or transcript[:500]
     return {
         "title": title or video.get("title", f"Lesson {order + 1}"),
         "order": order,

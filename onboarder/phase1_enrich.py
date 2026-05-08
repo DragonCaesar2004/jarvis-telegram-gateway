@@ -315,8 +315,7 @@ def enrich_course(*, course_idx: int, run_id: str,
     for lesson_idx, p in enumerate(processed, start=1):
         excerpt = (p["working_transcript"] or "")[:TRANSCRIPT_EXCERPT_CHARS]
         ld_src = lesson_descriptions.get(p["video_id"], "")
-        ld_combined = llm.join_with_russian(
-            ld_src, russian_map.get(f"lesson_{p['video_id']}"))
+        ld_ru = russian_map.get(f"lesson_{p['video_id']}", "")
         enriched_videos.append({
             "video_id": p["video_id"],
             "title": p["title"],
@@ -324,7 +323,10 @@ def enrich_course(*, course_idx: int, run_id: str,
             "duration_sec": p["duration_sec"],
             "lesson_idx": lesson_idx,
             "transcript_excerpt": excerpt,
-            "lesson_description": ld_combined,
+            # Source-of-truth original (will be sent to admin if operator
+            # doesn't edit it in Sheet). Russian goes to its own _ru column.
+            "lesson_description": ld_src,
+            "lesson_description_ru": ld_ru,
             "detected_lang": p["detected_lang"],
             "cuts_count": p["cuts_count"],
         })
@@ -336,19 +338,22 @@ def enrich_course(*, course_idx: int, run_id: str,
     return {
         "videos": enriched_videos,
         "course_title": final_course_title,
-        "course_description": llm.join_with_russian(
-            course_description, russian_map.get("course_description")),
-        "course_tagline": llm.join_with_russian(
-            course_tagline, russian_map.get("course_tagline")),
-        "course_what_you_learn": llm.join_with_russian(
-            course_what_you_learn, russian_map.get("course_what_you_learn")),
-        "course_target_audience": llm.join_with_russian(
-            course_target_audience, russian_map.get("course_target_audience")),
+        # Original-language fields (canon — Phase 2 sends these to admin
+        # unless the operator overrides them in the Sheet).
+        "course_description": course_description,
+        "course_tagline": course_tagline,
+        "course_what_you_learn": course_what_you_learn,
+        "course_target_audience": course_target_audience,
         "author_name": author.get("name") or channel_name,
-        "author_bio": llm.join_with_russian(
-            author.get("bio") or "", russian_map.get("author_bio")),
-        "author_expertise": llm.join_with_russian(
-            author.get("expertise") or "", russian_map.get("author_expertise")),
+        "author_bio": author.get("bio") or "",
+        "author_expertise": author.get("expertise") or "",
+        # Russian translations (Sheet-only, review aid).
+        "course_description_ru": russian_map.get("course_description", ""),
+        "course_tagline_ru": russian_map.get("course_tagline", ""),
+        "course_what_you_learn_ru": russian_map.get("course_what_you_learn", ""),
+        "course_target_audience_ru": russian_map.get("course_target_audience", ""),
+        "author_bio_ru": russian_map.get("author_bio", ""),
+        "author_expertise_ru": russian_map.get("author_expertise", ""),
         "compose_ok": compose_ok,
     }
 
