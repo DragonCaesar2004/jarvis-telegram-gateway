@@ -81,27 +81,33 @@ def _lang_instruction(output_lang: str) -> str:
 
 
 def _pain_audience_block(pain: str, audience: str) -> str:
-    """Return an extra system-prompt block describing the customer pain and
-    target audience the course must address. Empty when both are blank.
+    """Return an extra system-prompt block describing operator-specified
+    course direction and (optionally) target audience. Empty when both blank.
 
-    The operator decides if the LLM gets these signals via the wizard's
-    optional pain / audience steps. When both are empty we make no claim
-    about the customer profile and the model treats the topic generically.
+    `pain` is named for legacy reasons — the wizard now uses it as a
+    free-form COURSE DESCRIPTION (what topics the course should cover, what
+    pain it solves, what outcome the student gets). Either interpretation
+    flows through identically: it's a strong directive about the course's
+    direction. Older runs that stored a pure pain sentence still work.
     """
     pain = (pain or "").strip()
     audience = (audience or "").strip()
     if not pain and not audience:
         return ""
-    parts = ["\n\n## TARGET PAIN AND AUDIENCE (operator-specified)\n"]
+    parts = ["\n\n## OPERATOR-SPECIFIED COURSE DIRECTION\n"]
     if pain:
-        parts.append(f"- Customer pain the course MUST solve: \"{pain}\"")
+        parts.append(
+            f"- Course description / what the course MUST cover: \"{pain}\"\n"
+            "  Treat this as the canonical specification. The course's topics, "
+            "lesson selection, sequencing, depth, and tone must all serve it."
+        )
     if audience:
         parts.append(f"- Target audience: \"{audience}\"")
     parts.append(
         "- Bias EVERY judgment (channel scoring, video selection, lesson "
         "descriptions, course title/excerpt/about, curriculum structure, "
-        "author bio framing, testimonials voice) toward solving this exact "
-        "pain for this exact audience. Penalize generic/off-segment material."
+        "author bio framing, testimonials voice) toward this exact direction. "
+        "Penalize generic or off-spec material — it doesn't help the student."
     )
     return "\n".join(parts)
 

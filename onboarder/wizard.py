@@ -123,49 +123,73 @@ def handle_wizard_message(token: str, agent: str, cfg: dict, chat_id: int,
             _send(token, chat_id, "Тема не может быть пустой. Попробуй ещё раз.",
                   thread_id=thread_id)
             return
-        # Both pain and audience steps intentionally skipped — operator
-        # decided to keep the wizard minimal. Their infra (state fields,
-        # llm helpers' `pain=` / `audience=` kwargs) is kept so we can
-        # reinstate either by routing STEP_ASK_TOPIC's next step back to
-        # STEP_ASK_PAIN / STEP_ASK_AUDIENCE. Until then both stay "".
+        # Wizard now asks for: topic → free-form description → confirm.
+        # `count` is fixed at 1 (one course per run); the description fills
+        # the `pain` slot in the LLM helpers (it's used identically — biases
+        # scoring / selection / compose toward the operator's specification).
         _state.update(agent, user_id, thread_id=thread_id,
-                      topic=topic, step=STEP_ASK_COUNT)
+                      topic=topic, step=STEP_ASK_PAIN)
         _send(token, chat_id,
               f"Тема: <b>{_html_escape(topic)}</b>\n\n"
-              "Сколько курсов сделать? (число от 1 до 5)",
+              "Опиши <b>что должно быть в этом курсе</b>: какие темы покрыть, "
+              "для кого, какую боль/задачу решает, какой результат у студента в конце.\n\n"
+              "Чем подробнее — тем точнее Claude отберёт каналы и видео.\n\n"
+              "Например: «Восстановление коленного сустава после артроскопии: "
+              "анатомия, упражнения по неделям 1-12, ошибки в реабилитации, "
+              "когда возвращаться к спорту. Для людей 35-55 после операции.»\n\n"
+              "<i>Пропустить — отправь <code>-</code> или <code>/skip</code>.</i>",
               thread_id=thread_id)
         return
 
-    if step in (STEP_ASK_PAIN, STEP_ASK_AUDIENCE):
-        # Legacy / mid-flight wizards may still be sitting at one of these
-        # removed steps. Skip them silently and ask for the count instead
-        # so the user isn't stuck.
-        log.info(f"[{agent}] wizard advancing legacy {step!r} → ask_count")
-        _state.update(agent, user_id, thread_id=thread_id,
-                      step=STEP_ASK_COUNT)
-        _send(token, chat_id,
-              "Сколько курсов сделать? (число от 1 до 5)",
-              thread_id=thread_id)
-        return
-
-    if step == STEP_ASK_COUNT:
-        try:
-            count = int(text.strip())
-            if not (1 <= count <= 5):
-                raise ValueError("range")
-        except ValueError:
-            _send(token, chat_id, "Нужно число от 1 до 5. Попробуй ещё раз.",
-                  thread_id=thread_id)
-            return
+    if step == STEP_ASK_PAIN:
+        desc_raw = text.strip()
+        description = "" if desc_raw.lower() in _SKIP_TOKENS else desc_raw
+        # Persist as `pain` (legacy field name; LLM helpers expect this kwarg).
+        # Always 1 course per wizard run — count is fixed, no separate step.
         st = _state.update(agent, user_id, thread_id=thread_id,
-                           count=count, step=STEP_CONFIRM)
+                           pain=description, count=1, step=STEP_CONFIRM)
         topic = st.get("topic", "")
+        desc_line = (_html_escape(description)
+                     if description else "<i>(не указано)</i>")
         _send_with_buttons(
             token, chat_id,
             f"<b>Подтверждение:</b>\n\n"
             f"Тема: <b>{_html_escape(topic)}</b>\n"
-            f"Кол-во курсов: <b>{count}</b>\n\n"
-            f"Запустить Phase 1 (поиск каналов и видео)?",
+            f"Описание курса: {desc_line}\n\n"
+            f"Запустить Phase 1 (поиск каналов и видео для одного курса)?",
+            [[{"text": "🚀 Поехали", "callback_data": "wiz:start_phase1"},
+              {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
+            thread_id=thread_id,
+        )
+        return
+
+    if step == STEP_ASK_AUDIENCE:
+        # Legacy fallback: mid-flight wizards may still sit on this removed
+        # step. Skip it silently and route to confirm so the user isn't stuck.
+        log.info(f"[{agent}] wizard advancing legacy {step!r} → confirm")
+        _state.update(agent, user_id, thread_id=thread_id,
+                      count=1, step=STEP_CONFIRM)
+        topic = _state.load(agent, user_id, thread_id).get("topic", "")
+        _send_with_buttons(
+            token, chat_id,
+            f"<b>Подтверждение:</b>\n\nТема: <b>{_html_escape(topic)}</b>\n\n"
+            f"Запустить Phase 1?",
+            [[{"text": "🚀 Поехали", "callback_data": "wiz:start_phase1"},
+              {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
+            thread_id=thread_id,
+        )
+        return
+
+    if step == STEP_ASK_COUNT:
+        # Legacy fallback: ignore the count entry, force 1, route to confirm.
+        log.info(f"[{agent}] wizard collapsing legacy STEP_ASK_COUNT → confirm")
+        _state.update(agent, user_id, thread_id=thread_id,
+                      count=1, step=STEP_CONFIRM)
+        topic = _state.load(agent, user_id, thread_id).get("topic", "")
+        _send_with_buttons(
+            token, chat_id,
+            f"<b>Подтверждение:</b>\n\nТема: <b>{_html_escape(topic)}</b>\n\n"
+            f"Запустить Phase 1?",
             [[{"text": "🚀 Поехали", "callback_data": "wiz:start_phase1"},
               {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
             thread_id=thread_id,
@@ -233,27 +257,31 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
     if action == "start_phase1":
         st = _state.load(agent, user_id, thread_id)
         topic = st.get("topic")
-        count = st.get("count")
-        if not topic or not count:
+        description = st.get("pain", "")  # stored under `pain` for back-compat
+        count = 1  # one course per wizard run, always
+        if not topic:
             answer_callback_query(token, cq_id, "Состояние формы потеряно", show_alert=True)
             clear_wizard_state(agent, user_id, thread_id)
             return
-        _state.update(agent, user_id, thread_id=thread_id, step=STEP_PHASE1_RUNNING)
+        _state.update(agent, user_id, thread_id=thread_id,
+                      count=count, step=STEP_PHASE1_RUNNING)
         answer_callback_query(token, cq_id, "Phase 1 запущен")
+        desc_block = (f"\nОписание: <b>{_html_escape(description)[:300]}</b>"
+                      if description else "")
         try:
             tg_api(token, "sendMessage", chat_id=chat_id,
                    message_thread_id=thread_id or None,
                    text=(
                        "🔍 <b>Phase 1 запущен.</b>\n\n"
-                       f"Тема: <b>{_html_escape(topic)}</b>\n"
-                       f"Курсов: <b>{count}</b>\n\n"
-                       "Phase 1 теперь делает всю тяжёлую работу: ищет каналы, "
-                       "скачивает видео, транскрибирует, размечает вырезки, "
-                       "пишет описания уроков и курса, ищет инфу об авторе через "
-                       "WebSearch. На выходе в Sheet будут реальные описания, "
-                       "готовые для лендинга.\n\n"
-                       "Займёт ~40-90 минут. Можешь вернуться в чат с агентом "
-                       "(<code>/menu</code> → 💬 Чат), пришлю результат как будет готово."
+                       f"Тема: <b>{_html_escape(topic)}</b>"
+                       f"{desc_block}\n\n"
+                       "Phase 1 ищет каналы, скачивает видео, транскрибирует "
+                       "(Whisper), размечает вырезки, пишет описания уроков и "
+                       "курса, ищет инфу об авторе через WebSearch. На выходе "
+                       "в Sheet будут реальные описания, готовые для лендинга.\n\n"
+                       "~20-45 минут на курс. Можешь вернуться в чат с агентом "
+                       "(<code>/menu</code> → 💬 Чат), пришлю результат как "
+                       "будет готово."
                    ),
                    parse_mode="HTML")
         except Exception:
@@ -262,6 +290,7 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
             from . import phase1_discovery
             phase1_discovery.launch(token, agent, cfg, chat_id, user_id,
                                     topic, count,
+                                    pain=description,
                                     thread_id=thread_id)
         except Exception as e:
             log.exception(f"[{agent}] failed to launch phase1: {e}")
