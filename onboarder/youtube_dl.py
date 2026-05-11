@@ -244,9 +244,7 @@ def get_video_metadata(video_id: str, *,
     cookies path / a working proxy from the rotator.
     """
     url = f"https://youtu.be/{video_id}"
-    # ignoreerrors: suppress "Requested format is not available" — we only need
-    # metadata fields (title, channel, duration), not format selection.
-    extra: dict[str, Any] = {"ignoreerrors": True}
+    extra: dict[str, Any] = {}
     if cookies_file:
         from pathlib import Path as _P
         cp = _P(cookies_file).expanduser()
@@ -256,7 +254,10 @@ def get_video_metadata(video_id: str, *,
         extra["proxy"] = proxy
     with _ydl(extra) as ydl:
         try:
-            info = ydl.extract_info(url, download=False)
+            # process=False skips format selection (and the n-challenge it
+            # triggers) entirely — we only need page-level metadata fields
+            # (title, channel, duration, upload_date) here, not stream URLs.
+            info = ydl.extract_info(url, download=False, process=False)
         except Exception as e:
             log.warning(f"youtube_dl: video metadata failed for {video_id}: {e}")
             return {}
