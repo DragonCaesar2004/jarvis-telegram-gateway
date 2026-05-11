@@ -41,7 +41,7 @@ log = logging.getLogger("gateway")
 # Tuning knobs (some now overridable via Criteria)
 DEFAULT_SEARCH_RESULTS = 50   # criteria.search_results overrides
 TARGET_PASSING_PER_COURSE = 4  # legacy soft target; no longer used as early-exit
-HARD_CAP_CHANNELS_TO_CHECK = 100  # absolute ceiling on metadata fetches
+HARD_CAP_CHANNELS_TO_CHECK = 50  # absolute ceiling on metadata fetches
 MIN_LLM_SCORE = 0.4  # lowered from 0.5: more channels pass scoring → more
                      # candidates for the per-channel loop, less chance of
                      # Phase 1 failing because the top-3 didn't have on-topic
@@ -214,10 +214,11 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     # We used to early-exit once `target_passing` channels passed the hard
     # filter. That made Phase 1 fail too easily — if those few candidates
     # had no on-topic videos, there was no fallback. Now we always scan
-    # the full candidate pool (capped at HARD_CAP_CHANNELS_TO_CHECK), then
-    # let Claude score and the per-channel loop iterate down the ranked
-    # list until a usable channel is found. yt-dlp metadata is free, so
-    # the only cost is wall time (~30-90s for 100 channels in batches of 8).
+    # the full candidate pool (capped at HARD_CAP_CHANNELS_TO_CHECK=50),
+    # then let Claude score and the per-channel loop iterate down the
+    # ranked list until a usable channel is found. yt-dlp metadata is
+    # free, so the only cost is wall time (~30-60s for 50 channels in
+    # batches of 8).
     cap = min(len(candidates), HARD_CAP_CHANNELS_TO_CHECK)
     _send(token, chat_id,
           f"📊 Найдено {len(candidates)} каналов в выдаче. "
