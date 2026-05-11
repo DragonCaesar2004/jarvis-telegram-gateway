@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from . import (_secrets, bunny, cache, elevenlabs_dub, ffmpeg_cut, llm,
+from . import (_secrets, bunny, cache, google_dub, ffmpeg_cut, llm,
                nms_client, pipeline_db, proxy_pool, sheets,
                state as _state, whisper)
 from .proxy_pool import CookiesNeededError
@@ -124,10 +124,15 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
         raise RuntimeError("config: onboarder.bunny_stream_library_id not set")
     bunny_key = _secrets.resolve(onb, "bunny_stream_api_key", env="BUNNY_STREAM_API_KEY")
 
-    # ElevenLabs only required if there are any non-English videos.
-    # We resolve lazily (per-video) to allow English-only runs without the key.
-    def _elevenlabs_key() -> str:
-        return _secrets.resolve(onb, "elevenlabs_api_key", env="ELEVENLABS_API_KEY")
+    # Google API keys for dubbing (only needed for non-English videos).
+    # Resolved lazily so English-only runs don't require them.
+    def _google_translate_key() -> str:
+        return _secrets.resolve(onb, "google_translate_api_key",
+                                env="GOOGLE_TRANSLATE_API_KEY")
+
+    def _google_tts_key() -> str:
+        return _secrets.resolve(onb, "google_tts_api_key",
+                                env="GOOGLE_TTS_API_KEY")
 
     # NMS endpoint+token are optional for now: when missing, we skip the final
     # POST and keep the Bunny videoKeys in wizard state for later manual push.
@@ -144,6 +149,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
     # ── 2. Read approved+pending rows from unified Lessons tab ──────────
     st = _state.load(agent, user_id, int(thread_id or 0))
     run_id = st.get("run_id")
+    voice_gender: str = str(st.get("voice_gender") or "MALE").upper()
     # run_id is optional now — Phase 2 picks up any approved+pending rows
     # regardless of run, since user can mix-and-match across runs in the
     # single tab. If run_id is set, we filter to that run for safety.
@@ -251,7 +257,10 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                 token=token, chat_id=chat_id, agent=agent, user_id=user_id,
                 lessons=lessons, course_idx=course_idx,
                 scratch_dir=course_scratch,
-                openai_key=openai_key, get_elevenlabs_key=_elevenlabs_key,
+                openai_key=openai_key,
+                get_google_translate_key=_google_translate_key,
+                get_google_tts_key=_google_tts_key,
+                voice_gender=voice_gender,
                 bunny_lib=bunny_lib, bunny_key=bunny_key,
                 course_topic=clean_title,
                 youtube_cookies_file=youtube_cookies_file,
@@ -486,20 +495,14 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
 def _process_course_videos(*, token: str, chat_id: int, agent: str, user_id: int,
                            lessons: list[dict[str, Any]], course_idx: int,
                            scratch_dir: Path, openai_key: str,
-                           get_elevenlabs_key, bunny_lib: str, bunny_key: str,
+                           get_google_translate_key, get_google_tts_key,
+                           voice_gender: str = "MALE",
+                           bunny_lib: str, bunny_key: str,
                            course_topic: str,
                            youtube_cookies_file: str | None = None,
                            rotator=None,
                            parallel_videos: int = 1) -> list[dict[str, Any]]:
-    """Process every approved video in a course → list of NMS lesson payloads.
-
-    `parallel_videos`: how many videos to process at once. Default 1 (sequential)
-    keeps the original behavior. Higher values speed things up linearly when
-    download / FFmpeg / upload aren't the bottleneck — but ElevenLabs dub is
-    serialized per-account by tier (Creator=1, Pro=3, Scale=5+), so set this
-    above your tier's concurrency only if most videos are already English
-    (no dub needed).
-    """
+    """Process every approved video in a course → list of NMS lesson payloads."""
     total = len(lessons)
     parallel = max(1, min(int(parallel_videos or 1), total))
 
@@ -509,7 +512,9 @@ def _process_course_videos(*, token: str, chat_id: int, agent: str, user_id: int
             "prefix": f"Курс {course_idx}, видео {i}/{total}",
             "lesson": lesson, "scratch_dir": scratch_dir,
             "openai_key": openai_key,
-            "get_elevenlabs_key": get_elevenlabs_key,
+            "get_google_translate_key": get_google_translate_key,
+            "get_google_tts_key": get_google_tts_key,
+            "voice_gender": voice_gender,
             "bunny_lib": bunny_lib, "bunny_key": bunny_key,
             "course_topic": course_topic,
             "youtube_cookies_file": youtube_cookies_file,
@@ -613,17 +618,15 @@ def _download_with_rotation(*, token: str, chat_id: int, prefix: str,
 
 def _process_one_video(*, token: str, chat_id: int, prefix: str,
                        lesson: dict[str, Any], scratch_dir: Path,
-                       openai_key: str, get_elevenlabs_key,
+                       openai_key: str,
+                       get_google_translate_key, get_google_tts_key,
+                       voice_gender: str = "MALE",
                        bunny_lib: str, bunny_key: str,
                        course_topic: str,
                        youtube_cookies_file: str | None = None,
                        rotator=None) -> dict[str, Any]:
-    """Phase 2 happy path: cached MP4 + pre-computed cuts + skip working Whisper.
-
-    Falls back to the legacy download+transcribe+mark_cuts flow only if the
-    Phase 1 handoff is missing (e.g. video added manually to the Sheet).
-    """
-    from .elevenlabs_dub import _iso as _lang_iso
+    """Phase 2: download → cut → dub (Google TTS) → upload."""
+    from .google_dub import _iso as _lang_iso
 
     video_id = lesson["video_id"]
     title = lesson["title"]
@@ -672,26 +675,46 @@ def _process_one_video(*, token: str, chat_id: int, prefix: str,
     cleaned_path = ffmpeg_cut.cut_segments(input_path=raw_path, cuts=cuts,
                                            output_path=cleaned_path)
 
-    # ── 4. Dub if not English ────────────────────────────────────────────
+    # ── 4. Dub if not English (Google Translate + TTS) ───────────────────
     if detected_lang == "en":
         _send(token, chat_id, f"🇬🇧 {prefix}: уже на английском, дубляж пропускаем")
         final_path = cleaned_path
         was_dubbed = False
+        # Still need English transcript — transcribe the cleaned video
+        _send(token, chat_id, f"📝 {prefix}: транскрибация (EN)…")
+        final_transcript_result = whisper.transcribe(
+            api_key=openai_key, file_path=cleaned_path,
+            language="en", with_word_timestamps=False)
+        final_transcript_text = final_transcript_result.get("text", "")
     else:
+        voice_label = "👨 мужской" if voice_gender == "MALE" else "👩 женский"
         _send(token, chat_id,
-              f"🇬🇧 {prefix}: дубляж {detected_lang or '?'} → en (ElevenLabs, ~5-15 мин)…")
-        elevenlabs_key = get_elevenlabs_key()
-        elevenlabs_dub.dub_video(
-            api_key=elevenlabs_key, file_path=cleaned_path,
-            source_lang=detected_lang or "auto", target_lang="en",
-            output_path=final_path, name=title[:80],
+              f"🇬🇧 {prefix}: дубляж {detected_lang or '?'} → en "
+              f"(Google TTS, {voice_label})…")
+
+        # Re-transcribe cleaned video with segments for timing-accurate dubbing.
+        # Phase 1's working transcript was on the ORIGINAL video; after cuts the
+        # timestamps shifted, so we need fresh segments here.
+        working_clean = whisper.transcribe(
+            api_key=openai_key, file_path=cleaned_path,
+            with_word_timestamps=True)
+
+        translate_key = get_google_translate_key()
+        tts_key = get_google_tts_key()
+        _, final_transcript_text = google_dub.dub_video(
+            transcript=working_clean,
+            input_path=cleaned_path,
+            output_path=final_path,
+            source_lang=detected_lang or "ru",
+            target_lang="en",
+            voice_gender=voice_gender,
+            translate_api_key=translate_key,
+            tts_api_key=tts_key,
+            on_progress=lambda msg: _send(token, chat_id, f"{prefix}: {msg}"),
         )
         was_dubbed = True
 
-    # ── 5. Final transcribe of the post-edit video (text goes into admin) ─
-    _send(token, chat_id, f"📝 {prefix}: финальная транскрибация (EN)…")
-    final_transcript = whisper.transcribe(api_key=openai_key, file_path=final_path,
-                                          language="en", with_word_timestamps=False)
+    final_transcript = {"text": final_transcript_text}
 
     # ── 6. Upload to Bunny ───────────────────────────────────────────────
     duration_sec = int(ffmpeg_cut.probe_duration(final_path))

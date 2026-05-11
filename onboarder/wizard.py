@@ -54,6 +54,7 @@ STEP_AWAITING_COOKIES_PRE_PHASE2 = "awaiting_cookies_pre_phase2"  # forced refre
 STEP_PHASE2_RUNNING = "phase2_running"
 STEP_DONE = "done"
 STEP_AWAITING_COOKIES = "awaiting_cookies"  # standalone cookies upload (from /menu)
+STEP_ASK_VOICE = "ask_voice"              # gender selection before Phase 1 launch
 
 # Inputs that mean "no answer" for optional pain/audience steps.
 _SKIP_TOKENS = {"-", "—", "skip", "/skip", "пропустить", "нет", "no"}
@@ -303,9 +304,38 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
             clear_wizard_state(agent, user_id, thread_id)
             return
 
+        # Ask voice gender before launching Phase 1 (used for dubbing in Phase 2)
         _state.update(agent, user_id, thread_id=thread_id,
-                      count=count, step=STEP_PHASE1_RUNNING)
+                      count=count, step=STEP_ASK_VOICE)
+        answer_callback_query(token, cq_id)
+        _send_with_buttons(
+            token, chat_id,
+            "🎙 <b>Какой голос использовать для дубляжа на английский?</b>",
+            [[{"text": "👨 Мужской", "callback_data": "wiz:voice_male"},
+              {"text": "👩 Женский", "callback_data": "wiz:voice_female"}]],
+            thread_id=thread_id,
+        )
+        return
+
+    if action in ("voice_male", "voice_female"):
+        voice_gender = "MALE" if action == "voice_male" else "FEMALE"
+        st = _state.load(agent, user_id, thread_id)
+        url_mode = bool(st.get("url_mode"))
+        video_ids = list(st.get("video_ids") or [])
+        topic = st.get("topic") or ""
+        description = st.get("pain", "")
+        count = 1
+
+        if not topic and not (url_mode and video_ids):
+            answer_callback_query(token, cq_id, "Состояние формы потеряно", show_alert=True)
+            clear_wizard_state(agent, user_id, thread_id)
+            return
+
+        _state.update(agent, user_id, thread_id=thread_id,
+                      voice_gender=voice_gender, count=count, step=STEP_PHASE1_RUNNING)
         answer_callback_query(token, cq_id, "Phase 1 запущен")
+
+        voice_label = "👨 мужской" if voice_gender == "MALE" else "👩 женский"
 
         if url_mode and video_ids:
             # Direct URL mode: no YouTube search, enrich provided videos
@@ -314,7 +344,8 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
                        message_thread_id=thread_id or None,
                        text=(
                            "🔗 <b>Phase 1 запущен (прямые ссылки).</b>\n\n"
-                           f"Видео в обработке: <b>{len(video_ids)}</b>\n\n"
+                           f"Видео в обработке: <b>{len(video_ids)}</b>\n"
+                           f"Голос дубляжа: {voice_label}\n\n"
                            "Скачиваю видео, транскрибирую (Whisper), размечаю вырезки, "
                            "исследую автора и составляю описание курса. "
                            "Тему и названия генерирую автоматически по транскрипту.\n\n"
@@ -350,7 +381,8 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
                    text=(
                        "🔍 <b>Phase 1 запущен.</b>\n\n"
                        f"Тема: <b>{_html_escape(topic)}</b>"
-                       f"{desc_block}\n\n"
+                       f"{desc_block}\n"
+                       f"Голос дубляжа: {voice_label}\n\n"
                        "Phase 1 ищет каналы, скачивает видео, транскрибирует "
                        "(Whisper), размечает вырезки, пишет описания уроков и "
                        "курса, ищет инфу об авторе через WebSearch. На выходе "
