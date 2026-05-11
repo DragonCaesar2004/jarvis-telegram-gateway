@@ -24,9 +24,21 @@ Public API consumed by gateway.py:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Callable
 
 from . import state as _state
+
+# Matches youtube.com/watch?v=ID and youtu.be/ID (with or without https://).
+# Handles URLs separated by spaces, newlines, or multiple spaces.
+_YOUTUBE_URL_RE = re.compile(
+    r'(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?[^\s]*?v=|youtu\.be/)([A-Za-z0-9_-]{11})'
+)
+
+
+def _parse_youtube_urls(text: str) -> list[str]:
+    """Extract unique YouTube video IDs from text (space/newline-separated URLs)."""
+    return list(dict.fromkeys(_YOUTUBE_URL_RE.findall(text)))
 
 log = logging.getLogger("gateway")
 
@@ -62,7 +74,12 @@ def start_wizard(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     }, thread_id)
     _send(token, chat_id,
           "🎓 <b>Новый курс</b>\n\n"
-          "Какая тема курсов? (например: «AI для маркетологов»)\n\n"
+          "Два режима:\n\n"
+          "• <b>Тема</b> — напиши тему, бот сам найдёт YouTube-каналы и видео\n"
+          "  Пример: <i>«AI для маркетологов»</i>\n\n"
+          "• <b>Прямые ссылки</b> — вставь YouTube-ссылки через пробел или с новой строки, "
+          "бот возьмёт именно эти видео и сам сгенерирует тему/описание\n"
+          "  Пример: <i>https://youtu.be/abc123 https://youtu.be/def456</i>\n\n"
           "<i>/cancel — выход в чат с агентом.</i>",
           thread_id=thread_id)
 
@@ -123,10 +140,29 @@ def handle_wizard_message(token: str, agent: str, cfg: dict, chat_id: int,
             _send(token, chat_id, "Тема не может быть пустой. Попробуй ещё раз.",
                   thread_id=thread_id)
             return
-        # Wizard now asks for: topic → free-form description → confirm.
-        # `count` is fixed at 1 (one course per run); the description fills
-        # the `pain` slot in the LLM helpers (it's used identically — biases
-        # scoring / selection / compose toward the operator's specification).
+
+        # URL mode: user pasted YouTube links (space/newline/multi-space separated)
+        video_ids = _parse_youtube_urls(topic)
+        if video_ids:
+            _state.update(agent, user_id, thread_id=thread_id,
+                          url_mode=True, video_ids=video_ids,
+                          topic="", count=1, step=STEP_CONFIRM)
+            url_list = "\n".join(f"  youtu.be/{v}" for v in video_ids[:8])
+            more = f"\n  …и ещё {len(video_ids) - 8}" if len(video_ids) > 8 else ""
+            _send_with_buttons(
+                token, chat_id,
+                f"🔗 <b>Режим прямых ссылок</b>\n\n"
+                f"Распознано видео: <b>{len(video_ids)}</b>\n"
+                f"<code>{url_list}{more}</code>\n\n"
+                f"Тема и описания курса будут сгенерированы автоматически "
+                f"по транскрибации видео. Запустить Phase 1?",
+                [[{"text": "🚀 Поехали", "callback_data": "wiz:start_phase1"},
+                  {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
+                thread_id=thread_id,
+            )
+            return
+
+        # Normal topic flow: ask for description
         _state.update(agent, user_id, thread_id=thread_id,
                       topic=topic, step=STEP_ASK_PAIN)
         _send(token, chat_id,
@@ -256,16 +292,56 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
 
     if action == "start_phase1":
         st = _state.load(agent, user_id, thread_id)
-        topic = st.get("topic")
+        url_mode = bool(st.get("url_mode"))
+        video_ids = list(st.get("video_ids") or [])
+        topic = st.get("topic") or ""
         description = st.get("pain", "")  # stored under `pain` for back-compat
         count = 1  # one course per wizard run, always
-        if not topic:
+
+        if not topic and not (url_mode and video_ids):
             answer_callback_query(token, cq_id, "Состояние формы потеряно", show_alert=True)
             clear_wizard_state(agent, user_id, thread_id)
             return
+
         _state.update(agent, user_id, thread_id=thread_id,
                       count=count, step=STEP_PHASE1_RUNNING)
         answer_callback_query(token, cq_id, "Phase 1 запущен")
+
+        if url_mode and video_ids:
+            # Direct URL mode: no YouTube search, enrich provided videos
+            try:
+                tg_api(token, "sendMessage", chat_id=chat_id,
+                       message_thread_id=thread_id or None,
+                       text=(
+                           "🔗 <b>Phase 1 запущен (прямые ссылки).</b>\n\n"
+                           f"Видео в обработке: <b>{len(video_ids)}</b>\n\n"
+                           "Скачиваю видео, транскрибирую (Whisper), размечаю вырезки, "
+                           "исследую автора и составляю описание курса. "
+                           "Тему и названия генерирую автоматически по транскрипту.\n\n"
+                           "~15-30 минут. Можешь вернуться в чат "
+                           "(<code>/menu</code> → 💬 Чат), пришлю результат как будет готово."
+                       ),
+                       parse_mode="HTML")
+            except Exception:
+                pass
+            try:
+                from . import phase1_discovery
+                phase1_discovery.launch_from_urls(
+                    token, agent, cfg, chat_id, user_id,
+                    video_ids=video_ids, thread_id=thread_id,
+                )
+            except Exception as e:
+                log.exception(f"[{agent}] failed to launch phase1_from_urls: {e}")
+                try:
+                    tg_api(token, "sendMessage", chat_id=chat_id,
+                           message_thread_id=thread_id or None,
+                           text=f"⚠️ Не удалось запустить Phase 1: {e}")
+                except Exception:
+                    pass
+                _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
+            return
+
+        # Normal topic-based flow
         desc_block = (f"\nОписание: <b>{_html_escape(description)[:300]}</b>"
                       if description else "")
         try:

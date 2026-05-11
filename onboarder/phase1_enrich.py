@@ -188,27 +188,12 @@ def enrich_course(*, course_idx: int, run_id: str,
     output_lang = llm.detect_topic_lang(pain, course_topic_input, course_title_from_llm)
     _emit(f"🌐 Язык вывода: {output_lang}")
 
-    # ── 2. Per-lesson descriptions (single batched Claude call) ──────────
-    _emit(f"📝 Пишу описания {len(processed)} уроков (Claude, {output_lang})…")
+    # Lesson descriptions will be extracted from compose_full_course's curriculum
+    # (avoids a redundant separate Claude call — compose generates them as part of
+    # the full course structure, based on the same transcripts, at higher quality).
     lesson_descriptions: dict[str, str] = {}
-    try:
-        descs = llm.describe_lessons(
-            course_topic=course_title_from_llm or course_topic_input,
-            course_title=course_title_from_llm,
-            lessons=[
-                {"order": i, "title": p["title"], "transcript": p["working_transcript"]}
-                for i, p in enumerate(processed)
-            ],
-            output_lang=output_lang,
-            pain=pain, audience=audience,
-        )
-        for i, d in enumerate(descs):
-            if i < len(processed):
-                lesson_descriptions[processed[i]["video_id"]] = d.get("description", "")
-    except Exception as e:
-        log.warning(f"phase1_enrich: describe_lessons failed: {e}")
 
-    # ── 3. Author research (deep, with WebSearch) ────────────────────────
+    # ── 2. Author research (deep, with WebSearch) ────────────────────────
     _emit(f"🔍 Ищу информацию об авторе «{channel_name}» (Claude WebSearch, {output_lang})…")
     author = llm.research_author(
         channel_name=channel_name,
@@ -220,7 +205,7 @@ def enrich_course(*, course_idx: int, run_id: str,
     )
     _emit(f"  ✓ author: {author.get('name')} (confidence={author.get('confidence')})")
 
-    # ── 4. Full course compose (curriculum/plan/science/testimonials/...) ─
+    # ── 3. Full course compose (curriculum/plan/science/testimonials/...) ─
     _emit(f"✍️  Собираю полное описание курса (Claude, {output_lang})…")
     composed_full: dict[str, Any] | None = None
     compose_ok = False
@@ -243,6 +228,23 @@ def enrich_course(*, course_idx: int, run_id: str,
     if composed_full and author.get("bio"):
         composed_full["author"]["name"] = author.get("name") or composed_full["author"].get("name", "")
         composed_full["author"]["bio"] = author["bio"]
+
+    # ── 3.5 Extract lesson descriptions from compose curriculum ──────────
+    # compose_full_course already wrote per-lesson descriptions in CURRICULUM;
+    # use those instead of a separate describe_lessons call.
+    if composed_full and composed_full.get("curriculum"):
+        flat_lessons = [
+            lesson
+            for sec in composed_full["curriculum"]
+            for lesson in sec.get("lessons", [])
+        ]
+        for i, p in enumerate(processed):
+            if i < len(flat_lessons):
+                desc = (flat_lessons[i].get("description") or "").strip()
+                if desc:
+                    lesson_descriptions[p["video_id"]] = desc
+        if not any(lesson_descriptions.values()):
+            log.warning("phase1_enrich: no lesson descriptions extracted from curriculum")
 
     # Persist composed payload (Phase 2 reads back instead of re-running compose)
     if composed_full:
