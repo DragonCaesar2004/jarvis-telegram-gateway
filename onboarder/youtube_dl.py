@@ -244,7 +244,9 @@ def get_video_metadata(video_id: str, *,
     cookies path / a working proxy from the rotator.
     """
     url = f"https://youtu.be/{video_id}"
-    extra: dict[str, Any] = {}
+    # ignoreerrors: suppress "Requested format is not available" — we only need
+    # metadata fields (title, channel, duration), not format selection.
+    extra: dict[str, Any] = {"ignoreerrors": True}
     if cookies_file:
         from pathlib import Path as _P
         cp = _P(cookies_file).expanduser()
@@ -258,6 +260,9 @@ def get_video_metadata(video_id: str, *,
         except Exception as e:
             log.warning(f"youtube_dl: video metadata failed for {video_id}: {e}")
             return {}
+    if not info:
+        log.warning(f"youtube_dl: video metadata returned None for {video_id}")
+        return {}
     return {
         "video_id": info.get("id") or video_id,
         "title": info.get("title") or "",
