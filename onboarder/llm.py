@@ -61,10 +61,12 @@ def detect_topic_lang(*texts: str) -> str:
 def _lang_instruction(output_lang: str) -> str:
     """Return an extra system-prompt block forcing the output language.
 
-    Empty string for 'en' (default behavior); explicit Russian instruction
-    otherwise. Caller appends the result to the system prompt.
+    Caller appends the result to the system prompt. Always returns a non-empty
+    block so the LLM cannot drift to the input language just because the source
+    materials (transcripts, channel names) are non-English.
     """
-    if (output_lang or 'en').lower() == 'ru':
+    lang = (output_lang or 'en').lower()
+    if lang == 'ru':
         return (
             "\n\nLANGUAGE REQUIREMENT (override examples below): write ALL "
             "user-facing text in Russian (Cyrillic). This applies to: lesson "
@@ -77,7 +79,23 @@ def _lang_instruction(output_lang: str) -> str:
             "original form. Russian examples / English examples in the prompt "
             "below are STYLE references only — you must produce Russian output."
         )
-    return ""
+    # Default: English. We MUST be explicit — without this block, the LLM
+    # mirrors the source-material language (e.g. when transcripts are Russian
+    # or the channel is Russian, output drifts to Russian).
+    return (
+        "\n\nLANGUAGE REQUIREMENT: write ALL user-facing text in ENGLISH, "
+        "regardless of the input language of the materials below. This "
+        "applies to: lesson descriptions, course titles, taglines, excerpts, "
+        "about content, plan section titles and topics, science "
+        "headline/subtitle, curriculum lesson titles and descriptions, "
+        "testimonials, author bio, expertise. Author name: keep the real name "
+        "in its native script if it's a proper noun (e.g. a Russian author's "
+        "name stays in Cyrillic), but write the bio in English. Translate "
+        "concepts from Russian/other-language transcripts into natural, "
+        "fluent English — do NOT keep Russian phrasing or Cyrillic words in "
+        "the body of any description. Keep technical identifiers (URLs, IDs, "
+        "code) in their original form."
+    )
 
 
 def _pain_audience_block(pain: str, audience: str) -> str:
