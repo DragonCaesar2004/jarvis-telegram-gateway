@@ -364,15 +364,19 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                 "lessons": [_lesson_payload(v, idx, v["title"], "") for idx, v in enumerate(processed_lessons)],
             }]
 
-        # Sheet override: any non-empty *_orig column on the lesson_idx=1 row
-        # for this course is treated as an operator edit and wins over the
-        # pipeline.db cached compose. Empty cell → fall back to the cached
-        # compose value, then to a generic stub.
+        # Sheet override: any non-empty cell on the lesson_idx=1 row for this
+        # course is treated as an operator edit and wins over the pipeline.db
+        # cached compose. Empty cell → fall back to the cached compose value,
+        # then to a generic stub.
         first_lesson_row = next((r for r in lessons if r.get("lesson_idx") == 1),
                                 lessons[0] if lessons else {})
         sheet_excerpt = (first_lesson_row.get("course_description") or "").strip()
         sheet_author_name = (first_lesson_row.get("author_name") or "").strip()
         sheet_author_bio = (first_lesson_row.get("author_bio") or "").strip()
+        sheet_title = (first_lesson_row.get("course_title") or "").strip()
+        sheet_about = (first_lesson_row.get("course_about") or "").strip()
+        sheet_plan_text = (first_lesson_row.get("course_plan") or "").strip()
+        sheet_science_text = (first_lesson_row.get("course_science") or "").strip()
 
         # Author / course fields with sheet-overrides + fallbacks
         if composed_full:
@@ -385,15 +389,33 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                         or ""),
             }
             course_payload = {
-                "title": composed_full["course"]["title"] or clean_title,
+                "title": (sheet_title
+                          or composed_full["course"]["title"]
+                          or clean_title),
                 "excerpt": (sheet_excerpt
                             or composed_full["course"].get("excerpt")
                             or ""),
-                "aboutContent": composed_full["course"]["aboutContent"],
+                "aboutContent": (sheet_about
+                                 or composed_full["course"]["aboutContent"]),
                 "isAdult": composed_full["course"]["isAdult"],
             }
+            # Plan / Science: prefer Sheet edits (parsed) over composed cache
             plan_sections = composed_full.get("planSections") or []
+            if sheet_plan_text:
+                try:
+                    parsed_plan = llm.parse_plan_from_sheet(sheet_plan_text)
+                    if parsed_plan:
+                        plan_sections = parsed_plan
+                except Exception as e:
+                    log.warning(f"phase2: failed to parse sheet course_plan: {e}")
             science_plan = composed_full.get("sciencePlan")  # may be None
+            if sheet_science_text:
+                try:
+                    parsed_sci = llm.parse_science_from_sheet(sheet_science_text)
+                    if parsed_sci:
+                        science_plan = parsed_sci
+                except Exception as e:
+                    log.warning(f"phase2: failed to parse sheet course_science: {e}")
             testimonials = composed_full.get("testimonials") or []
             collection_name = composed_full.get("collectionName") or None
         else:
@@ -402,12 +424,25 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                 "bio": sheet_author_bio or f"{ch_name} — educator on YouTube.",
             }
             course_payload = {
-                "title": clean_title,
+                "title": sheet_title or clean_title,
                 "excerpt": sheet_excerpt or f"A practical course on {clean_title}.",
-                "aboutContent": f"Curated lessons from {ch_name} on {clean_title}.",
+                "aboutContent": (sheet_about
+                                 or f"Curated lessons from {ch_name} on {clean_title}."),
                 "isAdult": False,
             }
+            # Even without composed_full, the operator can paste plan/science
+            # into Sheet and we'll honor them.
             plan_sections, science_plan, testimonials, collection_name = [], None, [], None
+            if sheet_plan_text:
+                try:
+                    plan_sections = llm.parse_plan_from_sheet(sheet_plan_text) or []
+                except Exception as e:
+                    log.warning(f"phase2: failed to parse sheet course_plan: {e}")
+            if sheet_science_text:
+                try:
+                    science_plan = llm.parse_science_from_sheet(sheet_science_text)
+                except Exception as e:
+                    log.warning(f"phase2: failed to parse sheet course_science: {e}")
 
         # Sheet rows for this course (used for status updates)
         course_sheet_rows = [r["_sheet_row"] for r in lessons]

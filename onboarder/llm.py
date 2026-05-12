@@ -1057,6 +1057,71 @@ def _parse_testimonials(block: str) -> list[dict[str, Any]]:
     return out
 
 
+# Public aliases — Phase 2 calls these to parse operator-edited Sheet cells
+parse_plan_from_sheet = _parse_plan
+parse_science_from_sheet = _parse_science
+
+
+def format_plan_for_sheet(plan_sections: list[dict[str, Any]] | None) -> str:
+    """Inverse of _parse_plan — render plan_sections back to delimiter format.
+
+    Output the operator sees / edits in Sheet:
+        ---section: Foundations---
+        - Anatomy of the knee
+        - Common surgical approaches
+        ---section: Recovery---
+        - Week 1-2 protocols
+    """
+    if not plan_sections:
+        return ""
+    lines: list[str] = []
+    for sec in plan_sections:
+        title = (sec.get("title") or "").strip()
+        if not title:
+            continue
+        lines.append(f"---section: {title}---")
+        for item in (sec.get("items") or []):
+            t = (item.get("title") or "").strip()
+            if t:
+                lines.append(f"- {t}")
+    return "\n".join(lines)
+
+
+def format_science_for_sheet(science_plan: dict[str, Any] | None) -> str:
+    """Inverse of _parse_science — render sciencePlan back to delimiter format.
+
+    Output:
+        headline: ...
+        subtitle: ...
+        ---institution---
+        name: Harvard Medical School
+        style: serif-caps
+        ---stat---
+        value: 74%
+        description: ...
+        citation: ...
+    """
+    if not science_plan or not science_plan.get("enabled", True):
+        return ""
+    lines: list[str] = []
+    headline = (science_plan.get("headline") or "").strip()
+    subtitle = (science_plan.get("subtitle") or "").strip()
+    if headline:
+        lines.append(f"headline: {headline}")
+    if subtitle:
+        lines.append(f"subtitle: {subtitle}")
+    for inst in (science_plan.get("institutions") or []):
+        lines.append("---institution---")
+        lines.append(f"name: {(inst.get('name') or '').strip()}")
+        lines.append(f"style: {(inst.get('style') or 'serif').strip()}")
+    for stat in (science_plan.get("stats") or []):
+        lines.append("---stat---")
+        lines.append(f"value: {(stat.get('value') or '').strip()}")
+        lines.append(f"description: {(stat.get('description') or '').strip()}")
+        lines.append(f"citation: {(stat.get('citation') or '').strip()}")
+    return "\n".join(lines)
+
+
 def parse_template(text: str) -> dict[str, Any]:
     """Parse the LLM's filled template into a structured dict ready for NMS API."""
     sections = _split_top_sections(text)

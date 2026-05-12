@@ -337,6 +337,26 @@ def enrich_course(*, course_idx: int, run_id: str,
         _emit(f"⚠️ В курсе {course_idx} пропущено {len(failed)} видео из-за ошибок "
               f"(остальные {len(enriched_videos)} прошли).")
 
+    # Pre-render the structured plan/science back to the delimiter format the
+    # operator edits in Sheet (single multiline cell). Phase 2 parses these
+    # back via llm.parse_plan_from_sheet / parse_science_from_sheet if the
+    # operator edited them.
+    course_plan_text = ""
+    course_science_text = ""
+    if composed_full:
+        try:
+            course_plan_text = llm.format_plan_for_sheet(
+                composed_full.get("planSections") or []
+            )
+        except Exception as e:
+            log.warning(f"phase1_enrich: format_plan_for_sheet failed: {e}")
+        try:
+            course_science_text = llm.format_science_for_sheet(
+                composed_full.get("sciencePlan")
+            )
+        except Exception as e:
+            log.warning(f"phase1_enrich: format_science_for_sheet failed: {e}")
+
     return {
         "videos": enriched_videos,
         "course_title": final_course_title,
@@ -349,6 +369,10 @@ def enrich_course(*, course_idx: int, run_id: str,
         "author_name": author.get("name") or channel_name,
         "author_bio": author.get("bio") or "",
         "author_expertise": author.get("expertise") or "",
+        # Full landing payload — operator can edit any of these in Sheet.
+        "course_about": course_about,
+        "course_plan": course_plan_text,
+        "course_science": course_science_text,
         # Russian translations (Sheet-only, review aid).
         "course_description_ru": russian_map.get("course_description", ""),
         "course_tagline_ru": russian_map.get("course_tagline", ""),

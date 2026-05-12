@@ -97,6 +97,14 @@ LESSONS_HEADER = [
     "course_target_audience_ru",# AD
     "author_bio_ru",            # AE
     "author_expertise_ru",      # AF
+    # ── Override fields for the full landing payload (lesson_idx=1 only) ──
+    # Filled by Phase 1 from the cached compose; operator can edit any of
+    # these cells before clicking "Запустить обработку" and Phase 2 will
+    # use the edit instead of the cached value.
+    "course_title",             # AG: full course title (overrides composed)
+    "course_about",             # AH: large markdown about-content
+    "course_plan",              # AI: plan in delimiter format (---section: ...---)
+    "course_science",           # AJ: science block in delimiter format
 ]
 
 # Status enum values
@@ -384,6 +392,12 @@ def _lesson_row_to_values(r: dict[str, Any], *, run_id: str, ts: str) -> list[An
         r.get("course_target_audience_ru", ""),             # AD
         r.get("author_bio_ru", ""),                         # AE
         r.get("author_expertise_ru", ""),                   # AF
+        # Extended overrides (AG-AJ) — lesson_idx=1 only; Phase 2 prefers
+        # non-empty Sheet values over the cached compose payload.
+        r.get("course_title", ""),                          # AG
+        r.get("course_about", ""),                          # AH
+        r.get("course_plan", ""),                           # AI
+        r.get("course_science", ""),                        # AJ
     ]
 
 
@@ -450,6 +464,11 @@ def read_pending_approved_rows(client: Any, sheet_id: str,
             "course_target_audience_ru": d.get("course_target_audience_ru", ""),
             "author_bio_ru": d.get("author_bio_ru", ""),
             "author_expertise_ru": d.get("author_expertise_ru", ""),
+            # Extended override fields (lesson_idx=1 row carries them)
+            "course_title": d.get("course_title", ""),
+            "course_about": d.get("course_about", ""),
+            "course_plan": d.get("course_plan", ""),
+            "course_science": d.get("course_science", ""),
             "_sheet_row": i,  # 1-based row index for batch_update
         })
     return out

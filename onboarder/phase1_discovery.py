@@ -470,6 +470,11 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         author_name = enriched.get("author_name", "") or ch_name
         author_bio = enriched.get("author_bio", "")
         author_expertise = enriched.get("author_expertise", "")
+        # Extended overrides (full landing payload) — operator can edit any
+        # of these in Sheet and Phase 2 will pick them up.
+        course_about = enriched.get("course_about", "")
+        course_plan = enriched.get("course_plan", "")
+        course_science = enriched.get("course_science", "")
         # Russian translations (review-only; Phase 2 ignores them when
         # building the admin payload — the *_orig columns are canon).
         course_desc_ru = enriched.get("course_description_ru", "")
@@ -503,6 +508,12 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                 "author_name": author_name if is_first else "",
                 "author_bio": author_bio if is_first else "",
                 "author_expertise": author_expertise if is_first else "",
+                # Extended override fields (lesson_idx=1 only) — operator can
+                # edit any of these in Sheet → Phase 2 sends the edit to NMS.
+                "course_title": (final_course_title if is_first else ""),
+                "course_about": course_about if is_first else "",
+                "course_plan": course_plan if is_first else "",
+                "course_science": course_science if is_first else "",
                 # Russian counterparts (also lesson_idx=1 only for course-level).
                 "course_description_ru": course_desc_ru if is_first else "",
                 "course_tagline_ru": course_tagline_ru if is_first else "",
@@ -817,6 +828,11 @@ def _run_from_urls(token: str, agent: str, cfg: dict, chat_id: int, user_id: int
             "author_name": enriched.get("author_name", "") if is_first else "",
             "author_bio": enriched.get("author_bio", "") if is_first else "",
             "author_expertise": enriched.get("author_expertise", "") if is_first else "",
+            # Extended override fields (lesson_idx=1 only)
+            "course_title": (final_title if is_first else ""),
+            "course_about": enriched.get("course_about", "") if is_first else "",
+            "course_plan": enriched.get("course_plan", "") if is_first else "",
+            "course_science": enriched.get("course_science", "") if is_first else "",
             "course_description_ru": enriched.get("course_description_ru", "") if is_first else "",
             "course_tagline_ru": enriched.get("course_tagline_ru", "") if is_first else "",
             "course_what_you_learn_ru": enriched.get("course_what_you_learn_ru", "") if is_first else "",
