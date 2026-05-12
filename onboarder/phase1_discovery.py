@@ -785,7 +785,11 @@ def _run_from_urls(token: str, agent: str, cfg: dict, chat_id: int, user_id: int
             channel_name=channel_name,
             channel_description=channel_description,
             course_topic_input=course_topic_input,
-            course_title_from_llm=channel_name,  # placeholder; compose overrides
+            # Empty title → compose_full_course generates one from transcripts
+            # (compose system prompt: "if no title provided, create an engaging,
+            # clear title 3-10 words"). Channel name is the fallback if compose
+            # fails — wired into enrich_course's final_course_title.
+            course_title_from_llm="",
             selected_videos=selected_videos,
             videos_metadata=videos_metadata,
             openai_key=openai_key,

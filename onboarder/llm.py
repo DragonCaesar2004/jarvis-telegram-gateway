@@ -1174,9 +1174,20 @@ def compose_full_course(*, course_topic: str, course_title: str,
     if audience:
         pain_audience_lines += f"TARGET AUDIENCE: {audience}\n"
 
+    # When no title is provided (URL mode), tell the LLM to generate one from
+    # the lesson transcripts instead of fabricating a forced "COURSE TITLE: "
+    # blank line that confuses generation.
+    if course_title.strip():
+        title_line = f"COURSE TITLE (use exactly if you keep one): {course_title}\n"
+    else:
+        title_line = (
+            "COURSE TITLE: (NOT PROVIDED — generate one from the lesson "
+            "transcripts below: clear, outcome-oriented, 3-10 words)\n"
+        )
+
     materials = (
         f"COURSE TOPIC: {course_topic}\n"
-        f"COURSE TITLE (use exactly if you keep one): {course_title}\n"
+        f"{title_line}"
         f"{pain_audience_lines}"
         f"INSTRUCTOR / CHANNEL: {channel_name}\n"
         f"CHANNEL DESCRIPTION: {channel_description[:500] if channel_description else '(none)'}\n\n"

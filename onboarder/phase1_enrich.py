@@ -182,11 +182,13 @@ def enrich_course(*, course_idx: int, run_id: str,
             "compose_ok": False,
         }
 
-    # Detect output language ONCE per course from topic + pain + course title.
-    # Pain is often the most descriptive — operator types it in their own
-    # language, so it's the strongest signal.
-    output_lang = llm.detect_topic_lang(pain, course_topic_input, course_title_from_llm)
-    _emit(f"🌐 Язык вывода: {output_lang}")
+    # Admin payload is ALWAYS English (source-of-truth on the platform).
+    # If the operator wants to review in Russian, the *_ru columns of the
+    # Lessons sheet are populated separately via translate_batch_to_russian
+    # below. The operator's input language doesn't affect output language —
+    # all landing copy, descriptions, plan, science, etc. ship in EN.
+    output_lang = "en"
+    _emit("🌐 Язык вывода: en (всегда; RU перевод — в *_ru колонках для ревью)")
 
     # Lesson descriptions will be extracted from compose_full_course's curriculum
     # (avoids a redundant separate Claude call — compose generates them as part of
@@ -262,8 +264,14 @@ def enrich_course(*, course_idx: int, run_id: str,
             log.warning(f"phase1_enrich: save_course_compose failed: {e}")
 
     # ── 5. Build per-video enriched rows for the caller ──────────────────
-    final_course_title = (composed_full and composed_full["course"]["title"]
-                          or course_title_from_llm)
+    # Title priority: compose → operator-provided LLM-selected title → channel name.
+    # URL mode passes course_title_from_llm="" so compose generates it from
+    # transcripts; channel_name is the safety net if compose also failed.
+    final_course_title = (
+        (composed_full or {}).get("course", {}).get("title")
+        or course_title_from_llm
+        or channel_name
+    )
     course_description = (composed_full and composed_full["course"].get("excerpt")) or ""
     course_about = (composed_full and composed_full["course"].get("aboutContent")) or ""
 
