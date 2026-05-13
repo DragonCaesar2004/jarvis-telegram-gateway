@@ -58,8 +58,15 @@ class DubError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 def translate_batch(texts: list[str], source_lang: str, target_lang: str,
-                    api_key: str) -> list[str]:
-    """Translate many texts in one API call. Returns list aligned to input."""
+                    api_key: str, *, raise_on_failure: bool = False) -> list[str]:
+    """Translate many texts in one API call. Returns list aligned to input.
+
+    `raise_on_failure=True` (used by dub_video): propagate the error so the
+    caller doesn't accidentally feed source-language text to downstream TTS.
+    `raise_on_failure=False` (default, used by sanitizer): return originals so
+    a translate outage doesn't kill the whole Phase 2 — sanitization is a
+    best-effort layer over already-English content.
+    """
     non_empty = [(i, t) for i, t in enumerate(texts) if t.strip()]
     if not non_empty:
         return texts
@@ -76,7 +83,10 @@ def translate_batch(texts: list[str], source_lang: str, target_lang: str,
         r.raise_for_status()
         translations = r.json()["data"]["translations"]
     except Exception as e:
-        log.warning(f"google_dub: translate_batch failed: {e} — using originals")
+        msg = f"google_dub: translate_batch failed: {e}"
+        if raise_on_failure:
+            raise DubError(msg) from e
+        log.warning(f"{msg} — using originals")
         return texts
 
     result = list(texts)
@@ -244,7 +254,13 @@ def dub_video(*,
 
     if src_iso != tgt_iso:
         _emit(on_progress, f"🌐 Перевожу {len(seg_texts)} сегментов (Google Translate)…")
-        translated_texts = translate_batch(seg_texts, src_iso, tgt_iso, translate_api_key)
+        # raise_on_failure=True: never let source-language text fall through to
+        # TTS — that produces English-accented Russian, the worst of both
+        # worlds. If translate fails (API disabled, network), fail the video.
+        translated_texts = translate_batch(
+            seg_texts, src_iso, tgt_iso, translate_api_key,
+            raise_on_failure=True,
+        )
     else:
         translated_texts = seg_texts
 
