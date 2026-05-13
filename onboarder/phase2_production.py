@@ -447,6 +447,33 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
         # Sheet rows for this course (used for status updates)
         course_sheet_rows = [r["_sheet_row"] for r in lessons]
 
+        # ── 4.5 Sanitize: force every user-facing field to Latin script ───
+        # Defense in depth — even if compose/sheet/fallback let Cyrillic
+        # through (stale Phase 1 cache, YouTube video titles used as fallback,
+        # channel name fallback for author.name), translate any Cyrillic
+        # string via Google Translate before posting to NMS. Names get
+        # transliterated by Translate as a byproduct of EN→EN passthrough.
+        try:
+            translate_key = _google_translate_key()
+        except Exception as e:
+            log.warning(f"phase2: no Google Translate key for sanitization: {e}")
+            translate_key = ""
+        if translate_key:
+            sanitize_report = _sanitize_payload_to_english(
+                author_payload=author_payload,
+                course_payload=course_payload,
+                curriculum_payload=curriculum_payload,
+                plan_sections=plan_sections,
+                science_plan=science_plan,
+                testimonials=testimonials,
+                processed_lessons=processed_lessons,
+                api_key=translate_key,
+            )
+            if sanitize_report:
+                _send(token, chat_id,
+                      f"🌐 Курс {course_idx}: автоперевод в EN {sanitize_report} "
+                      f"полей с кириллицей перед отправкой в админку.")
+
         # ── 5. Push DRAFT course to NewMindStart ────────────────────────
         if nms_endpoint and nms_token:
             try:
@@ -898,3 +925,115 @@ def _html_escape(s: str) -> str:
          .replace("<", "&lt;")
          .replace(">", "&gt;")
     )
+
+
+# ---------------------------------------------------------------------------
+# Final-pass sanitizer: guarantee NO Cyrillic in any user-facing field
+# ---------------------------------------------------------------------------
+
+def _has_cyrillic(s: str) -> bool:
+    """True if string contains any Cyrillic character."""
+    if not s:
+        return False
+    return any('Ѐ' <= ch <= 'ӿ' for ch in s)
+
+
+def _sanitize_payload_to_english(*, author_payload: dict, course_payload: dict,
+                                 curriculum_payload: list,
+                                 plan_sections: list,
+                                 science_plan: dict | None,
+                                 testimonials: list,
+                                 processed_lessons: list,
+                                 api_key: str) -> str:
+    """Walk the entire NMS payload, collect Cyrillic strings, batch-translate
+    them all in one Google Translate API call, write back.
+
+    Returns a short human-readable report (e.g. "12") for the operator message,
+    or empty string if nothing needed translating.
+
+    Mutates the dicts/lists in place.
+    """
+    from . import google_dub
+
+    # Collect all (setter, original) pairs that have Cyrillic
+    setters: list[tuple[callable, str]] = []
+
+    def collect(value: str, setter: callable) -> None:
+        if isinstance(value, str) and _has_cyrillic(value):
+            setters.append((setter, value))
+
+    # author
+    collect(author_payload.get("name", ""),
+            lambda v: author_payload.__setitem__("name", v))
+    collect(author_payload.get("bio", ""),
+            lambda v: author_payload.__setitem__("bio", v))
+
+    # course
+    for k in ("title", "excerpt", "aboutContent"):
+        collect(course_payload.get(k, ""),
+                (lambda key=k: lambda v: course_payload.__setitem__(key, v))())
+
+    # curriculum: section titles + each lesson's title + description
+    for sec in curriculum_payload or []:
+        collect(sec.get("title", ""),
+                (lambda s=sec: lambda v: s.__setitem__("title", v))())
+        for lesson in sec.get("lessons", []) or []:
+            collect(lesson.get("title", ""),
+                    (lambda l=lesson: lambda v: l.__setitem__("title", v))())
+            collect(lesson.get("description", ""),
+                    (lambda l=lesson: lambda v: l.__setitem__("description", v))())
+            # Per-lesson description used by NMS flat lessons path too
+            collect(lesson.get("lessonDescription", ""),
+                    (lambda l=lesson: lambda v: l.__setitem__("lessonDescription", v))())
+
+    # plan_sections
+    for sec in plan_sections or []:
+        collect(sec.get("title", ""),
+                (lambda s=sec: lambda v: s.__setitem__("title", v))())
+        for item in sec.get("items", []) or []:
+            collect(item.get("title", ""),
+                    (lambda it=item: lambda v: it.__setitem__("title", v))())
+
+    # science_plan
+    if science_plan:
+        for k in ("headline", "subtitle"):
+            collect(science_plan.get(k, ""),
+                    (lambda key=k: lambda v: science_plan.__setitem__(key, v))())
+        for inst in science_plan.get("institutions", []) or []:
+            collect(inst.get("name", ""),
+                    (lambda i=inst: lambda v: i.__setitem__("name", v))())
+        for stat in science_plan.get("stats", []) or []:
+            for k in ("value", "description", "citation"):
+                collect(stat.get(k, ""),
+                        (lambda s=stat, key=k: lambda v: s.__setitem__(key, v))())
+
+    # testimonials
+    for t in testimonials or []:
+        collect(t.get("authorName", ""),
+                (lambda x=t: lambda v: x.__setitem__("authorName", v))())
+        collect(t.get("text", ""),
+                (lambda x=t: lambda v: x.__setitem__("text", v))())
+
+    # processed_lessons: each lesson has lessonDescription that NMS reads
+    for pl in processed_lessons or []:
+        collect(pl.get("lessonDescription", ""),
+                (lambda x=pl: lambda v: x.__setitem__("lessonDescription", v))())
+
+    if not setters:
+        return ""
+
+    # Batch-translate all collected strings in ONE API call
+    originals = [orig for _, orig in setters]
+    try:
+        translated = google_dub.translate_batch(
+            originals, source_lang="ru", target_lang="en", api_key=api_key,
+        )
+    except Exception as e:
+        log.warning(f"phase2 sanitize: translate_batch failed: {e}")
+        return ""
+
+    for (setter, _), new_val in zip(setters, translated):
+        if new_val:
+            setter(new_val)
+
+    return str(len(setters))
