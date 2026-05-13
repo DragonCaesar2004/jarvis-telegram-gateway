@@ -461,10 +461,28 @@ def _process_video_for_enrich(*, video_id: str, title: str, url: str,
         }
 
 
+MAX_TRUNCATED_PROXY_ROTATIONS = 5
+"""How many different proxies to try when a download truncates mid-stream.
+
+yt-dlp already retries ~10 times within a single proxy before giving up
+("Giving up after 10 retries"). When that happens, the proxy itself is likely
+flaky for this specific video (bandwidth cap, server-side throttle, or
+mid-stream connection reset). Rotating to a fresh proxy usually recovers."""
+
+
 def _download_with_rotation(*, video_id: str, url: str, output_path: Path,
                             cookies_file: str | None,
                             rotator: ProxyRotator | None) -> Path:
-    """Download with thread-aware proxy rotation. Mirrors phase2's helper."""
+    """Download with thread-aware proxy rotation.
+
+    Handles two distinct failure modes:
+      1. Bot-check ("Sign in to confirm you're not a bot") — rotate until pool
+         exhausted, then raise CookiesNeededError so wizard prompts for cookies.
+      2. Truncated download ("Giving up after N retries", "X bytes read, Y more
+         expected") — rotate up to MAX_TRUNCATED_PROXY_ROTATIONS different proxies,
+         then give up and raise FFmpegError (caller skips this one video).
+    """
+    truncated_tries = 0
     while True:
         proxy = rotator.current if rotator else None
         try:
@@ -473,19 +491,53 @@ def _download_with_rotation(*, video_id: str, url: str, output_path: Path,
                 cookies_file=cookies_file, proxy=proxy,
             )
         except ffmpeg_cut.FFmpegError as e:
-            if not _is_bot_check(e) or rotator is None:
-                raise
-            new_proxy = rotator.rotate_if_still(proxy)
-            if new_proxy is None:
-                raise CookiesNeededError(
-                    f"Все {len(rotator.pool)} прокси из пула заблокированы YouTube'ом "
-                    f"в Phase 1 (видео {video_id}). Cookies скорее всего тоже устарели."
-                ) from e
+            if _is_bot_check(e) and rotator is not None:
+                new_proxy = rotator.rotate_if_still(proxy)
+                if new_proxy is None:
+                    raise CookiesNeededError(
+                        f"Все {len(rotator.pool)} прокси из пула заблокированы "
+                        f"YouTube'ом в Phase 1 (видео {video_id}). Cookies "
+                        f"скорее всего тоже устарели."
+                    ) from e
+                continue
+            if _is_truncated_download(e) and rotator is not None:
+                truncated_tries += 1
+                if truncated_tries > MAX_TRUNCATED_PROXY_ROTATIONS:
+                    log.warning(
+                        f"phase1_enrich: video {video_id} truncated on "
+                        f"{truncated_tries} different proxies, giving up"
+                    )
+                    raise
+                new_proxy = rotator.rotate_if_still(proxy)
+                if new_proxy is None:
+                    # Pool exhausted before hitting the rotation budget — surface
+                    # the truncation error, not CookiesNeededError (cookies are
+                    # not the issue here).
+                    raise
+                log.info(
+                    f"phase1_enrich: video {video_id} truncated, trying proxy "
+                    f"#{truncated_tries + 1}/{MAX_TRUNCATED_PROXY_ROTATIONS + 1}"
+                )
+                continue
+            # Any other FFmpeg/yt-dlp error: surface immediately.
+            raise
 
 
 def _is_bot_check(err: Exception) -> bool:
     s = str(err).lower()
     return "sign in to confirm" in s or "not a bot" in s
+
+
+def _is_truncated_download(err: Exception) -> bool:
+    """Match yt-dlp's mid-stream truncation errors."""
+    s = str(err).lower()
+    return (
+        "giving up after" in s
+        or "bytes read" in s and "more expected" in s
+        or "connection reset" in s
+        or "incomplete read" in s
+        or "remote end closed connection" in s
+    )
 
 
 # ---------------------------------------------------------------------------

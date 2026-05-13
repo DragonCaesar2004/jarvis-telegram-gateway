@@ -618,15 +618,35 @@ def _is_bot_check_error(err: Exception) -> bool:
     return "sign in to confirm" in s or "not a bot" in s
 
 
+def _is_truncated_download_error(err: Exception) -> bool:
+    """Match yt-dlp's mid-stream truncation errors so we can rotate proxy."""
+    s = str(err).lower()
+    return (
+        "giving up after" in s
+        or "bytes read" in s and "more expected" in s
+        or "connection reset" in s
+        or "incomplete read" in s
+        or "remote end closed connection" in s
+    )
+
+
+MAX_TRUNCATED_PROXY_ROTATIONS = 5
+"""How many fresh proxies to try when yt-dlp's internal retries are exhausted."""
+
+
 def _download_with_rotation(*, token: str, chat_id: int, prefix: str,
                             url: str, output_path, cookies_file: str | None,
                             rotator) -> "Path":
-    """Download with proxy rotation on bot-check failures.
+    """Download with proxy rotation on bot-check OR truncation failures.
 
-    Tries current rotator.current; on bot-check, rotates and retries up to len(pool).
-    Raises CookiesNeededError if pool is exhausted.
+    - Bot-check ("Sign in to confirm"): rotate until pool exhausted, then raise
+      CookiesNeededError (wizard prompts user to refresh cookies).
+    - Truncation ("Giving up after N retries", "X bytes read, Y more expected"):
+      rotate up to MAX_TRUNCATED_PROXY_ROTATIONS times; if all fail, give up on
+      this video and let caller skip it (no cookies prompt — cookies are fine).
+    - Anything else: surface immediately.
     """
-    last_err: Exception | None = None
+    truncated_tries = 0
     while True:
         proxy = rotator.current if rotator else None
         try:
@@ -635,20 +655,40 @@ def _download_with_rotation(*, token: str, chat_id: int, prefix: str,
                 cookies_file=cookies_file, proxy=proxy,
             )
         except ffmpeg_cut.FFmpegError as e:
-            last_err = e
-            if not _is_bot_check_error(e) or rotator is None:
-                raise
-            label = proxy_pool._proxy_label(proxy) if proxy else "no-proxy"
-            _send(token, chat_id,
-                  f"🔁 {prefix}: bot-check на <code>{label}</code>, ищу другой прокси…")
-            new_proxy = rotator.rotate()
-            if new_proxy is None:
-                raise CookiesNeededError(
-                    f"Все {len(rotator.pool)} прокси из пула заблокированы YouTube'ом. "
-                    f"Cookies скорее всего тоже устарели — нужно обновить и повторить."
-                ) from e
-            _send(token, chat_id,
-                  f"➡️ {prefix}: переключился на <code>{proxy_pool._proxy_label(new_proxy)}</code>, повторяю…")
+            if _is_bot_check_error(e) and rotator is not None:
+                label = proxy_pool._proxy_label(proxy) if proxy else "no-proxy"
+                _send(token, chat_id,
+                      f"🔁 {prefix}: bot-check на <code>{label}</code>, ищу другой прокси…")
+                new_proxy = rotator.rotate()
+                if new_proxy is None:
+                    raise CookiesNeededError(
+                        f"Все {len(rotator.pool)} прокси из пула заблокированы "
+                        f"YouTube'ом. Cookies скорее всего тоже устарели — "
+                        f"нужно обновить и повторить."
+                    ) from e
+                _send(token, chat_id,
+                      f"➡️ {prefix}: переключился на <code>{proxy_pool._proxy_label(new_proxy)}</code>, повторяю…")
+                continue
+            if _is_truncated_download_error(e) and rotator is not None:
+                truncated_tries += 1
+                if truncated_tries > MAX_TRUNCATED_PROXY_ROTATIONS:
+                    _send(token, chat_id,
+                          f"❌ {prefix}: видео не докачалось на "
+                          f"{truncated_tries} разных прокси, пропускаю.")
+                    raise
+                label = proxy_pool._proxy_label(proxy) if proxy else "no-proxy"
+                _send(token, chat_id,
+                      f"⚠️ {prefix}: обрыв на <code>{label}</code> "
+                      f"(попытка {truncated_tries}/{MAX_TRUNCATED_PROXY_ROTATIONS}), "
+                      f"меняю прокси…")
+                new_proxy = rotator.rotate_if_still(proxy)
+                if new_proxy is None:
+                    raise
+                _send(token, chat_id,
+                      f"➡️ {prefix}: переключился на "
+                      f"<code>{proxy_pool._proxy_label(new_proxy)}</code>, повторяю…")
+                continue
+            raise
 
 
 def _process_one_video(*, token: str, chat_id: int, prefix: str,
