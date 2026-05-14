@@ -195,17 +195,38 @@ def enrich_course(*, course_idx: int, run_id: str,
     # the full course structure, based on the same transcripts, at higher quality).
     lesson_descriptions: dict[str, str] = {}
 
-    # ── 2. Author research (deep, with WebSearch) ────────────────────────
-    _emit(f"🔍 Ищу информацию об авторе «{channel_name}» (Claude WebSearch, {output_lang})…")
-    author = llm.research_author(
-        channel_name=channel_name,
-        channel_description=channel_description,
-        sample_video_titles=[p["title"] for p in processed[:8]],
-        course_topic=course_title_from_llm or course_topic_input,
-        output_lang=output_lang,
-        pain=pain, audience=audience,
-    )
-    _emit(f"  ✓ author: {author.get('name')} (confidence={author.get('confidence')})")
+    # ── 2. Author research (deep, with WebSearch) — cached per channel_id ──
+    # Same channel → same author. Bio rarely changes, so we cache forever in
+    # pipeline_db.author_research. Saves 30-90s of Claude+WebSearch on every
+    # repeat run of the same channel.
+    cached_author = pipeline_db.get_author_research(channel_id)
+    if cached_author and cached_author.get("bio"):
+        author = cached_author
+        _emit(f"  ✓ author из кэша: {author.get('name')} "
+              f"(cached @ {author.get('cached_at', '')[:10]})")
+    else:
+        _emit(f"🔍 Ищу информацию об авторе «{channel_name}» (Claude WebSearch, {output_lang})…")
+        author = llm.research_author(
+            channel_name=channel_name,
+            channel_description=channel_description,
+            sample_video_titles=[p["title"] for p in processed[:8]],
+            course_topic=course_title_from_llm or course_topic_input,
+            output_lang=output_lang,
+            pain=pain, audience=audience,
+        )
+        _emit(f"  ✓ author: {author.get('name')} (confidence={author.get('confidence')})")
+        # Save to cache for future runs of the same channel
+        try:
+            pipeline_db.save_author_research(
+                channel_id,
+                name=author.get("name", ""),
+                bio=author.get("bio", ""),
+                expertise=author.get("expertise", ""),
+                confidence=author.get("confidence", "low"),
+                sources=author.get("sources", []),
+            )
+        except Exception as e:
+            log.warning(f"phase1_enrich: save_author_research failed: {e}")
 
     # ── 3. Full course compose (curriculum/plan/science/testimonials/...) ─
     _emit(f"✍️  Собираю полное описание курса (Claude, {output_lang})…")

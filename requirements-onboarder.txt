@@ -9,3 +9,4 @@ openai>=1.50.0           # Whisper transcription API
 anthropic>=0.40.0        # Claude API for scoring/classification
 elevenlabs>=1.0.0        # Dubbing API
 requests>=2.31.0         # already in core requirements.txt — pin here for clarity
+pydub>=0.25.0            # fast in-memory audio mix (TTS overlay onto silence)

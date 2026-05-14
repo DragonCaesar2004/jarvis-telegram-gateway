@@ -65,6 +65,20 @@ def _connect() -> sqlite3.Connection:
             PRIMARY KEY (run_id, course_idx)
         )
     """)
+    # Author research cache — avoid re-querying Claude+WebSearch for channels
+    # we've already researched. Same channel = same author, the bio rarely
+    # changes meaningfully. Hit rate grows over time as channel inventory builds.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS author_research (
+            channel_id TEXT PRIMARY KEY,
+            name TEXT,
+            bio TEXT,
+            expertise TEXT,
+            confidence TEXT,
+            sources_json TEXT,
+            computed_at TEXT NOT NULL
+        )
+    """)
     return conn
 
 
@@ -188,3 +202,58 @@ def get_course_compose(*, run_id: str, course_idx: int) -> dict[str, Any] | None
         return json.loads(row[0] or "{}")
     except json.JSONDecodeError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# author_research: cache Claude+WebSearch bio lookup per channel_id
+# ---------------------------------------------------------------------------
+
+def save_author_research(channel_id: str, *,
+                         name: str = "", bio: str = "",
+                         expertise: str = "", confidence: str = "low",
+                         sources: list[str] | None = None) -> None:
+    """Upsert author research result for one channel."""
+    if not channel_id:
+        return
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    sources_payload = json.dumps(sources or [], ensure_ascii=False)
+    with _connect() as conn:
+        conn.execute("""
+            INSERT INTO author_research(channel_id, name, bio, expertise,
+                                        confidence, sources_json, computed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                name = excluded.name,
+                bio = excluded.bio,
+                expertise = excluded.expertise,
+                confidence = excluded.confidence,
+                sources_json = excluded.sources_json,
+                computed_at = excluded.computed_at
+        """, (channel_id, name, bio, expertise, confidence,
+              sources_payload, ts))
+
+
+def get_author_research(channel_id: str) -> dict[str, Any] | None:
+    """Return cached author research or None if no entry."""
+    if not channel_id:
+        return None
+    with _connect() as conn:
+        row = conn.execute("""
+            SELECT name, bio, expertise, confidence, sources_json, computed_at
+              FROM author_research WHERE channel_id = ?
+        """, (channel_id,)).fetchone()
+    if not row:
+        return None
+    name, bio, expertise, confidence, sources_json, computed_at = row
+    try:
+        sources = json.loads(sources_json or "[]")
+    except json.JSONDecodeError:
+        sources = []
+    return {
+        "name": name or "",
+        "bio": bio or "",
+        "expertise": expertise or "",
+        "confidence": confidence or "low",
+        "sources": sources,
+        "cached_at": computed_at or "",
+    }

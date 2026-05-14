@@ -44,9 +44,10 @@ _VOICES: dict[str, dict[str, str]] = {
     "FEMALE": {"languageCode": "en-US", "name": "en-US-Wavenet-F", "ssmlGender": "FEMALE"},
 }
 
-# Max parallel TTS workers. Cloud TTS rate limit is 300 RPM on Basic tier,
-# so 8 parallel is safe for typical 20-30 min lecture (~150 segments).
-TTS_WORKERS = 8
+# Max parallel TTS workers. Cloud TTS rate limit is 300 RPM on Basic tier:
+# 16 workers × ~1.5 sec per call ≈ 640 RPM peak, but in practice we burst at
+# ~150-200 RPM (segments aren't all submitted simultaneously). Safe headroom.
+TTS_WORKERS = 16
 
 
 class DubError(RuntimeError):
@@ -209,19 +210,76 @@ def _probe_duration(path: Path) -> float:
 def _build_audio_track(clips: list[tuple[float, Path]],
                        total_duration: float,
                        output: Path) -> None:
-    """Mix a silent base with TTS clips placed at their start timestamps."""
-    # Base: generate silence
-    base_cmd = [
+    """Mix a silent base with TTS clips placed at their start timestamps.
+
+    Two paths:
+      - pydub (primary): parallel MP3 decode + in-memory overlay. Fast for many
+        segments (150+) because there's no monolithic FFmpeg filter graph.
+      - FFmpeg amix (fallback): used if pydub isn't installed or raises.
+    """
+    if not clips:
+        # Just silence — single ffmpeg call is fine
+        _build_silent_track_ffmpeg(total_duration, output)
+        return
+    try:
+        _build_audio_track_pydub(clips, total_duration, output)
+    except Exception as e:
+        log.warning(f"google_dub: pydub mix failed ({e}), falling back to ffmpeg amix")
+        _build_audio_track_ffmpeg(clips, total_duration, output)
+
+
+def _build_silent_track_ffmpeg(total_duration: float, output: Path) -> None:
+    """Generate a silent WAV via FFmpeg lavfi."""
+    cmd = [
         "ffmpeg", "-y", "-f", "lavfi",
         "-i", f"anullsrc=r=44100:cl=mono:d={total_duration:.3f}",
         "-c:a", "pcm_s16le", str(output),
     ]
-    subprocess.run(base_cmd, check=True, capture_output=True)
+    subprocess.run(cmd, check=True, capture_output=True)
 
-    if not clips:
-        return
 
-    # Overlay each TTS clip at its timestamp using adelay + amix
+def _build_audio_track_pydub(clips: list[tuple[float, Path]],
+                             total_duration: float,
+                             output: Path) -> None:
+    """pydub path: parallel-decode all TTS clips, then overlay onto silent base.
+
+    Why this is faster than ffmpeg amix for 100+ segments:
+      - amix builds a single filter_complex with N adelays. The filter graph
+        compile + execute cost grows ~quadratically past ~50 inputs.
+      - pydub: each MP3 is decoded by a small ffmpeg subprocess (1 sec each,
+        parallel × 8 workers ≈ N/8 sec total), then overlay is a fast in-memory
+        array copy.
+
+    Pre-decoded clips × overlay × export to WAV. Output: 44.1kHz mono PCM,
+    same as the ffmpeg path.
+    """
+    from pydub import AudioSegment  # lazy: keep dep optional
+
+    total_ms = int(total_duration * 1000)
+
+    # Parallel-decode all TTS clips
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        loaded = list(ex.map(
+            lambda p: AudioSegment.from_mp3(str(p)),
+            [c[1] for c in clips],
+        ))
+
+    # Build base silence + overlay clips
+    base = AudioSegment.silent(duration=total_ms, frame_rate=44100)
+    base = base.set_channels(1)
+    for (start_sec, _), seg in zip(clips, loaded):
+        seg = seg.set_channels(1).set_frame_rate(44100)
+        base = base.overlay(seg, position=int(start_sec * 1000))
+
+    base.export(str(output), format="wav", parameters=["-acodec", "pcm_s16le"])
+
+
+def _build_audio_track_ffmpeg(clips: list[tuple[float, Path]],
+                              total_duration: float,
+                              output: Path) -> None:
+    """Original FFmpeg amix path — used as fallback when pydub fails."""
+    _build_silent_track_ffmpeg(total_duration, output)
+
     inputs: list[str] = ["-i", str(output)]
     for _, mp3 in clips:
         inputs += ["-i", str(mp3)]
@@ -249,7 +307,6 @@ def _build_audio_track(clips: list[tuple[float, Path]],
     if r.returncode != 0:
         raise DubError(f"ffmpeg amix failed: {r.stderr[-600:]}")
 
-    # Replace silent base with the mixed result
     mixed.replace(output)
 
 

@@ -935,7 +935,15 @@ def _strip_course_prefix(s: str, idx: int) -> str:
 
 
 def _send(token: str, chat_id: int, text: str) -> None:
-    """Send to Telegram, routing via _TLS.thread_id when in a forum topic."""
+    """Send to Telegram, routing via _TLS.thread_id when in a forum topic.
+
+    No-op when token is empty/falsy — used by complete_course.py and other
+    CLI tools that drive Phase 2 without a Telegram channel. Skipping the
+    HTTP call entirely saves ~3.7s per message (Telegram returns 404 on
+    empty token with retry).
+    """
+    if not token:
+        return
     from gateway import tg_api  # type: ignore
     thread_id = int(getattr(_TLS, "thread_id", 0) or 0)
     kwargs: dict[str, Any] = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
