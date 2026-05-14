@@ -754,13 +754,18 @@ def _process_one_video(*, token: str, chat_id: int, prefix: str,
             rotator=rotator,
         )
 
-    # ── 2. Cuts + detected language: prefer Phase 1's pipeline_db record ─
+    # ── 2. Cuts + detected language + segments: prefer Phase 1's pipeline_db ─
     db_record = pipeline_db.get_cuts(video_id)
+    cached_segments: list[dict[str, Any]] = []
     if db_record is not None:
         cuts = db_record.get("cuts") or []
         detected_lang = db_record.get("detected_lang") or ""
+        cached_segments = db_record.get("segments") or []
+        seg_note = (f", {len(cached_segments)} сегментов" if cached_segments
+                    else ", сегментов нет (старый run — повторим Whisper)")
         _send(token, chat_id,
-              f"📋 {prefix}: cuts из Phase 1 ({len(cuts)} кусков, lang={detected_lang or '?'})")
+              f"📋 {prefix}: cuts из Phase 1 ({len(cuts)} кусков, "
+              f"lang={detected_lang or '?'}{seg_note})")
     else:
         # Fallback: video has no Phase 1 handoff — recompute on the fly.
         _send(token, chat_id,
@@ -769,6 +774,7 @@ def _process_one_video(*, token: str, chat_id: int, prefix: str,
                                      with_word_timestamps=True)
         detected_lang = _lang_iso((working.get("language") or "").lower())
         cuts = llm.mark_cuts(course_topic=course_topic, transcript=working) or []
+        cached_segments = working.get("segments") or []
 
     cuts_summary = f"{len(cuts)} кусков" if cuts else "нет вырезок"
 
@@ -777,29 +783,60 @@ def _process_one_video(*, token: str, chat_id: int, prefix: str,
     cleaned_path = ffmpeg_cut.cut_segments(input_path=raw_path, cuts=cuts,
                                            output_path=cleaned_path)
 
-    # ── 4. Dub if not English (Google Translate + TTS) ───────────────────
+    # ── 4. Derive cleaned-video segments — reuse Phase 1 cache when possible ──
+    # Old flow re-ran Whisper on the cleaned video (extra $0.006/min + minute(s)
+    # of latency). New flow: take Phase 1's word-level segments and reproject
+    # them through the cuts list — zero API calls, ~0.5s word-width precision.
+    cleaned_segments: list[dict[str, Any]] = []
+    if cached_segments:
+        from . import segment_shift
+        cleaned_segments = segment_shift.shift_segments_through_cuts(
+            cached_segments, cuts,
+        )
+        if cleaned_segments:
+            _send(token, chat_id,
+                  f"⚡ {prefix}: сегменты получены из кэша Phase 1 "
+                  f"({len(cleaned_segments)} шт, Whisper API пропущен)")
+        else:
+            log.warning(f"phase2: shift produced 0 segments for {video_id}, "
+                        f"falling back to Whisper")
+            cached_segments = []  # force fallback below
+
+    # ── 5. Dub if not English (Google Translate + TTS) ───────────────────
     if detected_lang == "en":
         _send(token, chat_id, f"🇬🇧 {prefix}: уже на английском, дубляж пропускаем")
         final_path = cleaned_path
         was_dubbed = False
-        # Still need English transcript — transcribe the cleaned video
-        _send(token, chat_id, f"📝 {prefix}: транскрибация (EN)…")
-        final_transcript_result = whisper.transcribe(
-            api_key=openai_key, file_path=cleaned_path,
-            language="en", with_word_timestamps=False)
-        final_transcript_text = final_transcript_result.get("text", "")
+        # Final EN transcript: join shifted segments, or re-transcribe as fallback
+        if cleaned_segments:
+            from . import segment_shift
+            final_transcript_text = segment_shift.join_transcript(cleaned_segments)
+        else:
+            _send(token, chat_id, f"📝 {prefix}: транскрибация (EN, fallback)…")
+            final_transcript_result = whisper.transcribe(
+                api_key=openai_key, file_path=cleaned_path,
+                language="en", with_word_timestamps=False)
+            final_transcript_text = final_transcript_result.get("text", "")
     else:
         voice_label = "👨 мужской" if voice_gender == "MALE" else "👩 женский"
         _send(token, chat_id,
               f"🇬🇧 {prefix}: дубляж {detected_lang or '?'} → en "
               f"(Google TTS, {voice_label})…")
 
-        # Re-transcribe cleaned video with segments for timing-accurate dubbing.
-        # Phase 1's working transcript was on the ORIGINAL video; after cuts the
-        # timestamps shifted, so we need fresh segments here.
-        working_clean = whisper.transcribe(
-            api_key=openai_key, file_path=cleaned_path,
-            with_word_timestamps=True)
+        # Build the working_clean dict that google_dub expects. Prefer the
+        # shifted-cache segments; fall back to a fresh Whisper call on the
+        # cleaned video if there's no cached data (legacy run or shift failed).
+        if cleaned_segments:
+            working_clean = {
+                "segments": cleaned_segments,
+                "language": detected_lang,
+            }
+        else:
+            _send(token, chat_id,
+                  f"📝 {prefix}: сегменты не сохранены — повторяю Whisper (fallback)…")
+            working_clean = whisper.transcribe(
+                api_key=openai_key, file_path=cleaned_path,
+                with_word_timestamps=True)
 
         translate_key = get_google_translate_key()
         tts_key = get_google_tts_key()

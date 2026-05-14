@@ -435,6 +435,10 @@ def _process_video_for_enrich(*, video_id: str, title: str, url: str,
             pipeline_db.save_cuts(
                 video_id, cuts=cuts, working_transcript=text,
                 detected_lang=detected_iso, duration_sec=duration_sec,
+                # Persist full Whisper segments (with word-level timestamps) so
+                # Phase 2 can derive cleaned-timeline segments via segment_shift
+                # without re-running Whisper on the cut video.
+                segments=working.get("segments") or [],
             )
         except Exception as e:
             log.warning(f"phase1_enrich: save_cuts failed for {video_id}: {e}")
