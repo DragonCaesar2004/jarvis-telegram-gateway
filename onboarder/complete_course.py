@@ -143,6 +143,51 @@ def main(run_id: str, telegram_chat_id: int | None = None) -> None:
         # ── Build NMS payload ────────────────────────────────────────────
         composed = pipeline_db.get_course_compose(
             run_id=run_id, course_idx=course_idx)
+
+        # If compose is missing OR has no curriculum (yesterday Phase 1 failed
+        # at this step due to Claude Max limit), call compose_full_course now
+        # using the transcripts we have (from pipeline_db.video_cuts +
+        # Phase 2 results + Bunny captions). Save the result back to pipeline_db.
+        needs_compose = (
+            composed is None
+            or not (composed.get("curriculum") or [])
+            or len((composed.get("course", {}).get("aboutContent") or "")) < 200
+        )
+        if needs_compose:
+            log.info(f"course {course_idx}: composed payload missing/empty in "
+                     f"pipeline.db — running compose_full_course on the fly")
+            transcripts = _gather_transcripts(
+                lessons=lessons, processed=processed,
+                bunny_lib=str(bunny_lib), bunny_key=bunny_key,
+            )
+            log.info(f"  gathered {sum(1 for t in transcripts if t)} non-empty "
+                     f"transcripts out of {len(transcripts)}")
+            compose_model = (onb.get("models") or {}).get("compose") or llm.DEFAULT_MODEL_QUALITY
+            try:
+                composed = llm.compose_full_course(
+                    course_topic=clean_title,
+                    course_title=clean_title,
+                    channel_name=ch_name,
+                    channel_description="",
+                    lesson_transcripts=transcripts,
+                    model=compose_model,
+                )
+                # Persist for future runs of this run_id
+                try:
+                    pipeline_db.save_course_compose(
+                        run_id=run_id, course_idx=course_idx,
+                        composed=composed,
+                    )
+                except Exception as e:
+                    log.warning(f"  save_course_compose failed: {e}")
+                log.info(f"  ✓ compose ready: title={composed['course']['title']!r}, "
+                         f"about={len(composed['course']['aboutContent'])} chars, "
+                         f"plan={len(composed.get('planSections', []))} sections")
+            except Exception as e:
+                log.error(f"  compose_full_course failed: {e}", exc_info=True)
+                # Continue with whatever we have (stubs)
+                composed = composed or None
+
         author_payload, course_payload, plan_sections, science_plan, \
             testimonials, collection_name, curriculum_payload = \
             _build_payload(composed=composed, processed=processed,
@@ -272,6 +317,56 @@ def _build_processed_lessons(*, lessons, by_norm, bunny_lib, bunny_key,
             continue
 
     return processed
+
+
+def _gather_transcripts(*, lessons: list[dict[str, Any]],
+                        processed: list[dict[str, Any]],
+                        bunny_lib: str, bunny_key: str) -> list[str]:
+    """Collect a transcript per lesson, in original lesson_idx order.
+
+    Source priority (first non-empty wins):
+      1. `processed[i].transcriptEn` — freshly produced by Phase 2 just now
+      2. `pipeline_db.video_cuts.working_transcript` — Phase 1's transcript
+      3. Bunny auto-generated EN captions (if ready)
+    """
+    # Index processed by video_id for fast lookup
+    by_vid: dict[str, dict[str, Any]] = {}
+    for p in processed:
+        # Phase 2 result doesn't include video_id directly; fall back to
+        # title-match against the lessons list.
+        pass
+    # Instead match by lesson title (1:1 with lessons in same order)
+    proc_by_title = {p.get("title"): p for p in processed}
+
+    out: list[str] = []
+    for lesson in lessons:
+        title = lesson.get("title", "")
+        video_id = lesson.get("video_id", "")
+        text = ""
+
+        # 1. Freshly processed
+        p = proc_by_title.get(title)
+        if p and (p.get("transcriptEn") or "").strip():
+            text = p["transcriptEn"]
+        # 2. pipeline.db Phase 1 transcript
+        if not text and video_id:
+            try:
+                rec = pipeline_db.get_cuts(video_id)
+                if rec and rec.get("working_transcript"):
+                    text = rec["working_transcript"]
+            except Exception as e:
+                log.warning(f"  pipeline_db read failed for {video_id}: {e}")
+        # 3. Bunny captions (slow, single REST call per video)
+        if not text and p and p.get("videoKey"):
+            try:
+                from .recover_from_bunny import fetch_bunny_caption_text
+                text = fetch_bunny_caption_text(
+                    bunny_lib, bunny_key, p["videoKey"], lang="en") or ""
+            except Exception as e:
+                log.warning(f"  bunny caption fetch failed: {e}")
+
+        out.append(text or "")
+    return out
 
 
 def _find_bunny_match(title: str,
