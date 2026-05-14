@@ -4,16 +4,18 @@ Use case: Phase 2 uploaded videos to Bunny but the final NMS push failed
 (token mismatch, network blip, etc.). The videos are sitting on Bunny as
 orphans. This script:
 
-1. Reads pending+approved rows from the Lessons sheet (filterable by run_id)
+1. Reads rows from the Lessons sheet (filterable by run_id)
+   - Default mode: pending+approved only
+   - --include-done: ALL approved rows (including `done` and `processing`),
+     used to consolidate a partially-uploaded course into a single new DRAFT.
 2. Lists the Bunny library, matches Lessons rows to Bunny videos by title
-3. Downloads each video's MP4 from Bunny (no YouTube hit)
-4. Re-Whispers them for the final EN transcript
-5. Calls compose_full_course (Claude builds the course copy)
-6. POSTs to /api/agent/onboard-course
-7. Updates Lessons rows to status=done with admin URL
+3. Uses Bunny's auto-generated captions for transcripts (no Whisper)
+4. Calls compose_full_course (Claude builds the course copy)
+5. POSTs to /api/agent/onboard-course
+6. Updates Lessons rows to status=done with admin URL
 
 Run via:
-    python -m onboarder.recover_from_bunny [run_id]
+    python -m onboarder.recover_from_bunny [run_id] [--include-done]
 
 Without a run_id, picks up ALL pending+approved rows.
 """
@@ -123,7 +125,56 @@ def normalize_title(s: str) -> str:
     return "".join(c.lower() for c in s.strip() if c.isalnum())
 
 
-def main(run_id: str | None = None) -> None:
+def _read_all_approved_rows(client: Any, sheet_id: str,
+                            run_id: str | None = None) -> list[dict[str, Any]]:
+    """Like sheets.read_pending_approved_rows but ANY approved row (pending +
+    processing + done + failed), filtered by run_id if given.
+
+    Used by --include-done to consolidate a partially-uploaded course into
+    one new DRAFT covering all original videos from that run.
+    """
+    ws = sheets.ensure_lessons_tab(client, sheet_id)
+    raw_rows = ws.get_all_values()
+    if len(raw_rows) < 2:
+        return []
+    hdr = raw_rows[0]
+    out: list[dict[str, Any]] = []
+    for i, raw in enumerate(raw_rows[1:], start=2):
+        d = {h: (raw[j] if j < len(raw) else "") for j, h in enumerate(hdr)}
+        if (d.get("approved", "").strip().lower()
+                not in ("true", "1", "x", "yes", "да")):
+            continue
+        if run_id and d.get("run_id", "").strip() != run_id:
+            continue
+        try:
+            duration_sec = int(d.get("duration_sec") or 0)
+        except ValueError:
+            duration_sec = 0
+        out.append({
+            "course": d.get("course", ""),
+            "channel": d.get("channel", ""),
+            "channel_id": d.get("channel_id", ""),
+            "title": d.get("lesson_title", ""),
+            "url": d.get("url", ""),
+            "video_id": d.get("video_id", ""),
+            "duration_sec": duration_sec,
+            "course_idx": _safe_int(d.get("course_idx", "")),
+            "lesson_idx": _safe_int(d.get("lesson_idx", "")),
+            "run_id": d.get("run_id", ""),
+            "status": d.get("status", "").strip().lower(),
+            "_sheet_row": i,
+        })
+    return out
+
+
+def _safe_int(v: Any) -> int:
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return 0
+
+
+def main(run_id: str | None = None, include_done: bool = False) -> None:
     cfg = json.loads(Path("config.json").read_text())
     onb = cfg["agents"]["operations"]["onboarder"]
 
@@ -140,12 +191,17 @@ def main(run_id: str | None = None) -> None:
 
     client = sheets.open_client(sa_path)
 
-    log.info("loading pending+approved rows from Lessons…")
-    rows = sheets.read_pending_approved_rows(client, sheet_id, run_id=run_id)
+    if include_done:
+        log.info(f"loading ALL approved rows for run_id={run_id!r}…")
+        rows = _read_all_approved_rows(client, sheet_id, run_id=run_id)
+    else:
+        log.info("loading pending+approved rows from Lessons…")
+        rows = sheets.read_pending_approved_rows(client, sheet_id, run_id=run_id)
     if not rows:
-        log.error("no pending+approved rows found")
+        log.error("no approved rows found")
         return
-    log.info(f"got {len(rows)} rows")
+    log.info(f"got {len(rows)} rows (statuses: "
+             f"{sorted({r.get('status', 'pending') for r in rows})})")
 
     log.info(f"listing Bunny library {bunny_lib}…")
     bunny_videos = list_bunny_videos(bunny_lib, bunny_key)
@@ -323,5 +379,9 @@ def _lesson_payload(p: dict[str, Any], order: int, title: str, description: str)
 
 
 if __name__ == "__main__":
-    run_id_arg = sys.argv[1] if len(sys.argv) > 1 else None
-    main(run_id_arg)
+    args = [a for a in sys.argv[1:] if a]
+    include_done = "--include-done" in args
+    if include_done:
+        args.remove("--include-done")
+    run_id_arg = args[0] if args else None
+    main(run_id_arg, include_done=include_done)

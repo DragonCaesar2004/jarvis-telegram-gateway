@@ -57,9 +57,44 @@ class DubError(RuntimeError):
 # Google Translate (batch)
 # ---------------------------------------------------------------------------
 
+# Google Translate v2 limits per request:
+#   q array length: max 128 strings
+#   total chars in q: max 30_000
+#   single string: max 5_000 chars
+# We chunk well under these so a long lecture (200+ Whisper segments) doesn't
+# silently fail with HTTP 400. Picking 100 and 25k leaves headroom for the
+# request envelope and source/target/format fields.
+TRANSLATE_MAX_STRINGS_PER_REQ = 100
+TRANSLATE_MAX_CHARS_PER_REQ = 25_000
+
+
+def _chunk_for_translate(items: list[tuple[int, str]]
+                         ) -> list[list[tuple[int, str]]]:
+    """Split (idx, text) pairs into chunks under Google's per-request limits."""
+    chunks: list[list[tuple[int, str]]] = []
+    current: list[tuple[int, str]] = []
+    current_chars = 0
+    for idx, t in items:
+        t_chars = len(t)
+        # If adding this string would push us over limits, start a new chunk.
+        # First-item check protects against a single huge string blocking forever.
+        if current and (
+            len(current) >= TRANSLATE_MAX_STRINGS_PER_REQ
+            or current_chars + t_chars > TRANSLATE_MAX_CHARS_PER_REQ
+        ):
+            chunks.append(current)
+            current = []
+            current_chars = 0
+        current.append((idx, t))
+        current_chars += t_chars
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def translate_batch(texts: list[str], source_lang: str, target_lang: str,
                     api_key: str, *, raise_on_failure: bool = False) -> list[str]:
-    """Translate many texts in one API call. Returns list aligned to input.
+    """Translate many texts. Chunks under Google's 128-string / 30K-char limits.
 
     `raise_on_failure=True` (used by dub_video): propagate the error so the
     caller doesn't accidentally feed source-language text to downstream TTS.
@@ -71,27 +106,43 @@ def translate_batch(texts: list[str], source_lang: str, target_lang: str,
     if not non_empty:
         return texts
 
-    payload = {
-        "q": [t for _, t in non_empty],
-        "source": _iso(source_lang),
-        "target": _iso(target_lang),
-        "format": "text",
-    }
-    try:
-        r = requests.post(TRANSLATE_API, params={"key": api_key},
-                          json=payload, timeout=60)
-        r.raise_for_status()
-        translations = r.json()["data"]["translations"]
-    except Exception as e:
-        msg = f"google_dub: translate_batch failed: {e}"
-        if raise_on_failure:
-            raise DubError(msg) from e
-        log.warning(f"{msg} — using originals")
-        return texts
-
     result = list(texts)
-    for (orig_idx, _), tr in zip(non_empty, translations):
-        result[orig_idx] = tr.get("translatedText", texts[orig_idx])
+    chunks = _chunk_for_translate(non_empty)
+
+    for chunk_idx, chunk in enumerate(chunks):
+        payload = {
+            "q": [t for _, t in chunk],
+            "source": _iso(source_lang),
+            "target": _iso(target_lang),
+            "format": "text",
+        }
+        r = None
+        try:
+            r = requests.post(TRANSLATE_API, params={"key": api_key},
+                              json=payload, timeout=60)
+            r.raise_for_status()
+            translations = r.json()["data"]["translations"]
+        except Exception as e:
+            body = ""
+            try:
+                if r is not None:
+                    body = r.text[:400]
+            except Exception:
+                pass
+            msg = (f"google_dub: translate_batch failed at chunk "
+                   f"{chunk_idx + 1}/{len(chunks)} "
+                   f"({len(chunk)} strings, "
+                   f"{sum(len(t) for _, t in chunk)} chars): {e}")
+            if body:
+                msg = f"{msg} body={body}"
+            if raise_on_failure:
+                raise DubError(msg) from e
+            log.warning(f"{msg} — using originals for this chunk")
+            continue  # leave originals in `result` for this chunk
+
+        for (orig_idx, _), tr in zip(chunk, translations):
+            result[orig_idx] = tr.get("translatedText", texts[orig_idx])
+
     return result
 
 
