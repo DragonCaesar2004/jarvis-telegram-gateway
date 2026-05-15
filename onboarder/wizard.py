@@ -54,7 +54,8 @@ STEP_AWAITING_COOKIES_PRE_PHASE2 = "awaiting_cookies_pre_phase2"  # forced refre
 STEP_PHASE2_RUNNING = "phase2_running"
 STEP_DONE = "done"
 STEP_AWAITING_COOKIES = "awaiting_cookies"  # standalone cookies upload (from /menu)
-STEP_ASK_VOICE = "ask_voice"              # gender selection before Phase 1 launch
+STEP_ASK_VOICE = "ask_voice"              # LEGACY: gender selection before Phase 1 launch
+STEP_ASK_VOICE_PHASE2 = "ask_voice_phase2"  # gender selection right before Phase 2 launch
 
 # Inputs that mean "no answer" for optional pain/audience steps.
 _SKIP_TOKENS = {"-", "—", "skip", "/skip", "пропустить", "нет", "no"}
@@ -304,48 +305,20 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
             clear_wizard_state(agent, user_id, thread_id)
             return
 
-        # Ask voice gender before launching Phase 1 (used for dubbing in Phase 2)
+        # Phase 1 doesn't need voice_gender. The dubbing choice happens at
+        # Phase 2 launch — after the operator has seen the actual video set
+        # in the Sheet and can judge whether dubbing is even needed.
         _state.update(agent, user_id, thread_id=thread_id,
-                      count=count, step=STEP_ASK_VOICE)
-        answer_callback_query(token, cq_id)
-        _send_with_buttons(
-            token, chat_id,
-            "🎙 <b>Какой голос использовать для дубляжа на английский?</b>",
-            [[{"text": "👨 Мужской", "callback_data": "wiz:voice_male"},
-              {"text": "👩 Женский", "callback_data": "wiz:voice_female"}]],
-            thread_id=thread_id,
-        )
-        return
-
-    if action in ("voice_male", "voice_female"):
-        voice_gender = "MALE" if action == "voice_male" else "FEMALE"
-        st = _state.load(agent, user_id, thread_id)
-        url_mode = bool(st.get("url_mode"))
-        video_ids = list(st.get("video_ids") or [])
-        topic = st.get("topic") or ""
-        description = st.get("pain", "")
-        count = 1
-
-        if not topic and not (url_mode and video_ids):
-            answer_callback_query(token, cq_id, "Состояние формы потеряно", show_alert=True)
-            clear_wizard_state(agent, user_id, thread_id)
-            return
-
-        _state.update(agent, user_id, thread_id=thread_id,
-                      voice_gender=voice_gender, count=count, step=STEP_PHASE1_RUNNING)
+                      count=count, step=STEP_PHASE1_RUNNING)
         answer_callback_query(token, cq_id, "Phase 1 запущен")
 
-        voice_label = "👨 мужской" if voice_gender == "MALE" else "👩 женский"
-
         if url_mode and video_ids:
-            # Direct URL mode: no YouTube search, enrich provided videos
             try:
                 tg_api(token, "sendMessage", chat_id=chat_id,
                        message_thread_id=thread_id or None,
                        text=(
                            "🔗 <b>Phase 1 запущен (прямые ссылки).</b>\n\n"
-                           f"Видео в обработке: <b>{len(video_ids)}</b>\n"
-                           f"Голос дубляжа: {voice_label}\n\n"
+                           f"Видео в обработке: <b>{len(video_ids)}</b>\n\n"
                            "Скачиваю видео, транскрибирую (Whisper), размечаю вырезки, "
                            "исследую автора и составляю описание курса. "
                            "Тему и названия генерирую автоматически по транскрипту.\n\n"
@@ -381,8 +354,7 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
                    text=(
                        "🔍 <b>Phase 1 запущен.</b>\n\n"
                        f"Тема: <b>{_html_escape(topic)}</b>"
-                       f"{desc_block}\n"
-                       f"Голос дубляжа: {voice_label}\n\n"
+                       f"{desc_block}\n\n"
                        "Phase 1 ищет каналы, скачивает видео, транскрибирует "
                        "(Whisper), размечает вырезки, пишет описания уроков и "
                        "курса, ищет инфу об авторе через WebSearch. На выходе "
@@ -406,6 +378,42 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
                 tg_api(token, "sendMessage", chat_id=chat_id,
                        message_thread_id=thread_id or None,
                        text=f"⚠️ Не удалось запустить Phase 1: {e}")
+            except Exception:
+                pass
+            _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
+        return
+
+    if action in ("voice_male", "voice_female"):
+        # Voice gender selection: now happens right before Phase 2 launch.
+        # See skip_cookies (and the cookies upload handler) for how the user
+        # gets here — both routes set step=STEP_ASK_VOICE_PHASE2 and prompt
+        # for the voice.
+        voice_gender = "MALE" if action == "voice_male" else "FEMALE"
+        _state.update(agent, user_id, thread_id=thread_id,
+                      voice_gender=voice_gender, step=STEP_PHASE2_RUNNING)
+        answer_callback_query(token, cq_id, "Запускаю Phase 2")
+        voice_label = "👨 мужской" if voice_gender == "MALE" else "👩 женский"
+        try:
+            tg_api(token, "sendMessage", chat_id=chat_id,
+                   message_thread_id=thread_id or None,
+                   text=(
+                       f"🎬 <b>Phase 2 запущен.</b>\n\n"
+                       f"Голос дубляжа: {voice_label} "
+                       f"(используется только для не-английских видео)"
+                   ),
+                   parse_mode="HTML")
+        except Exception:
+            pass
+        try:
+            from . import phase2_production
+            phase2_production.launch(token, agent, cfg, chat_id, user_id,
+                                     thread_id=thread_id)
+        except Exception as e:
+            log.exception(f"[{agent}] failed to launch phase2: {e}")
+            try:
+                tg_api(token, "sendMessage", chat_id=chat_id,
+                       message_thread_id=thread_id or None,
+                       text=f"⚠️ Не удалось запустить Phase 2: {e}")
             except Exception:
                 pass
             _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
@@ -436,22 +444,26 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
         return
 
     if action == "skip_cookies":
-        # User asserts cookies are fresh — proceed straight to Phase 2
-        _state.update(agent, user_id, thread_id=thread_id, step=STEP_PHASE2_RUNNING)
-        answer_callback_query(token, cq_id, "Запускаю Phase 2")
-        try:
-            from . import phase2_production
-            phase2_production.launch(token, agent, cfg, chat_id, user_id,
-                                     thread_id=thread_id)
-        except Exception as e:
-            log.exception(f"[{agent}] failed to launch phase2: {e}")
-            try:
-                tg_api(token, "sendMessage", chat_id=chat_id,
-                       message_thread_id=thread_id or None,
-                       text=f"⚠️ Не удалось запустить Phase 2: {e}")
-            except Exception:
-                pass
-            _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
+        # User asserts cookies are fresh — proceed to voice question (instead
+        # of launching Phase 2 directly). Voice is only used for non-English
+        # videos; if none of the approved videos are non-EN we still ask once
+        # for simplicity (the answer is just ignored downstream).
+        _state.update(agent, user_id, thread_id=thread_id,
+                      step=STEP_ASK_VOICE_PHASE2)
+        answer_callback_query(token, cq_id)
+        _send_with_buttons(
+            token, chat_id,
+            text=(
+                "🎙 <b>Какой голос использовать для дубляжа на английский?</b>\n\n"
+                "(применяется только к видео, которые не на английском — "
+                "английские пройдут без озвучки)"
+            ),
+            buttons=[[
+                {"text": "👨 Мужской", "callback_data": "wiz:voice_male"},
+                {"text": "👩 Женский", "callback_data": "wiz:voice_female"},
+            ]],
+            thread_id=thread_id,
+        )
         return
 
     answer_callback_query(token, cq_id)
@@ -558,23 +570,25 @@ def _handle_cookies_upload(token: str, agent: str, cfg: dict,
     current_step = st.get("step")
     prev_step = st.pop("_prev_step", None)
 
-    # Case A: cookies were requested as part of the pre-Phase 2 gate → autostart Phase 2
+    # Case A: cookies were requested as part of the pre-Phase 2 gate.
+    # Move to voice-selection step (voice is asked right before Phase 2 now
+    # that we know the actual approved video set in the Sheet).
     if current_step == STEP_AWAITING_COOKIES_PRE_PHASE2:
-        st["step"] = STEP_PHASE2_RUNNING
+        st["step"] = STEP_ASK_VOICE_PHASE2
         _state.save(agent, user_id, st, thread_id)
-        _send(token, chat_id,
-              f"✅ <b>Cookies обновлены</b> ({size_kb:.1f} KB, {line_count} строк).\n"
-              f"Запускаю Phase 2…",
-              thread_id=thread_id)
-        try:
-            from . import phase2_production
-            phase2_production.launch(token, agent, cfg, chat_id, user_id,
-                                     thread_id=thread_id)
-        except Exception as e:
-            log.exception(f"phase2 autostart after cookies upload failed: {e}")
-            _send(token, chat_id, f"⚠️ Не удалось запустить Phase 2: {e}",
-                  thread_id=thread_id)
-            _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
+        _send_with_buttons(
+            token, chat_id,
+            text=(
+                f"✅ <b>Cookies обновлены</b> ({size_kb:.1f} KB, {line_count} строк).\n\n"
+                f"🎙 <b>Какой голос использовать для дубляжа?</b>\n"
+                f"(применяется только к не-английским видео)"
+            ),
+            buttons=[[
+                {"text": "👨 Мужской", "callback_data": "wiz:voice_male"},
+                {"text": "👩 Женский", "callback_data": "wiz:voice_female"},
+            ]],
+            thread_id=thread_id,
+        )
         return
 
     # Case B: standalone cookies upload during an active run (e.g. user is on
