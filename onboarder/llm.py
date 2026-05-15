@@ -296,7 +296,11 @@ def score_channels(*, topic: str, criteria: dict[str, Any],
         payload["target_audience"] = audience
     user = json.dumps(payload, ensure_ascii=False, indent=2)
     system = SCORE_CHANNELS_SYSTEM + _pain_audience_block(pain, audience)
-    parsed = _call_json(model=model, system=system, user=user)
+    # 15-min timeout: with HARD_CAP_CHANNELS_TO_CHECK at 100, the prompt can
+    # carry 50-100 channels (30K+ tokens). Default 180s isn't enough for Claude
+    # to process this much input; we raise specifically for score_channels so
+    # other callers keep their tighter timeouts.
+    parsed = _call_json(model=model, system=system, user=user, timeout=900)  # 15 min for score_channels
     if not isinstance(parsed, list):
         raise ValueError(f"score_channels: expected list, got {type(parsed).__name__}")
     parsed.sort(key=lambda x: x.get("score", 0), reverse=True)
