@@ -248,8 +248,18 @@ def _call_json(*, model: str, system: str, user: str,
                 text = text[idx:]
                 break
 
+    # Use raw_decode so trailing prose after the JSON object/array doesn't fail
+    # the parse. Claude occasionally appends commentary like "Here's the scoring
+    # explanation..." after the JSON; raw_decode reads the JSON value and tells
+    # us where it ended, ignoring whatever comes after.
     try:
-        return json.loads(text)
+        obj, end_idx = json.JSONDecoder().raw_decode(text)
+        if end_idx < len(text):
+            tail = text[end_idx:].strip()
+            if tail:
+                log.info(f"llm: ignored {len(tail)} chars of trailing text after JSON "
+                         f"(preview: {tail[:120]!r})")
+        return obj
     except json.JSONDecodeError as e:
         log.error(f"llm: JSON parse failed. Raw: {text[:500]}")
         raise ValueError(f"LLM returned non-JSON: {e}")
