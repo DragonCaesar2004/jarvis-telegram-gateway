@@ -40,6 +40,50 @@ def _parse_youtube_urls(text: str) -> list[str]:
     """Extract unique YouTube video IDs from text (space/newline-separated URLs)."""
     return list(dict.fromkeys(_YOUTUBE_URL_RE.findall(text)))
 
+
+def _parse_youtube_url_groups(text: str) -> list[list[str]]:
+    """Split text into course groups by separator lines, return list-of-lists of video_ids.
+
+    A separator line is one whose stripped content is one or more of the
+    same character from {=, -, _, *, #} — e.g.:
+        url1
+        url2
+        ===
+        url3
+        url4
+        ---
+        url5
+
+    Returns 3 groups: [url1,url2], [url3,url4], [url5].
+
+    If there are no separator lines, returns a single group containing all
+    URLs from the text (backward-compatible with single-course paste).
+
+    Empty groups (no valid URLs in a block) are dropped silently. Within each
+    group, video_ids are deduplicated; cross-group duplicates are NOT removed
+    (operator may legitimately want the same video in two courses).
+    """
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        is_sep = bool(s) and len(set(s)) == 1 and s[0] in "=-_*#"
+        if is_sep:
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+        current.append(line)
+    if current:
+        blocks.append(current)
+
+    groups: list[list[str]] = []
+    for block in blocks:
+        vids = _parse_youtube_urls("\n".join(block))
+        if vids:
+            groups.append(vids)
+    return groups
+
 log = logging.getLogger("gateway")
 
 # Form step identifiers
@@ -143,25 +187,55 @@ def handle_wizard_message(token: str, agent: str, cfg: dict, chat_id: int,
                   thread_id=thread_id)
             return
 
-        # URL mode: user pasted YouTube links (space/newline/multi-space separated)
-        video_ids = _parse_youtube_urls(topic)
-        if video_ids:
-            _state.update(agent, user_id, thread_id=thread_id,
-                          url_mode=True, video_ids=video_ids,
-                          topic="", count=1, step=STEP_CONFIRM)
-            url_list = "\n".join(f"  youtu.be/{v}" for v in video_ids[:8])
-            more = f"\n  …и ещё {len(video_ids) - 8}" if len(video_ids) > 8 else ""
-            _send_with_buttons(
-                token, chat_id,
-                f"🔗 <b>Режим прямых ссылок</b>\n\n"
-                f"Распознано видео: <b>{len(video_ids)}</b>\n"
-                f"<code>{url_list}{more}</code>\n\n"
-                f"Тема и описания курса будут сгенерированы автоматически "
-                f"по транскрибации видео. Запустить Phase 1?",
-                [[{"text": "🚀 Поехали", "callback_data": "wiz:start_phase1"},
-                  {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
-                thread_id=thread_id,
-            )
+        # URL mode: user pasted YouTube links.
+        # If they used separator lines (===, ---, ***, ###) → multi-course batch.
+        url_groups = _parse_youtube_url_groups(topic)
+        if url_groups:
+            total = sum(len(g) for g in url_groups)
+            if len(url_groups) == 1:
+                # Single course — preserve the existing wizard state shape
+                # (url_mode + video_ids) so legacy callbacks still work.
+                video_ids = url_groups[0]
+                _state.update(agent, user_id, thread_id=thread_id,
+                              url_mode=True, video_ids=video_ids,
+                              topic="", count=1, step=STEP_CONFIRM)
+                url_list = "\n".join(f"  youtu.be/{v}" for v in video_ids[:8])
+                more = f"\n  …и ещё {len(video_ids) - 8}" if len(video_ids) > 8 else ""
+                _send_with_buttons(
+                    token, chat_id,
+                    f"🔗 <b>Режим прямых ссылок</b>\n\n"
+                    f"Распознано видео: <b>{len(video_ids)}</b>\n"
+                    f"<code>{url_list}{more}</code>\n\n"
+                    f"Тема и описания курса будут сгенерированы автоматически "
+                    f"по транскрибации видео. Запустить Phase 1?",
+                    [[{"text": "🚀 Поехали", "callback_data": "wiz:start_phase1"},
+                      {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
+                    thread_id=thread_id,
+                )
+            else:
+                # Multi-course batch
+                _state.update(agent, user_id, thread_id=thread_id,
+                              url_mode=True, url_groups=url_groups,
+                              video_ids=[], topic="",
+                              count=len(url_groups), step=STEP_CONFIRM)
+                summary = "\n".join(
+                    f"  Курс {i+1}: <b>{len(g)}</b> видео ({', '.join('youtu.be/' + v for v in g[:3])}{', …' if len(g) > 3 else ''})"
+                    for i, g in enumerate(url_groups)
+                )
+                _send_with_buttons(
+                    token, chat_id,
+                    f"🔗 <b>Пакетный режим — {len(url_groups)} курс(ов)</b>\n\n"
+                    f"Всего видео: <b>{total}</b>\n\n"
+                    f"{summary}\n\n"
+                    f"Каждый курс обрабатывается отдельно, темы и описания "
+                    f"генерируются автоматически по транскриптам. "
+                    f"Sheet наполнится последовательно (~10-20 мин на курс). "
+                    f"Запустить Phase 1 для всех {len(url_groups)} курсов?",
+                    [[{"text": f"🚀 Поехали ({len(url_groups)} курсов)",
+                       "callback_data": "wiz:start_phase1"},
+                      {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
+                    thread_id=thread_id,
+                )
             return
 
         # Normal topic flow: ask for description
@@ -295,12 +369,13 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
     if action == "start_phase1":
         st = _state.load(agent, user_id, thread_id)
         url_mode = bool(st.get("url_mode"))
+        url_groups = list(st.get("url_groups") or [])
         video_ids = list(st.get("video_ids") or [])
         topic = st.get("topic") or ""
         description = st.get("pain", "")  # stored under `pain` for back-compat
-        count = 1  # one course per wizard run, always
+        count = max(1, len(url_groups)) if url_groups else 1
 
-        if not topic and not (url_mode and video_ids):
+        if not topic and not (url_mode and (video_ids or url_groups)):
             answer_callback_query(token, cq_id, "Состояние формы потеряно", show_alert=True)
             clear_wizard_state(agent, user_id, thread_id)
             return
@@ -312,6 +387,43 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
                       count=count, step=STEP_PHASE1_RUNNING)
         answer_callback_query(token, cq_id, "Phase 1 запущен")
 
+        # URL multi-batch (operator pasted multiple courses separated by ===/---)
+        if url_mode and url_groups:
+            total = sum(len(g) for g in url_groups)
+            try:
+                tg_api(token, "sendMessage", chat_id=chat_id,
+                       message_thread_id=thread_id or None,
+                       text=(
+                           f"🔗 <b>Phase 1 запущен — пакет из {len(url_groups)} курсов.</b>\n\n"
+                           f"Всего видео: <b>{total}</b>\n\n"
+                           "Курсы обрабатываются последовательно. Каждый: скачивание, "
+                           "Whisper, разметка вырезок, исследование автора, compose. "
+                           "Тему и названия генерирую по транскриптам.\n\n"
+                           f"Примерно <b>~{15 * len(url_groups)}-{30 * len(url_groups)} мин</b> на весь пакет. "
+                           "Можешь вернуться в чат (<code>/menu</code> → 💬 Чат), "
+                           "пришлю одно итоговое сообщение когда всё будет готово."
+                       ),
+                       parse_mode="HTML")
+            except Exception:
+                pass
+            try:
+                from . import phase1_discovery
+                phase1_discovery.launch_from_url_groups(
+                    token, agent, cfg, chat_id, user_id,
+                    url_groups=url_groups, thread_id=thread_id,
+                )
+            except Exception as e:
+                log.exception(f"[{agent}] failed to launch phase1_from_url_groups: {e}")
+                try:
+                    tg_api(token, "sendMessage", chat_id=chat_id,
+                           message_thread_id=thread_id or None,
+                           text=f"⚠️ Не удалось запустить Phase 1: {e}")
+                except Exception:
+                    pass
+                _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
+            return
+
+        # URL single-course mode (legacy single-group input)
         if url_mode and video_ids:
             try:
                 tg_api(token, "sendMessage", chat_id=chat_id,

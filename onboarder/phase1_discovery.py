@@ -876,6 +876,348 @@ def _run_from_urls(token: str, agent: str, cfg: dict, chat_id: int, user_id: int
 
 
 # ---------------------------------------------------------------------------
+# URL multi-batch: process N courses sequentially within one run_id
+# ---------------------------------------------------------------------------
+
+def launch_from_url_groups(token: str, agent: str, cfg: dict, chat_id: int,
+                           user_id: int, url_groups: list[list[str]],
+                           *, thread_id: int = 0) -> None:
+    """Spawn Phase 1 for a batch of URL groups (one course per group).
+
+    Each group's videos become one course_idx within a single shared run_id.
+    Sheet rows for all courses are written at the end so the operator sees a
+    single, complete review payload.
+    """
+    thr = threading.Thread(
+        target=_worker_from_url_groups,
+        args=(token, agent, cfg, chat_id, user_id,
+              [list(g) for g in url_groups], int(thread_id or 0)),
+        name=f"phase1-url-groups-{agent}-{user_id}-{int(thread_id or 0)}",
+        daemon=True,
+    )
+    thr.start()
+
+
+def _worker_from_url_groups(token: str, agent: str, cfg: dict, chat_id: int,
+                            user_id: int, url_groups: list[list[str]],
+                            thread_id: int = 0) -> None:
+    onb = (cfg.get("onboarder") or {})
+    _TLS.thread_id = int(thread_id or 0)
+    try:
+        _run_from_url_groups(token, agent, cfg, chat_id, user_id, url_groups, onb,
+                             thread_id=int(thread_id or 0))
+    except CookiesNeededError as e:
+        log.warning(f"phase1_url_groups: cookies needed: {e}")
+        _state.update(agent, user_id, thread_id=int(thread_id or 0),
+                      step="error", error=f"cookies_needed: {e}")
+        _send_with_buttons(
+            token, chat_id,
+            text=(
+                "⏸ <b>Phase 1 на паузе (нужны cookies).</b>\n\n"
+                f"{_html_escape(str(e))[:500]}\n\n"
+                "Загрузи свежий cookies.txt с youtube.com, потом /menu → 🎓 Новый курс."
+            ),
+            buttons=[[
+                {"text": "📎 Загрузить cookies", "callback_data": "menu:cookies"},
+                {"text": "✖️ Отмена", "callback_data": "wiz:cancel"},
+            ]],
+        )
+    except Exception as e:
+        tb = traceback.format_exc()
+        log.error(f"phase1_url_groups worker crashed: {e}\n{tb}")
+        _state.update(agent, user_id, thread_id=int(thread_id or 0),
+                      step="error", error=str(e))
+        _send(token, chat_id,
+              f"⚠️ <b>Phase 1 упал.</b>\n\n<code>{_html_escape(str(e))[:500]}</code>\n\n"
+              "Используй /cancel для возврата в чат или /menu → 🎓 Новый курс.")
+    finally:
+        _TLS.thread_id = 0
+
+
+def _run_from_url_groups(token: str, agent: str, cfg: dict, chat_id: int,
+                        user_id: int, url_groups: list[list[str]], onb: dict,
+                        *, thread_id: int = 0) -> None:
+    """Multi-course URL batch. Reuses per-course logic via _process_one_url_course."""
+    from collections import Counter
+
+    # ── 1. Resolve secrets and open Sheet (once for entire batch) ─────────
+    sa_path = _secrets.resolve_path(onb, "google_service_account")
+    sheet_id = onb.get("google_sheet_id") or ""
+    if not sheet_id:
+        raise RuntimeError("config: onboarder.google_sheet_id not set")
+    openai_key = _secrets.resolve(onb, "openai_api_key", env="OPENAI_API_KEY")
+    youtube_cookies_file = onb.get("youtube_cookies_file") or None
+    proxy_pool_list = proxy_pool.normalise_pool(
+        onb.get("youtube_proxies") or onb.get("youtube_proxy")
+    )
+    parallel_per_course = int(onb.get("phase1_parallel_per_course") or 4)
+    compose_model = (onb.get("models") or {}).get("compose") or llm.DEFAULT_MODEL_QUALITY
+
+    client = sheets.open_client(sa_path)
+    sheets.ensure_lessons_tab(client, sheet_id)
+
+    run_id = sheets.make_run_id()
+    _state.update(agent, user_id, thread_id=int(thread_id or 0),
+                  run_id=run_id, step="phase1_running",
+                  topic=f"(URL batch: {len(url_groups)} courses)",
+                  count=len(url_groups), chat_id=chat_id,
+                  sheet_url=sheets.sheet_url(sheet_id))
+
+    # ── 2. Init proxy rotator (once) ──────────────────────────────────────
+    rotator = proxy_pool.ProxyRotator(proxy_pool_list, cookies_file=youtube_cookies_file)
+    if proxy_pool_list:
+        _send(token, chat_id,
+              f"🔍 Проверяю {len(proxy_pool_list)} прокси на YouTube…")
+        last_progress = [time.time()]
+        results: list[str] = []
+
+        def _on_probe(idx: int, total: int, name: str, ok: bool) -> None:
+            results.append(f"{'✅' if ok else '❌'} {idx}/{total} {name}")
+            now = time.time()
+            if ok or now - last_progress[0] > 15 or idx == total:
+                _send(token, chat_id, "\n".join(results[-12:]))
+                last_progress[0] = now
+
+        try:
+            rotator.init(on_progress=_on_probe)
+            _send(token, chat_id,
+                  f"✅ Прокси готов: <code>{proxy_pool._proxy_label(rotator.current)}</code>")
+        except proxy_pool.NoWorkingProxyError as e:
+            raise RuntimeError(
+                f"Ни один прокси не прошёл проверку YouTube.\n\n{str(e)[:600]}"
+            )
+    else:
+        _send(token, chat_id, "⚠️ Прокси не настроен — пробую напрямую с VPS-IP")
+
+    # ── 3. Loop over course groups, enrich each, accumulate rows ──────────
+    all_lesson_rows: list[dict[str, Any]] = []
+    course_summaries: list[str] = []
+    courses_done = 0
+    courses_failed: list[str] = []
+
+    for course_idx, video_ids in enumerate(url_groups, start=1):
+        _send(token, chat_id,
+              f"\n📚 <b>Курс {course_idx}/{len(url_groups)}</b> — {len(video_ids)} видео")
+        # Re-read active video_ids from Sheet on EACH course iteration —
+        # earlier courses in this batch just wrote rows that need to be
+        # respected by later courses' dedup check.
+        active_video_ids = sheets.get_active_video_ids(client, sheet_id)
+        try:
+            course_rows, summary = _process_one_url_course(
+                course_idx=course_idx, run_id=run_id, video_ids=video_ids,
+                active_video_ids=active_video_ids,
+                openai_key=openai_key, cookies_file=youtube_cookies_file,
+                rotator=rotator, parallel_per_course=parallel_per_course,
+                compose_model=compose_model, token=token, chat_id=chat_id,
+            )
+        except CookiesNeededError:
+            raise  # propagate to worker handler
+        except Exception as e:
+            log.error(f"course {course_idx} crashed: {e}", exc_info=True)
+            _send(token, chat_id,
+                  f"⚠️ Курс {course_idx} упал: <code>{_html_escape(str(e))[:200]}</code>. "
+                  f"Продолжаю со следующими.")
+            courses_failed.append(f"Курс {course_idx}: {str(e)[:80]}")
+            continue
+
+        if not course_rows:
+            courses_failed.append(f"Курс {course_idx}: нет уроков после обработки")
+            continue
+
+        all_lesson_rows.extend(course_rows)
+        course_summaries.append(summary)
+        courses_done += 1
+
+        # Write rows incrementally per-course so progress is visible in Sheet
+        # even if a later course in the batch crashes.
+        with sheets.sheet_lock():
+            latest_seen = sheets.get_active_video_ids(client, sheet_id)
+            new_rows = [r for r in course_rows
+                        if r.get("video_id") not in latest_seen]
+            if new_rows:
+                sheets.append_lesson_rows(client, sheet_id, run_id=run_id,
+                                          rows=new_rows)
+
+    if not all_lesson_rows:
+        raise RuntimeError(
+            "Ни один курс из пакета не дал валидных уроков. "
+            + ("\n".join(courses_failed) if courses_failed else "")
+        )
+
+    _state.update(agent, user_id, thread_id=int(thread_id or 0),
+                  step="awaiting_approval",
+                  courses_summary=course_summaries)
+
+    # ── 4. Final Telegram message with action button ──────────────────────
+    sheet_url = sheets.sheet_url(sheet_id)
+    summary_text = "\n".join(f"  {s}" for s in course_summaries)
+    fail_text = ""
+    if courses_failed:
+        fail_text = "\n\n⚠️ <b>Упавшие курсы:</b>\n" + "\n".join(
+            f"  • {_html_escape(f)}" for f in courses_failed)
+    _send_with_buttons(
+        token, chat_id,
+        text=(
+            f"✅ <b>Phase 1 готов (пакетный режим).</b>\n\n"
+            f"Успешных курсов: <b>{courses_done}/{len(url_groups)}</b>\n"
+            f"Всего уроков: <b>{len(all_lesson_rows)}</b>\n\n"
+            f"{summary_text}{fail_text}\n\n"
+            f"📋 Открой таб <b>Lessons</b>, проверь описания, "
+            f"отметь <b>Approved=TRUE</b> у нужных строк:\n"
+            f"{sheet_url}\n\n"
+            f"Когда готов — нажми кнопку:"
+        ),
+        buttons=[[{"text": f"🚀 Запустить обработку ({courses_done} курсов)",
+                   "callback_data": "wiz:start_phase2"},
+                  {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
+    )
+
+
+def _process_one_url_course(*, course_idx: int, run_id: str,
+                            video_ids: list[str],
+                            active_video_ids: set[str],
+                            openai_key: str, cookies_file: str | None,
+                            rotator: proxy_pool.ProxyRotator,
+                            parallel_per_course: int, compose_model: str,
+                            token: str, chat_id: int,
+                            ) -> tuple[list[dict[str, Any]], str]:
+    """Process ONE course of a URL batch. Returns (sheet_rows, summary_str).
+
+    Mirrors the per-course steps from _run_from_urls but with the course_idx
+    threaded through everywhere so multi-batch Sheet rows are properly tagged.
+    """
+    from collections import Counter
+
+    # Dedup vs Sheet
+    new_video_ids = [v for v in video_ids if v not in active_video_ids]
+    skipped = len(video_ids) - len(new_video_ids)
+    if skipped:
+        _send(token, chat_id,
+              f"  ♻️ Курс {course_idx}: пропущено {skipped} дублей из Sheet")
+    if not new_video_ids:
+        raise RuntimeError(
+            f"Курс {course_idx}: все {len(video_ids)} видео уже в Sheet")
+
+    # Fetch metadata
+    _send(token, chat_id,
+          f"  📋 Курс {course_idx}: метаданные {len(new_video_ids)} видео…")
+    proxy_current = rotator.current if rotator else None
+    videos_metadata: dict[str, Any] = {}
+    for vid in new_video_ids:
+        meta = ytdl.get_video_metadata(
+            vid, cookies_file=cookies_file, proxy=proxy_current)
+        if meta:
+            videos_metadata[vid] = meta
+    if not videos_metadata:
+        raise RuntimeError(
+            f"Курс {course_idx}: не получил метаданные ни одного видео")
+
+    # Determine nominal channel
+    ch_counts: Counter[str] = Counter(
+        m.get("channel_id") for m in videos_metadata.values() if m.get("channel_id")
+    )
+    dominant_ch_id = ch_counts.most_common(1)[0][0] if ch_counts else "user-provided"
+    dominant_ch_meta = next(
+        (m for m in videos_metadata.values() if m.get("channel_id") == dominant_ch_id),
+        {},
+    )
+    channel_name = dominant_ch_meta.get("channel_name") or "User-provided"
+    channel_description = dominant_ch_meta.get("description") or ""
+    channel_id = dominant_ch_id
+    if len(ch_counts) > 1:
+        names = ", ".join(m.get("channel_name", "?")
+                          for m in list(videos_metadata.values())[:3])
+        channel_name = f"Mixed ({names})"
+        channel_id = "mixed"
+
+    selected_videos = [
+        {
+            "video_id": vid,
+            "title": videos_metadata[vid].get("title") or f"Video {i + 1}",
+            "order": i,
+            "reason": "user-provided URL",
+        }
+        for i, vid in enumerate(new_video_ids)
+        if vid in videos_metadata
+    ]
+    if not selected_videos:
+        raise RuntimeError(f"Курс {course_idx}: нет пригодных видео")
+
+    titles_hint = ", ".join(v["title"][:40] for v in selected_videos[:4])
+    if len(selected_videos) > 4:
+        titles_hint += "…"
+    course_topic_input = f"Course from: {titles_hint}"
+
+    _send(token, chat_id,
+          f"  🎬 Курс {course_idx} — <b>{_html_escape(channel_name)}</b>: "
+          f"скачиваю + транскрибирую + compose ({len(selected_videos)} видео)…")
+
+    enriched = phase1_enrich.enrich_course(
+        course_idx=course_idx, run_id=run_id,
+        channel_id=channel_id, channel_name=channel_name,
+        channel_description=channel_description,
+        course_topic_input=course_topic_input,
+        course_title_from_llm="",  # compose will generate
+        selected_videos=selected_videos,
+        videos_metadata=videos_metadata,
+        openai_key=openai_key, cookies_file=cookies_file, rotator=rotator,
+        on_progress=lambda msg: _send(token, chat_id,
+                                      f"  [Курс {course_idx}] {_html_escape(msg)}"),
+        max_parallel=parallel_per_course,
+        compose_model=compose_model,
+    )
+
+    if not enriched.get("videos"):
+        raise RuntimeError(f"Курс {course_idx}: ни одно видео не прошло обогащение")
+
+    final_title = enriched.get("course_title") or channel_name
+    full_title = f"Курс {course_idx}: {channel_name} — {final_title}"
+    course_label = f"Курс {course_idx}"
+
+    rows: list[dict[str, Any]] = []
+    for v in enriched["videos"]:
+        is_first = (v["lesson_idx"] == 1)
+        rows.append({
+            "course": full_title if is_first else course_label,
+            "lesson_idx": v["lesson_idx"],
+            "channel": channel_name,
+            "lesson_title": v["title"],
+            "url": v["url"],
+            "duration_sec": v.get("duration_sec", 0),
+            "video_id": v["video_id"],
+            "channel_id": channel_id,
+            "course_idx": course_idx,
+            "lesson_description": v.get("lesson_description", ""),
+            "lesson_description_ru": v.get("lesson_description_ru", ""),
+            "transcript_excerpt": v.get("transcript_excerpt", ""),
+            "course_description": enriched.get("course_description", "") if is_first else "",
+            "course_tagline": enriched.get("course_tagline", "") if is_first else "",
+            "course_what_you_learn": enriched.get("course_what_you_learn", "") if is_first else "",
+            "course_target_audience": enriched.get("course_target_audience", "") if is_first else "",
+            "author_name": enriched.get("author_name", "") if is_first else "",
+            "author_bio": enriched.get("author_bio", "") if is_first else "",
+            "author_expertise": enriched.get("author_expertise", "") if is_first else "",
+            "course_title": (final_title if is_first else ""),
+            "course_about": enriched.get("course_about", "") if is_first else "",
+            "course_plan": enriched.get("course_plan", "") if is_first else "",
+            "course_science": enriched.get("course_science", "") if is_first else "",
+            "course_description_ru": enriched.get("course_description_ru", "") if is_first else "",
+            "course_tagline_ru": enriched.get("course_tagline_ru", "") if is_first else "",
+            "course_what_you_learn_ru": enriched.get("course_what_you_learn_ru", "") if is_first else "",
+            "course_target_audience_ru": enriched.get("course_target_audience_ru", "") if is_first else "",
+            "author_bio_ru": enriched.get("author_bio_ru", "") if is_first else "",
+            "author_expertise_ru": enriched.get("author_expertise_ru", "") if is_first else "",
+        })
+
+    summary = (f"{course_idx}. {final_title} "
+               f"({len(enriched['videos'])} уроков, {channel_name})")
+    _send(token, chat_id,
+          f"  ✅ Курс {course_idx} готов: <b>{_html_escape(final_title)}</b> "
+          f"({len(enriched['videos'])} уроков)")
+    return rows, summary
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
