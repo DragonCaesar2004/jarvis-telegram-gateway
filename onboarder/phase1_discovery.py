@@ -134,7 +134,25 @@ def _worker(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
 def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
          topic: str, count: int, onb: dict,
          *, pain: str = "", audience: str = "",
-         thread_id: int = 0) -> None:
+         thread_id: int = 0,
+         batch_run_id: str | None = None,
+         batch_course_idx_offset: int = 0,
+         batch_silent_finish: bool = False) -> int:
+    """Run topic-mode Phase 1 for ONE topic.
+
+    Standalone use returns 0 (caller doesn't need a value).
+
+    Batch use (when batch_run_id is provided):
+      - Reuses the given run_id instead of generating a new one
+      - course_idx in Sheet rows is offset by batch_course_idx_offset
+        (so e.g. topic #3 in a batch starts at course_idx=3, not 1)
+      - If batch_silent_finish=True, skips the final "Phase 1 готов" button
+        and the wizard state→awaiting_approval update — the batch caller
+        does that once after all topics finish
+      - Returns the number of courses (rows-with-lesson-idx-1) actually
+        written to Sheet for this topic, so the caller can advance the
+        course_idx offset for the next topic in the batch
+    """
     # ── 1. Resolve secrets and open Sheet ────────────────────────────────
     # Anthropic API key not needed: llm.py uses `claude -p` CLI via Max OAuth.
     sa_path = _secrets.resolve_path(onb, "google_service_account")
@@ -165,7 +183,9 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
              f"{len(blocked_channel_ids)} channels previously seen in Sheet — "
              f"deduping these (any status, including rejected/failed/legacy_import)")
 
-    run_id = sheets.make_run_id()
+    # Batch mode reuses the caller's run_id so all topics in the batch
+    # land under the same run grouping in the Sheet.
+    run_id = batch_run_id or sheets.make_run_id()
     _state.update(agent, user_id, thread_id=int(thread_id or 0),
                   run_id=run_id,
                   step="phase1_running",
@@ -347,7 +367,9 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     all_lesson_rows: list[dict[str, Any]] = []
     course_summaries: list[str] = []
     skipped_total = 0
-    course_idx = 0
+    # Batch mode offsets course_idx so each topic's course gets a unique
+    # course_idx within the shared run_id (topic #1 → idx 1, topic #2 → idx 2…).
+    course_idx = batch_course_idx_offset
     successful_courses = 0
     skip_reasons: list[str] = []  # for the final failure message if zero succeed
     for ch in candidate_channels:
@@ -564,11 +586,18 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         if rows_to_write:
             sheets.append_lesson_rows(client, sheet_id, run_id=run_id,
                                       rows=rows_to_write)
+    if late_dedup_skipped:
+        skipped_total += late_dedup_skipped
+
+    # Batch mode: caller (launch_topic_batch) handles state update and final
+    # button after ALL topics in the batch finish. Return how many courses
+    # this topic produced so the caller can advance course_idx for the next.
+    if batch_silent_finish:
+        return successful_courses
+
     _state.update(agent, user_id, thread_id=int(thread_id or 0),
                   step="awaiting_approval",
                   courses_summary=course_summaries)
-    if late_dedup_skipped:
-        skipped_total += late_dedup_skipped
 
     # ── 8. Final Telegram message with action button ─────────────────────
     sheet_url = sheets.sheet_url(sheet_id)
@@ -588,6 +617,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         buttons=[[{"text": "🚀 Запустить обработку", "callback_data": "wiz:start_phase2"},
                   {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
     )
+    return successful_courses
 
 
 # ---------------------------------------------------------------------------
@@ -1215,6 +1245,161 @@ def _process_one_url_course(*, course_idx: int, run_id: str,
           f"  ✅ Курс {course_idx} готов: <b>{_html_escape(final_title)}</b> "
           f"({len(enriched['videos'])} уроков)")
     return rows, summary
+
+
+# ---------------------------------------------------------------------------
+# Topic multi-batch: run topic-mode Phase 1 sequentially for N topics
+# ---------------------------------------------------------------------------
+
+def launch_topic_batch(token: str, agent: str, cfg: dict, chat_id: int,
+                       user_id: int, topic_groups: list[dict[str, str]],
+                       *, thread_id: int = 0) -> None:
+    """Spawn Phase 1 worker that processes N topic+description pairs sequentially.
+
+    Each topic becomes one course_idx within a shared run_id. After all topics
+    are processed, one consolidated "Запустить обработку" button is sent.
+    """
+    thr = threading.Thread(
+        target=_worker_topic_batch,
+        args=(token, agent, cfg, chat_id, user_id,
+              [dict(tg) for tg in topic_groups], int(thread_id or 0)),
+        name=f"phase1-topic-batch-{agent}-{user_id}-{int(thread_id or 0)}",
+        daemon=True,
+    )
+    thr.start()
+
+
+def _worker_topic_batch(token: str, agent: str, cfg: dict, chat_id: int,
+                        user_id: int, topic_groups: list[dict[str, str]],
+                        thread_id: int = 0) -> None:
+    onb = (cfg.get("onboarder") or {})
+    _TLS.thread_id = int(thread_id or 0)
+    try:
+        _run_topic_batch(token, agent, cfg, chat_id, user_id, topic_groups, onb,
+                         thread_id=int(thread_id or 0))
+    except CookiesNeededError as e:
+        log.warning(f"phase1_topic_batch: cookies needed: {e}")
+        _state.update(agent, user_id, thread_id=int(thread_id or 0),
+                      step="error", error=f"cookies_needed: {e}")
+        _send_with_buttons(
+            token, chat_id,
+            text=(
+                "⏸ <b>Phase 1 на паузе (нужны cookies).</b>\n\n"
+                f"{_html_escape(str(e))[:500]}\n\n"
+                "Загрузи свежий cookies.txt с youtube.com, потом /menu → 🎓 Новый курс."
+            ),
+            buttons=[[
+                {"text": "📎 Загрузить cookies", "callback_data": "menu:cookies"},
+                {"text": "✖️ Отмена", "callback_data": "wiz:cancel"},
+            ]],
+        )
+    except Exception as e:
+        tb = traceback.format_exc()
+        log.error(f"phase1_topic_batch worker crashed: {e}\n{tb}")
+        _state.update(agent, user_id, thread_id=int(thread_id or 0),
+                      step="error", error=str(e))
+        _send(token, chat_id,
+              f"⚠️ <b>Phase 1 упал.</b>\n\n<code>{_html_escape(str(e))[:500]}</code>\n\n"
+              "Используй /cancel для возврата в чат или /menu → 🎓 Новый курс.")
+    finally:
+        _TLS.thread_id = 0
+
+
+def _run_topic_batch(token: str, agent: str, cfg: dict, chat_id: int,
+                     user_id: int, topic_groups: list[dict[str, str]], onb: dict,
+                     *, thread_id: int = 0) -> None:
+    """Sequentially run topic-mode Phase 1 for each topic in the batch.
+
+    Reuses one shared run_id. Each topic's course gets a unique course_idx
+    via the batch_course_idx_offset param on _run. Sheet rows are written
+    incrementally by each _run call (no extra accumulation needed here)
+    so partial progress survives mid-batch crashes.
+    """
+    sheet_id = onb.get("google_sheet_id") or ""
+    if not sheet_id:
+        raise RuntimeError("config: onboarder.google_sheet_id not set")
+
+    # Generate ONE run_id for the whole batch. Each topic's call to _run
+    # reuses it (via batch_run_id) so all rows land under the same group.
+    run_id = sheets.make_run_id()
+
+    _state.update(agent, user_id, thread_id=int(thread_id or 0),
+                  run_id=run_id,
+                  step="phase1_running",
+                  topic=f"(topic batch: {len(topic_groups)} courses)",
+                  count=len(topic_groups),
+                  chat_id=chat_id,
+                  sheet_url=sheets.sheet_url(sheet_id))
+
+    completed_topics: list[str] = []
+    failed_topics: list[str] = []
+    course_idx_offset = 0  # advances by number of courses produced per topic
+
+    for topic_idx, tg in enumerate(topic_groups, start=1):
+        topic = (tg.get("topic") or "").strip()
+        pain = (tg.get("pain") or "").strip()
+        if not topic:
+            continue
+
+        _send(token, chat_id,
+              f"\n📚 <b>Тема {topic_idx}/{len(topic_groups)}: "
+              f"{_html_escape(topic)}</b>")
+
+        try:
+            courses_made = _run(
+                token, agent, cfg, chat_id, user_id,
+                topic=topic, count=1, onb=onb,
+                pain=pain, audience="",
+                thread_id=thread_id,
+                batch_run_id=run_id,
+                batch_course_idx_offset=course_idx_offset,
+                batch_silent_finish=True,
+            )
+            course_idx_offset += int(courses_made or 0)
+            if courses_made:
+                completed_topics.append(f"  ✓ Тема {topic_idx}: «{topic}» ({courses_made} курс)")
+            else:
+                failed_topics.append(f"  ✗ Тема {topic_idx}: «{topic}» — 0 курсов")
+        except CookiesNeededError:
+            raise  # propagate to outer worker
+        except Exception as e:
+            log.error(f"topic batch: topic {topic_idx} «{topic}» failed: {e}",
+                      exc_info=True)
+            _send(token, chat_id,
+                  f"⚠️ Тема {topic_idx} «{_html_escape(topic)}» упала: "
+                  f"<code>{_html_escape(str(e))[:200]}</code>. Продолжаю.")
+            failed_topics.append(f"  ✗ Тема {topic_idx}: «{topic}» — {str(e)[:80]}")
+            continue
+
+    if not completed_topics:
+        raise RuntimeError(
+            "Ни одна тема из пакета не дала курсов.\n"
+            + "\n".join(failed_topics)
+        )
+
+    # Final state + button (only here, not per topic)
+    _state.update(agent, user_id, thread_id=int(thread_id or 0),
+                  step="awaiting_approval",
+                  courses_summary=completed_topics)
+
+    sheet_url = sheets.sheet_url(sheet_id)
+    success_block = "\n".join(completed_topics)
+    fail_block = ("\n\n⚠️ <b>Не сработали:</b>\n" + "\n".join(failed_topics)
+                  if failed_topics else "")
+    _send_with_buttons(
+        token, chat_id,
+        text=(
+            f"✅ <b>Phase 1 готов (пакет тем).</b>\n\n"
+            f"Успешных: <b>{len(completed_topics)}/{len(topic_groups)}</b>\n\n"
+            f"{success_block}{fail_block}\n\n"
+            f"📋 Открой <b>Lessons</b>, отметь <b>Approved=TRUE</b> у нужных строк:\n"
+            f"{sheet_url}\n\n"
+            f"Когда готов — нажми кнопку:"
+        ),
+        buttons=[[{"text": f"🚀 Запустить обработку",
+                   "callback_data": "wiz:start_phase2"},
+                  {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
+    )
 
 
 # ---------------------------------------------------------------------------

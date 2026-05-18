@@ -41,6 +41,50 @@ def _parse_youtube_urls(text: str) -> list[str]:
     return list(dict.fromkeys(_YOUTUBE_URL_RE.findall(text)))
 
 
+def _parse_topic_groups(text: str) -> list[dict[str, str]]:
+    """Split topic+description text by separator lines into a list of courses.
+
+    Each block (between separator lines of =/-/_/*/#) becomes one course.
+    Within a block:
+      - first non-empty line  → `topic`
+      - remaining lines       → `pain` (description)
+
+    Returns list of {"topic": str, "pain": str}. Empty blocks dropped.
+    Example input:
+        Kegel yoga для мужчин
+        Курс должен включать упражнения тазового дна
+        ===
+        Постпартум восстановление
+        Для мам после родов
+    → [{"topic": "Kegel yoga для мужчин", "pain": "Курс должен включать..."},
+        {"topic": "Постпартум восстановление", "pain": "Для мам после родов"}]
+    """
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        is_sep = bool(s) and len(set(s)) == 1 and s[0] in "=-_*#"
+        if is_sep:
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+        current.append(line)
+    if current:
+        blocks.append(current)
+
+    out: list[dict[str, str]] = []
+    for block in blocks:
+        non_empty = [line for line in block if line.strip()]
+        if not non_empty:
+            continue
+        topic = non_empty[0].strip()
+        pain = "\n".join(non_empty[1:]).strip()
+        if topic:
+            out.append({"topic": topic, "pain": pain})
+    return out
+
+
 def _parse_youtube_url_groups(text: str) -> list[list[str]]:
     """Split text into course groups by separator lines, return list-of-lists of video_ids.
 
@@ -238,6 +282,35 @@ def handle_wizard_message(token: str, agent: str, cfg: dict, chat_id: int,
                 )
             return
 
+        # Multi-topic batch: separator lines present in plain text → each block
+        # is a topic with optional description. Skip the per-topic STEP_ASK_PAIN
+        # since the description is already in each block.
+        topic_groups = _parse_topic_groups(topic)
+        if len(topic_groups) >= 2:
+            _state.update(agent, user_id, thread_id=thread_id,
+                          topic_groups=topic_groups,
+                          topic="", pain="",
+                          count=len(topic_groups), step=STEP_CONFIRM)
+            summary = "\n".join(
+                f"  Курс {i+1}: <b>{_html_escape(tg['topic'])}</b>"
+                + (f"\n    <i>{_html_escape(tg['pain'][:120])}{'…' if len(tg['pain']) > 120 else ''}</i>"
+                   if tg.get('pain') else "")
+                for i, tg in enumerate(topic_groups)
+            )
+            _send_with_buttons(
+                token, chat_id,
+                f"📦 <b>Пакетный режим тем — {len(topic_groups)} курс(ов)</b>\n\n"
+                f"{summary}\n\n"
+                f"Каждый курс пойдёт через полную Phase 1: поиск YouTube-каналов "
+                f"по теме, отбор видео, транскрибация, compose. "
+                f"~20-40 мин на курс. Запустить?",
+                [[{"text": f"🚀 Поехали ({len(topic_groups)} курсов)",
+                   "callback_data": "wiz:start_phase1"},
+                  {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
+                thread_id=thread_id,
+            )
+            return
+
         # Normal topic flow: ask for description
         _state.update(agent, user_id, thread_id=thread_id,
                       topic=topic, step=STEP_ASK_PAIN)
@@ -370,12 +443,21 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
         st = _state.load(agent, user_id, thread_id)
         url_mode = bool(st.get("url_mode"))
         url_groups = list(st.get("url_groups") or [])
+        topic_groups = list(st.get("topic_groups") or [])
         video_ids = list(st.get("video_ids") or [])
         topic = st.get("topic") or ""
         description = st.get("pain", "")  # stored under `pain` for back-compat
-        count = max(1, len(url_groups)) if url_groups else 1
+        if url_groups:
+            count = len(url_groups)
+        elif topic_groups:
+            count = len(topic_groups)
+        else:
+            count = 1
 
-        if not topic and not (url_mode and (video_ids or url_groups)):
+        has_input = (topic
+                     or (url_mode and (video_ids or url_groups))
+                     or topic_groups)
+        if not has_input:
             answer_callback_query(token, cq_id, "Состояние формы потеряно", show_alert=True)
             clear_wizard_state(agent, user_id, thread_id)
             return
@@ -386,6 +468,41 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
         _state.update(agent, user_id, thread_id=thread_id,
                       count=count, step=STEP_PHASE1_RUNNING)
         answer_callback_query(token, cq_id, "Phase 1 запущен")
+
+        # Topic multi-batch (operator pasted multiple TOPICS separated by ===)
+        if topic_groups and not url_mode:
+            try:
+                tg_api(token, "sendMessage", chat_id=chat_id,
+                       message_thread_id=thread_id or None,
+                       text=(
+                           f"🔍 <b>Phase 1 запущен — пакет из {len(topic_groups)} тем.</b>\n\n"
+                           "Каждая тема пройдёт полную Phase 1: поиск YouTube-каналов, "
+                           "скоринг через Claude, отбор видео, скачивание, "
+                           "транскрибация, compose. Курсы пишутся в Sheet по ходу.\n\n"
+                           f"Примерно <b>~{20 * len(topic_groups)}-{40 * len(topic_groups)} мин</b> "
+                           "на весь пакет. Можешь вернуться в чат "
+                           "(<code>/menu</code> → 💬 Чат), пришлю одно итоговое "
+                           "сообщение когда всё будет готово."
+                       ),
+                       parse_mode="HTML")
+            except Exception:
+                pass
+            try:
+                from . import phase1_discovery
+                phase1_discovery.launch_topic_batch(
+                    token, agent, cfg, chat_id, user_id,
+                    topic_groups=topic_groups, thread_id=thread_id,
+                )
+            except Exception as e:
+                log.exception(f"[{agent}] failed to launch phase1_topic_batch: {e}")
+                try:
+                    tg_api(token, "sendMessage", chat_id=chat_id,
+                           message_thread_id=thread_id or None,
+                           text=f"⚠️ Не удалось запустить Phase 1: {e}")
+                except Exception:
+                    pass
+                _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
+            return
 
         # URL multi-batch (operator pasted multiple courses separated by ===/---)
         if url_mode and url_groups:
