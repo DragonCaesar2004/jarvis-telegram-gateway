@@ -112,6 +112,46 @@ def _lang_instruction(output_lang: str) -> str:
     )
 
 
+# Universal ban — appended to every user-facing prompt (compose, research_author,
+# describe_lessons). The published course must read as native to the platform;
+# the student must never learn how it was assembled.
+NO_ORIGIN_DISCLOSURE_RULES = """
+
+## STRICT PUBLISHING RULES — ABSOLUTE BANS
+
+The course is sold on an independent education platform. The student does NOT
+know — and must NEVER be told — anything about how the content was assembled
+or where it originated. Apply these bans to every user-facing field you produce
+(course excerpt, aboutContent, plan, science, curriculum descriptions,
+testimonials, author bio, author expertise, lesson descriptions, etc.):
+
+1. **NEVER write the word "YouTube"** anywhere, in any field.
+2. **NEVER mention the instructor's channel, subscribers, views, follower
+   count, social-media presence, online following, or any external platform**.
+   No "follow her on Instagram", "her popular YouTube channel", "click the
+   link below", "subscribe", "in the description", etc.
+3. **NEVER imply the course is curated, compiled, assembled, selected, or
+   sourced** from existing material. No "curated from his most popular
+   sessions", "selected from her library", "based on her YouTube series".
+4. **NEVER reference external URLs, websites, social handles, or "the link
+   in the description".** The course is self-contained on this platform.
+5. **Refer to content units as "lessons", "sessions", "classes", "practices",
+   or "modules"** — never as "videos", "uploads", "episodes from the channel".
+6. **Author bios describe a teacher's credentials, experience, methodology,
+   and pedagogy** — NOT their online metrics or platform presence. Books,
+   degrees, certifications, clinical practice, teaching tenure — yes.
+   Subscriber counts, viral videos, channel growth — no.
+7. **Strip all phrases like "subscribe", "click the link", "in the
+   description", "follow me on..."** even when they appear in the source
+   transcripts. Those are filler the speaker added to their original recording;
+   they do not belong in the published course.
+
+These bans override anything in the source materials. If a transcript opens
+with "Welcome back to my channel" or closes with "subscribe and ring the
+bell", that text is NOT part of the published lesson.
+"""
+
+
 def _pain_audience_block(pain: str, audience: str) -> str:
     """Return an extra system-prompt block describing operator-specified
     course direction and (optionally) target audience. Empty when both blank.
@@ -521,14 +561,17 @@ def describe_lessons(*, course_topic: str, course_title: str,
 
     system = (DESCRIBE_LESSONS_SYSTEM
               + _pain_audience_block(pain, audience)
-              + _lang_instruction(output_lang))
+              + _lang_instruction(output_lang)
+              + NO_ORIGIN_DISCLOSURE_RULES)
     parsed = _call_json(model=model, system=system, user=user,
                         max_tokens=4096)
     if not isinstance(parsed, list):
         raise ValueError(f"describe_lessons: expected list, got {type(parsed).__name__}")
 
-    # Defensive: backfill any missing entries
-    by_order = {int(p.get("order", -1)): str(p.get("description", "")).strip()
+    # Defensive: backfill any missing entries. Strip any origin-disclosure
+    # sentences (YouTube/channel/subscribe etc) before passing through.
+    by_order = {int(p.get("order", -1)):
+                _strip_origin_sentences(str(p.get("description", "")).strip())
                 for p in parsed if isinstance(p, dict)}
     out: list[dict[str, Any]] = []
     for l in lessons:
@@ -674,7 +717,8 @@ def research_author(*, channel_name: str, channel_description: str,
 
     system = (RESEARCH_AUTHOR_SYSTEM
               + _pain_audience_block(pain, audience)
-              + _lang_instruction(output_lang))
+              + _lang_instruction(output_lang)
+              + NO_ORIGIN_DISCLOSURE_RULES)
     try:
         parsed = _call_json(model=model, system=system, user=user,
                             timeout=timeout)
@@ -686,20 +730,27 @@ def research_author(*, channel_name: str, channel_description: str,
         log.warning(f"llm.research_author: non-dict result for {channel_name}: {parsed!r}")
         return _author_fallback(channel_name, channel_description)
 
+    # Strip any sentences that mention YouTube / channel / subscribers — the
+    # bio that goes to the platform must read as a normal teacher's bio.
+    bio = _strip_origin_sentences(str(parsed.get("bio") or "").strip())
+    expertise = _strip_origin_sentences(str(parsed.get("expertise") or "").strip())
     return {
         "name": str(parsed.get("name") or channel_name).strip(),
-        "bio": str(parsed.get("bio") or "").strip(),
-        "expertise": str(parsed.get("expertise") or "").strip(),
+        "bio": bio,
+        "expertise": expertise,
         "confidence": str(parsed.get("confidence") or "low").strip().lower(),
         "sources": [s for s in (parsed.get("sources") or []) if isinstance(s, str)][:10],
     }
 
 
 def _author_fallback(channel_name: str, channel_description: str) -> dict[str, Any]:
-    """Cheap fallback when WebSearch / LLM fails — keeps pipeline alive."""
-    desc = (channel_description or "").strip()[:300]
+    """Cheap fallback when WebSearch / LLM fails — keeps pipeline alive.
+
+    Bio must NOT mention YouTube / channel / external platform.
+    """
+    desc = _strip_origin_sentences((channel_description or "").strip())[:300]
     bio = (desc if desc else
-           f"{channel_name} runs an educational YouTube channel covering this topic.")
+           f"{channel_name} is a teacher specializing in this subject area.")
     return {
         "name": channel_name,
         "bio": bio,
@@ -867,10 +918,30 @@ rating: 5
 Rules:
 - Generate 5-8 testimonials
 - Each review MUST have: `name:` (required), `text:` (required, multiline ok), `rating:` (always 5)
-- Use diverse, realistic first+last names
-- Make reviews specific to the course content — mention particular lessons, techniques, or outcomes
-- Vary review length (1-4 sentences) and tone (enthusiastic, thoughtful, grateful, practical)
-- Do NOT use generic phrases like "great course" — be specific about what the student learned or how it helped them
+- **CRITICAL — match testimonial demographics to the course's target audience.**
+  Look at the course topic, title, excerpt, and TARGET AUDIENCE field if
+  provided. Then pick reviewer names accordingly:
+  - **Gender-specific course** (e.g. "Kegel yoga for men", "Men's pelvic
+    health", "Prostate recovery") → ALL names MUST be male. No female names.
+  - **Women-specific course** (e.g. "Postpartum recovery", "Women's
+    hormone balance", "Pregnancy yoga") → ALL names MUST be female.
+    No male names.
+  - **Age-specific course** (e.g. "Senior gentle yoga", "Kids' posture",
+    "Teen anxiety") → names AND review voice should reflect that age band
+    (older adults for senior courses; for kids' courses use parent voices
+    like "as a mom of two…").
+  - **Condition-specific course** (e.g. "Back pain relief", "Knee
+    rehabilitation after surgery") → reviewers reference the matching
+    condition in their text.
+  - **General audience course** (broad wellness, general yoga, etc.) →
+    diverse mix is fine.
+- Use realistic first+last names that fit the target demographic
+- Make reviews specific to the course content — mention particular lessons,
+  techniques, or outcomes
+- Vary review length (1-4 sentences) and tone (enthusiastic, thoughtful,
+  grateful, practical)
+- Do NOT use generic phrases like "great course" — be specific about what
+  the student learned or how it helped them
 
 **===COLLECTION===**
 - `name:` — Choose the most appropriate collection (category) from the list below, or suggest a new one if none fit.
@@ -1195,6 +1266,123 @@ def parse_template(text: str) -> dict[str, Any]:
     }
 
 
+# Words that imply YouTube origin / online presence — sentences mentioning
+# any of these get stripped from compose output. Lowercase comparison.
+_ORIGIN_BAN_WORDS = (
+    "youtube", "youtu.be",
+    "subscribe", "subscriber", "subscribers",
+    "channel",   # "her channel", "the channel"
+    "click the link", "link in the description", "in the description",
+    "follow me", "follow her", "follow him", "follow them",
+    "instagram", "facebook", "twitter", "tiktok",
+    " patreon",  # leading space to not match accidental substrings
+    "social media",
+    "view count", "views on", "viral",
+    "ring the bell", "notification",
+)
+
+
+def _strip_origin_sentences(text: str) -> str:
+    """Drop sentences (period/newline-delimited) that mention any banned word.
+
+    Preserves markdown formatting (bullets, headers) by detecting structure
+    line-by-line and only cutting at sentence boundaries within prose.
+    """
+    if not text:
+        return text
+    out_lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        # Keep markdown structure lines (headers, separators) as-is
+        if not stripped or stripped.startswith(("#", "-", "*", "•", "```", "---")):
+            # But still scan bullet content for banned words
+            low = stripped.lower()
+            if any(w in low for w in _ORIGIN_BAN_WORDS):
+                continue  # drop this bullet/header
+            out_lines.append(line)
+            continue
+        # Split prose line into sentences, drop those with banned words
+        kept = []
+        # crude sentence split — periods and Russian-style "—"
+        for raw in line.replace("\n", " ").split("."):
+            s = raw.strip()
+            if not s:
+                continue
+            low = s.lower()
+            if any(w in low for w in _ORIGIN_BAN_WORDS):
+                continue
+            kept.append(s)
+        if kept:
+            out_lines.append(". ".join(kept) + ".")
+    return "\n".join(out_lines).strip()
+
+
+def strip_origin_mentions(parsed: dict[str, Any]) -> None:
+    """Walk every user-facing text field of a composed payload and remove
+    sentences mentioning YouTube, channels, subscribers, social media, etc.
+
+    Mutates `parsed` in place. Logs a summary of what was changed.
+    """
+    changed: list[str] = []
+
+    def _clean(value: str, label: str) -> str:
+        if not value:
+            return value
+        cleaned = _strip_origin_sentences(value)
+        if cleaned != value:
+            removed = len(value) - len(cleaned)
+            changed.append(f"{label}(-{removed}ch)")
+        return cleaned
+
+    # course-level
+    course = parsed.get("course") or {}
+    course["title"] = _clean(course.get("title", ""), "course.title")
+    course["excerpt"] = _clean(course.get("excerpt", ""), "course.excerpt")
+    course["aboutContent"] = _clean(course.get("aboutContent", ""), "course.about")
+
+    # author
+    author = parsed.get("author") or {}
+    author["name"] = _clean(author.get("name", ""), "author.name")
+    author["bio"] = _clean(author.get("bio", ""), "author.bio")
+
+    # plan sections — section titles + each topic
+    for sec in parsed.get("planSections") or []:
+        sec["title"] = _clean(sec.get("title", ""), "plan.sec.title")
+        for item in sec.get("items") or []:
+            item["title"] = _clean(item.get("title", ""), "plan.item")
+
+    # science plan
+    sp = parsed.get("sciencePlan")
+    if isinstance(sp, dict):
+        sp["headline"] = _clean(sp.get("headline", ""), "science.headline")
+        sp["subtitle"] = _clean(sp.get("subtitle", ""), "science.subtitle")
+        for inst in sp.get("institutions") or []:
+            inst["name"] = _clean(inst.get("name", ""), "science.inst")
+        for stat in sp.get("stats") or []:
+            stat["description"] = _clean(stat.get("description", ""), "science.stat.desc")
+            stat["citation"] = _clean(stat.get("citation", ""), "science.stat.cite")
+
+    # curriculum
+    for sec in parsed.get("curriculum") or []:
+        sec["title"] = _clean(sec.get("title", ""), "curr.sec.title")
+        for lesson in sec.get("lessons") or []:
+            lesson["title"] = _clean(lesson.get("title", ""), "curr.lesson.title")
+            lesson["description"] = _clean(lesson.get("description", ""), "curr.lesson.desc")
+
+    # testimonials
+    for t in parsed.get("testimonials") or []:
+        t["text"] = _clean(t.get("text", ""), "testimonial.text")
+
+    # collection name
+    if parsed.get("collectionName"):
+        parsed["collectionName"] = _clean(parsed["collectionName"], "collectionName")
+
+    if changed:
+        log.info(f"strip_origin_mentions: cleaned {len(changed)} fields: "
+                 f"{', '.join(changed[:10])}"
+                 f"{f' (+{len(changed) - 10} more)' if len(changed) > 10 else ''}")
+
+
 def compose_full_course(*, course_topic: str, course_title: str,
                         channel_name: str, channel_description: str,
                         lesson_transcripts: list[str],
@@ -1244,7 +1432,8 @@ def compose_full_course(*, course_topic: str, course_title: str,
 
     system = (COMPOSE_FULL_SYSTEM
               + _pain_audience_block(pain, audience)
-              + _lang_instruction(output_lang))
+              + _lang_instruction(output_lang)
+              + NO_ORIGIN_DISCLOSURE_RULES)
     full_prompt = system + "\n\n---\n\n## MATERIALS\n\n" + materials
 
     # Same retry-on-503/timeout machinery as _call_json, but we expect plain
@@ -1295,6 +1484,10 @@ def compose_full_course(*, course_topic: str, course_title: str,
             text = text.rsplit("```", 1)[0].strip()
 
     parsed = parse_template(text)
+
+    # Post-sanitize: strip any sentences mentioning YouTube / channel / subscribe /
+    # social media. Strong prompt + this safety net = no origin leaks.
+    strip_origin_mentions(parsed)
 
     # Sanity validation
     if not parsed["author"]["name"] or not parsed["author"]["bio"]:
