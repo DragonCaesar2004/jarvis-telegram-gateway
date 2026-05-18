@@ -1346,9 +1346,12 @@ def _run_topic_batch(token: str, agent: str, cfg: dict, chat_id: int,
               f"{_html_escape(topic)}</b>")
 
         try:
+            # Each topic in the batch ALSO tries to produce up to 5 courses
+            # (same as single-topic mode). Phase 1's per-channel loop stops
+            # at the first 5 that succeed, or at whatever it found if fewer.
             courses_made = _run(
                 token, agent, cfg, chat_id, user_id,
-                topic=topic, count=1, onb=onb,
+                topic=topic, count=5, onb=onb,
                 pain=pain, audience="",
                 thread_id=thread_id,
                 batch_run_id=run_id,
@@ -1357,7 +1360,9 @@ def _run_topic_batch(token: str, agent: str, cfg: dict, chat_id: int,
             )
             course_idx_offset += int(courses_made or 0)
             if courses_made:
-                completed_topics.append(f"  ✓ Тема {topic_idx}: «{topic}» ({courses_made} курс)")
+                completed_topics.append(
+                    f"  ✓ Тема {topic_idx}: «{topic}» — {courses_made} курс(ов)"
+                )
             else:
                 failed_topics.append(f"  ✗ Тема {topic_idx}: «{topic}» — 0 курсов")
         except CookiesNeededError:

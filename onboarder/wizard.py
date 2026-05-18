@@ -299,11 +299,12 @@ def handle_wizard_message(token: str, agent: str, cfg: dict, chat_id: int,
             )
             _send_with_buttons(
                 token, chat_id,
-                f"📦 <b>Пакетный режим тем — {len(topic_groups)} курс(ов)</b>\n\n"
+                f"📦 <b>Пакетный режим тем — {len(topic_groups)} тем(ы)</b>\n\n"
                 f"{summary}\n\n"
-                f"Каждый курс пойдёт через полную Phase 1: поиск YouTube-каналов "
-                f"по теме, отбор видео, транскрибация, compose. "
-                f"~20-40 мин на курс. Запустить?",
+                f"По каждой теме найду <b>до 5 курсов</b> "
+                f"(отдельный канал = отдельный курс). Если каналов меньше — "
+                f"сколько прошло критерии Sheet, столько и будет. "
+                f"~20-40 мин на тему. Запустить?",
                 [[{"text": f"🚀 Поехали ({len(topic_groups)} курсов)",
                    "callback_data": "wiz:start_phase1"},
                   {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
@@ -330,9 +331,12 @@ def handle_wizard_message(token: str, agent: str, cfg: dict, chat_id: int,
         desc_raw = text.strip()
         description = "" if desc_raw.lower() in _SKIP_TOKENS else desc_raw
         # Persist as `pain` (legacy field name; LLM helpers expect this kwarg).
-        # Always 1 course per wizard run — count is fixed, no separate step.
+        # Single-topic mode: try to find UP TO 5 channels (and thus 5 courses)
+        # matching the topic. If criteria match fewer, Phase 1 stops at what
+        # it found (won't fail unless 0 succeed). To request exactly one
+        # course per topic, use the multi-topic batch (===) format.
         st = _state.update(agent, user_id, thread_id=thread_id,
-                           pain=description, count=1, step=STEP_CONFIRM)
+                           pain=description, count=5, step=STEP_CONFIRM)
         topic = st.get("topic", "")
         desc_line = (_html_escape(description)
                      if description else "<i>(не указано)</i>")
@@ -341,7 +345,8 @@ def handle_wizard_message(token: str, agent: str, cfg: dict, chat_id: int,
             f"<b>Подтверждение:</b>\n\n"
             f"Тема: <b>{_html_escape(topic)}</b>\n"
             f"Описание курса: {desc_line}\n\n"
-            f"Запустить Phase 1 (поиск каналов и видео для одного курса)?",
+            f"Запустить Phase 1? Соберу <b>до 5 курсов</b> на эту тему "
+            f"(каждый — отдельный канал, прошедший критерии Sheet).",
             [[{"text": "🚀 Поехали", "callback_data": "wiz:start_phase1"},
               {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
             thread_id=thread_id,
@@ -584,13 +589,14 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
                        "🔍 <b>Phase 1 запущен.</b>\n\n"
                        f"Тема: <b>{_html_escape(topic)}</b>"
                        f"{desc_block}\n\n"
-                       "Phase 1 ищет каналы, скачивает видео, транскрибирует "
-                       "(Whisper), размечает вырезки, пишет описания уроков и "
-                       "курса, ищет инфу об авторе через WebSearch. На выходе "
-                       "в Sheet будут реальные описания, готовые для лендинга.\n\n"
-                       "~20-45 минут на курс. Можешь вернуться в чат с агентом "
-                       "(<code>/menu</code> → 💬 Чат), пришлю результат как "
-                       "будет готово."
+                       "Phase 1 ищет каналы (до 5), скачивает видео, "
+                       "транскрибирует (Whisper), размечает вырезки, пишет "
+                       "описания уроков и курса, ищет инфу об авторе через "
+                       "WebSearch. На выходе в Sheet будут реальные описания, "
+                       "готовые для лендинга.\n\n"
+                       "~20-45 минут на каждый курс (5 курсов = ~2-4 часа). "
+                       "Можешь вернуться в чат с агентом (<code>/menu</code> → "
+                       "💬 Чат), пришлю результат как будет готово."
                    ),
                    parse_mode="HTML")
         except Exception:
