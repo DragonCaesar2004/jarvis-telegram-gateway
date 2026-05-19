@@ -457,7 +457,11 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
         elif topic_groups:
             count = len(topic_groups)
         else:
-            count = 1
+            # Single-topic / single-URL path: respect what STEP_ASK_PAIN
+            # (count=5) or the URL handler (count=1) saved into state.
+            # Falling back to a hardcoded 1 here used to silently clobber
+            # the "up to 5 courses per topic" intent.
+            count = int(st.get("count") or 1)
 
         has_input = (topic
                      or (url_mode and (video_ids or url_groups))
