@@ -48,16 +48,36 @@ _TLS = threading.local()
 # ---------------------------------------------------------------------------
 
 def launch(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
-           *, thread_id: int = 0) -> None:
+           *, thread_id: int = 0,
+           run_id_override: str | None = None,
+           course_idx_filter: int | None = None,
+           voice_gender_override: str | None = None) -> None:
     """Spawn the Phase 2 worker in a background daemon thread.
 
     `thread_id` is the Telegram forum topic the run was started in. 0 means
     DM / non-forum group, preserving the original behavior.
+
+    `run_id_override` / `course_idx_filter` scope this launch to a single
+    course inside a specific run — used by the per-course «🚀 Запустить
+    Курс N» button so the operator can process one course at a time
+    without claiming rows from the other 4 courses in the same Sheet.
+
+    `voice_gender_override` lets the per-course button supply a fresh
+    gender choice without mutating shared wizard state (which other
+    parallel per-course launches might read).
     """
     thr = threading.Thread(
         target=_worker,
         args=(token, agent, cfg, chat_id, user_id, int(thread_id or 0)),
-        name=f"phase2-{agent}-{user_id}-{int(thread_id or 0)}",
+        kwargs={
+            "run_id_override": run_id_override,
+            "course_idx_filter": course_idx_filter,
+            "voice_gender_override": voice_gender_override,
+        },
+        name=(
+            f"phase2-{agent}-{user_id}-{int(thread_id or 0)}"
+            + (f"-c{course_idx_filter}" if course_idx_filter else "")
+        ),
         daemon=True,
     )
     thr.start()
@@ -68,11 +88,17 @@ def launch(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
 # ---------------------------------------------------------------------------
 
 def _worker(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
-            thread_id: int = 0) -> None:
+            thread_id: int = 0, *,
+            run_id_override: str | None = None,
+            course_idx_filter: int | None = None,
+            voice_gender_override: str | None = None) -> None:
     onb = (cfg.get("onboarder") or {})
     _TLS.thread_id = int(thread_id or 0)
     try:
-        _run(token, agent, cfg, chat_id, user_id, onb, thread_id=int(thread_id or 0))
+        _run(token, agent, cfg, chat_id, user_id, onb, thread_id=int(thread_id or 0),
+             run_id_override=run_id_override,
+             course_idx_filter=course_idx_filter,
+             voice_gender_override=voice_gender_override)
     except CookiesNeededError as e:
         # Pool exhausted — pause Phase 2 and ask user to upload fresh cookies
         log.warning(f"phase2: cookies needed: {e}")
@@ -109,7 +135,10 @@ def _worker(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
 
 
 def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dict,
-         *, thread_id: int = 0) -> None:
+         *, thread_id: int = 0,
+         run_id_override: str | None = None,
+         course_idx_filter: int | None = None,
+         voice_gender_override: str | None = None) -> None:
     # ── 1. Resolve secrets and config ────────────────────────────────────
     sa_path = _secrets.resolve_path(onb, "google_service_account")
     sheet_id = onb.get("google_sheet_id") or ""
@@ -149,8 +178,11 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
 
     # ── 2. Read approved+pending rows from unified Lessons tab ──────────
     st = _state.load(agent, user_id, int(thread_id or 0))
-    run_id = st.get("run_id")
-    voice_gender: str = str(st.get("voice_gender") or "MALE").upper()
+    # Per-course launches pass overrides; bulk launches fall back to wizard state.
+    run_id = run_id_override or st.get("run_id")
+    voice_gender: str = str(
+        voice_gender_override or st.get("voice_gender") or "MALE"
+    ).upper()
     # run_id is optional now — Phase 2 picks up any approved+pending rows
     # regardless of run, since user can mix-and-match across runs in the
     # single tab. If run_id is set, we filter to that run for safety.
@@ -162,12 +194,20 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
     # same rows as already-processing and skip them — no two workers ever
     # process the same lesson.
     with sheets.sheet_lock():
-        approved = sheets.read_pending_approved_rows(client, sheet_id, run_id=run_id)
+        approved = sheets.read_pending_approved_rows(
+            client, sheet_id, run_id=run_id,
+            course_idx=course_idx_filter,
+        )
         if not approved:
+            scope = []
+            if run_id:
+                scope.append(f"run_id={run_id}")
+            if course_idx_filter is not None:
+                scope.append(f"курс {course_idx_filter}")
+            scope_str = (" для " + ", ".join(scope)) if scope else ""
             raise RuntimeError(
-                "В табе Lessons нет строк со status=pending и approved=TRUE"
-                + (f" для run_id={run_id}" if run_id else "")
-                + ". Открой Sheet, отметь Approved=TRUE и нажми кнопку ещё раз."
+                f"В табе Lessons нет строк со status=pending и approved=TRUE{scope_str}."
+                " Открой Sheet, отметь Approved=TRUE и нажми кнопку ещё раз."
             )
         sheets.update_status(
             client, sheet_id,

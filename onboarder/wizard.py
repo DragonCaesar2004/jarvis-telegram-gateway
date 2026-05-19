@@ -658,6 +658,100 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
             _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
         return
 
+    # Per-course Phase 2 launch button. Triggered from Phase 1's per-course
+    # «🚀 Запустить Курс N» message. Format: wiz:p2c:{run_id}:{course_idx}
+    if action.startswith("p2c:"):
+        parts = action.split(":")
+        if len(parts) != 3:
+            answer_callback_query(token, cq_id, "Битый callback", show_alert=True)
+            return
+        run_id = parts[1]
+        try:
+            course_idx = int(parts[2])
+        except ValueError:
+            answer_callback_query(token, cq_id, "Битый course_idx", show_alert=True)
+            return
+        answer_callback_query(token, cq_id, f"Курс {course_idx}: выбор голоса")
+        # Strip the button off the Phase 1 message so a second click doesn't
+        # spawn another worker for the same course.
+        message_id = msg.get("message_id")
+        if message_id:
+            try:
+                tg_api(token, "editMessageReplyMarkup",
+                       chat_id=chat_id, message_id=message_id,
+                       reply_markup={"inline_keyboard": []})
+            except Exception as e:
+                log.warning(f"p2c: could not strip button: {e}")
+        # Ask voice (per course, per user preference).
+        try:
+            tg_api(token, "sendMessage", chat_id=chat_id,
+                   message_thread_id=thread_id or None,
+                   text=(
+                       f"🎙 <b>Курс {course_idx}: голос дубляжа?</b>\n\n"
+                       f"<i>(применяется только к не-английским видео)</i>"
+                   ),
+                   parse_mode="HTML",
+                   reply_markup={"inline_keyboard": [[
+                       {"text": "👨 Мужской",
+                        "callback_data": f"wiz:p2cv:{run_id}:{course_idx}:MALE"},
+                       {"text": "👩 Женский",
+                        "callback_data": f"wiz:p2cv:{run_id}:{course_idx}:FEMALE"},
+                   ]]})
+        except Exception as e:
+            log.exception(f"[{agent}] p2c: failed to ask voice: {e}")
+        return
+
+    # Voice picked for a per-course Phase 2 launch.
+    # Format: wiz:p2cv:{run_id}:{course_idx}:{MALE|FEMALE}
+    if action.startswith("p2cv:"):
+        parts = action.split(":")
+        if len(parts) != 4:
+            answer_callback_query(token, cq_id, "Битый callback", show_alert=True)
+            return
+        run_id = parts[1]
+        try:
+            course_idx = int(parts[2])
+        except ValueError:
+            answer_callback_query(token, cq_id, "Битый course_idx", show_alert=True)
+            return
+        voice_gender = parts[3].upper()
+        if voice_gender not in ("MALE", "FEMALE"):
+            voice_gender = "MALE"
+        voice_label = "👨 мужской" if voice_gender == "MALE" else "👩 женский"
+        answer_callback_query(token, cq_id, f"Курс {course_idx} запущен")
+        # Strip the voice picker buttons.
+        message_id = msg.get("message_id")
+        if message_id:
+            try:
+                tg_api(token, "editMessageText",
+                       chat_id=chat_id, message_id=message_id,
+                       text=(
+                           f"🎬 <b>Курс {course_idx} запущен.</b>\n"
+                           f"Голос: {voice_label}"
+                       ),
+                       parse_mode="HTML")
+            except Exception as e:
+                log.warning(f"p2cv: could not update prompt: {e}")
+        try:
+            from . import phase2_production
+            phase2_production.launch(
+                token, agent, cfg, chat_id, user_id,
+                thread_id=thread_id,
+                run_id_override=run_id,
+                course_idx_filter=course_idx,
+                voice_gender_override=voice_gender,
+            )
+        except Exception as e:
+            log.exception(f"[{agent}] p2cv: failed to launch phase2 "
+                          f"(run={run_id} course={course_idx}): {e}")
+            try:
+                tg_api(token, "sendMessage", chat_id=chat_id,
+                       message_thread_id=thread_id or None,
+                       text=f"⚠️ Не удалось запустить Курс {course_idx}: {e}")
+            except Exception:
+                pass
+        return
+
     if action == "start_phase2":
         # Force a cookies refresh before Phase 2 — common failure mode is
         # forgetting to update YouTube cookies between runs.

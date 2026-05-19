@@ -424,11 +424,15 @@ def _row_to_dict(row: list[str], header: list[str]) -> dict[str, str]:
 
 
 def read_pending_approved_rows(client: Any, sheet_id: str,
-                               run_id: str | None = None) -> list[dict[str, Any]]:
+                               run_id: str | None = None,
+                               course_idx: int | None = None,
+                               ) -> list[dict[str, Any]]:
     """Return rows where Approved=TRUE AND status=pending.
 
     Each item carries enough metadata for Phase 2 + a `_sheet_row` index for
-    later status updates. Filter by run_id if provided (otherwise all runs).
+    later status updates. Filter by run_id if provided (otherwise all runs);
+    additionally filter by `course_idx` to scope Phase 2 to a single course
+    within a run.
     """
     ws = ensure_lessons_tab(client, sheet_id)
     rows = ws.get_all_values()
@@ -444,6 +448,13 @@ def read_pending_approved_rows(client: Any, sheet_id: str,
             continue
         if run_id and d.get("run_id", "").strip() != run_id:
             continue
+        if course_idx is not None:
+            try:
+                row_course_idx = int(d.get("course_idx") or 0)
+            except ValueError:
+                row_course_idx = 0
+            if row_course_idx != int(course_idx):
+                continue
         try:
             duration_sec = int(d.get("duration_sec") or 0)
         except ValueError:

@@ -399,9 +399,9 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
              f"threshold; will try them in order until {count} courses succeed")
 
     # ── 6. Per-channel: list videos + Claude select + dedup ─────────────
-    all_lesson_rows: list[dict[str, Any]] = []
     course_summaries: list[str] = []
     skipped_total = 0
+    total_videos_written = 0
     # Batch mode offsets course_idx so each topic's course gets a unique
     # course_idx within the shared run_id (topic #1 → idx 1, topic #2 → idx 2…).
     course_idx = batch_course_idx_offset
@@ -557,10 +557,9 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         author_bio_ru = enriched.get("author_bio_ru", "")
         author_expertise_ru = enriched.get("author_expertise_ru", "")
 
-        # When streaming is active, rows are already in the Sheet (pre-allocated
-        # + per-video updates). Finalize row 1 with course-level fields and
-        # SKIP the local all_lesson_rows aggregation for this course — the
-        # final batch append below will see fewer rows but the Sheet is correct.
+        # Streaming mode: rows were already pre-allocated in the Sheet at the
+        # start of enrich. Just finalize row 1 with course-level fields and
+        # send the per-course button.
         if streaming_enabled and streaming_row_map:
             phase1_enrich.finalize_streaming_row1(
                 client, sheet_id,
@@ -570,12 +569,26 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                 final_course_title=final_course_title,
                 author_name_fallback=ch_name,
             )
+            written_count = len(streaming_row_map)
+            total_videos_written += written_count
+            _send_per_course_phase2_button(
+                token, chat_id, sheets.sheet_url(sheet_id),
+                run_id=run_id, course_idx=course_idx, count=count,
+                course_title=final_course_title, video_count=written_count,
+                channel_name=ch_name,
+            )
             successful_courses += 1
             continue
 
+        # Non-streaming path: build all rows for this course in memory, then
+        # write them to the Sheet under sheet_lock with late-dedup, then
+        # send the per-course Phase 2 button. Each course becomes visible
+        # to the reviewer as soon as it finishes (instead of all at once
+        # at the end of Phase 1).
+        course_rows: list[dict[str, Any]] = []
         for v in enriched["videos"]:
             is_first = (v["lesson_idx"] == 1)
-            all_lesson_rows.append({
+            course_rows.append({
                 "course": full_course_title if is_first else f"Курс {course_idx}",
                 "lesson_idx": v["lesson_idx"],
                 "channel": ch_name,
@@ -611,11 +624,47 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                 "author_bio_ru": author_bio_ru if is_first else "",
                 "author_expertise_ru": author_expertise_ru if is_first else "",
             })
+
+        # Atomic write of this course's rows + late-dedup. A second wizard
+        # running in parallel might have committed the same video_ids while
+        # we were enriching; re-check under the lock before append.
+        with sheets.sheet_lock():
+            latest_seen = sheets.get_active_video_ids(client, sheet_id)
+            latest_blocked = sheets.get_seen_channel_ids(client, sheet_id)
+            rows_to_write = [
+                r for r in course_rows
+                if r.get("video_id") not in latest_seen
+                and r.get("channel_id") not in latest_blocked
+            ]
+            late_skipped = len(course_rows) - len(rows_to_write)
+            if rows_to_write:
+                sheets.append_lesson_rows(
+                    client, sheet_id, run_id=run_id, rows=rows_to_write,
+                )
+        if late_skipped:
+            skipped_total += late_skipped
+            log.info(f"phase1[{user_id}] late dedup under sheet lock: "
+                     f"dropped {late_skipped} rows for course {course_idx}")
+
+        if not rows_to_write:
+            _send(token, chat_id,
+                  f"⚠️ Курс {course_idx} ({_html_escape(ch_name)}) пропущен — "
+                  f"все {len(course_rows)} видео уже в Sheet (поздний дубликат).")
+            skip_reasons.append(f"{ch_name}: all videos already in sheet (late dedup)")
+            continue
+
+        total_videos_written += len(rows_to_write)
+        _send_per_course_phase2_button(
+            token, chat_id, sheets.sheet_url(sheet_id),
+            run_id=run_id, course_idx=course_idx, count=count,
+            course_title=final_course_title, video_count=len(rows_to_write),
+            channel_name=ch_name,
+        )
         # Course built successfully; advance the success counter so the loop
         # exits after `count` good ones, not after `count` attempts.
         successful_courses += 1
 
-    if not all_lesson_rows:
+    if successful_courses == 0:
         # Surface concrete skip reasons so the operator knows which channels
         # tried what and why nothing made it through.
         diag = ""
@@ -629,35 +678,8 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
             "Попробуй другую тему или расширь критерии." + diag
         )
 
-    # ── 7. Append to unified Lessons tab (atomic re-check + write) ──────
-    # Two parallel wizards (one per forum topic) might both reach this point
-    # holding rows they each consider "new". Take the sheet lock, re-read
-    # the dedup set under the lock to catch anything the other worker
-    # appended while we were enriching, filter again, then commit.
-    with sheets.sheet_lock():
-        latest_seen = sheets.get_active_video_ids(client, sheet_id)
-        latest_blocked = sheets.get_seen_channel_ids(client, sheet_id)
-        rows_to_write: list[dict[str, Any]] = []
-        late_dedup_skipped = 0
-        for r in all_lesson_rows:
-            if r.get("video_id") in latest_seen:
-                late_dedup_skipped += 1
-                continue
-            if r.get("channel_id") in latest_blocked:
-                late_dedup_skipped += 1
-                continue
-            rows_to_write.append(r)
-        if late_dedup_skipped:
-            log.info(f"phase1[{user_id}] late dedup under sheet lock: "
-                     f"dropped {late_dedup_skipped} rows that another worker had committed")
-        if rows_to_write:
-            sheets.append_lesson_rows(client, sheet_id, run_id=run_id,
-                                      rows=rows_to_write)
-    if late_dedup_skipped:
-        skipped_total += late_dedup_skipped
-
     # Batch mode: caller (launch_topic_batch) handles state update and final
-    # button after ALL topics in the batch finish. Return how many courses
+    # summary after ALL topics in the batch finish. Return how many courses
     # this topic produced so the caller can advance course_idx for the next.
     if batch_silent_finish:
         return successful_courses
@@ -666,24 +688,17 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                   step="awaiting_approval",
                   courses_summary=course_summaries)
 
-    # ── 8. Final Telegram message with action button ─────────────────────
-    sheet_url = sheets.sheet_url(sheet_id)
-    summary_lines = "\n".join(course_summaries) if course_summaries else "(нет курсов)"
-    dedup_note = f"\n\n♻️ Пропущено как дубли: <b>{skipped_total}</b> видео." if skipped_total else ""
-    _send_with_buttons(
-        token, chat_id,
-        text=(
-            f"✅ <b>Phase 1 готов.</b>\n\n"
-            f"Подборка ({len(all_lesson_rows)} видео в {len(course_summaries)} курсах):\n"
-            f"{_html_escape(summary_lines)}{dedup_note}\n\n"
-            f"📋 Открой таб <b>Lessons</b>, отметь <b>Approved=TRUE</b> "
-            f"у нужных строк (status=pending). Все запуски в одной таблице:\n"
-            f"{sheet_url}\n\n"
-            f"Когда готов — нажми кнопку:"
-        ),
-        buttons=[[{"text": "🚀 Запустить обработку", "callback_data": "wiz:start_phase2"},
-                  {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
-    )
+    # ── 7. Final summary — rows + per-course buttons were already sent
+    #       progressively as each course finished. This is just the total.
+    dedup_note = f"\n♻️ Пропущено как дубли: <b>{skipped_total}</b> видео." if skipped_total else ""
+    _send(token, chat_id,
+          f"🏁 <b>Phase 1 завершён.</b>\n\n"
+          f"Всего курсов: <b>{successful_courses}</b>"
+          + (f" (запрашивали до {count})" if successful_courses < count else "")
+          + f"\nВидео: <b>{total_videos_written}</b>"
+          + dedup_note
+          + "\n\nКаждый курс выше — со своей кнопкой "
+          + "<b>«🚀 Запустить Курс N»</b>. Жми когда проверил Sheet.")
     return successful_courses
 
 
@@ -933,19 +948,11 @@ def _run_from_urls(token: str, agent: str, cfg: dict, chat_id: int, user_id: int
         _state.update(agent, user_id, thread_id=int(thread_id or 0),
                       step="awaiting_approval",
                       courses_summary=[f"1. {final_title} ({len(enriched['videos'])} уроков)"])
-        sheet_url = sheets.sheet_url(sheet_id)
-        _send_with_buttons(
-            token, chat_id,
-            text=(
-                f"✅ <b>Phase 1 готов (прямые ссылки, streaming).</b>\n\n"
-                f"Курс: <b>{_html_escape(final_title)}</b>\n"
-                f"Уроков: {len(enriched['videos'])}\n\n"
-                f"📋 Открой таб <b>Lessons</b>, проверь описания, "
-                f"отметь <b>Approved=TRUE</b>:\n"
-                f"{sheet_url}\n\nКогда готов — нажми кнопку:"
-            ),
-            buttons=[[{"text": "🚀 Запустить обработку", "callback_data": "wiz:start_phase2"},
-                      {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
+        _send_per_course_phase2_button(
+            token, chat_id, sheets.sheet_url(sheet_id),
+            run_id=run_id, course_idx=1, count=1,
+            course_title=final_title, video_count=len(enriched["videos"]),
+            channel_name=channel_name,
         )
         return
 
@@ -997,21 +1004,12 @@ def _run_from_urls(token: str, agent: str, cfg: dict, chat_id: int, user_id: int
                   step="awaiting_approval",
                   courses_summary=[f"1. {final_title} ({len(enriched['videos'])} уроков)"])
 
-    # ── 6. Final Telegram message with action button ──────────────────────
-    sheet_url = sheets.sheet_url(sheet_id)
-    _send_with_buttons(
-        token, chat_id,
-        text=(
-            f"✅ <b>Phase 1 готов (прямые ссылки).</b>\n\n"
-            f"Курс: <b>{_html_escape(final_title)}</b>\n"
-            f"Уроков: {len(enriched['videos'])}\n\n"
-            f"📋 Открой таб <b>Lessons</b>, проверь описания уроков и курса, "
-            f"отметь <b>Approved=TRUE</b> у нужных строк:\n"
-            f"{sheet_url}\n\n"
-            f"Когда готов — нажми кнопку:"
-        ),
-        buttons=[[{"text": "🚀 Запустить обработку", "callback_data": "wiz:start_phase2"},
-                  {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
+    # ── 6. Per-course Telegram button (rows already written above) ────────
+    _send_per_course_phase2_button(
+        token, chat_id, sheets.sheet_url(sheet_id),
+        run_id=run_id, course_idx=1, count=1,
+        course_title=final_title, video_count=len(enriched["videos"]),
+        channel_name=channel_name,
     )
 
 
@@ -1196,29 +1194,20 @@ def _run_from_url_groups(token: str, agent: str, cfg: dict, chat_id: int,
                   step="awaiting_approval",
                   courses_summary=course_summaries)
 
-    # ── 4. Final Telegram message with action button ──────────────────────
-    sheet_url = sheets.sheet_url(sheet_id)
+    # ── 4. Final summary — per-course buttons were already sent in
+    #       _process_one_url_course as each course finished.
     summary_text = "\n".join(f"  {s}" for s in course_summaries)
     fail_text = ""
     if courses_failed:
         fail_text = "\n\n⚠️ <b>Упавшие курсы:</b>\n" + "\n".join(
             f"  • {_html_escape(f)}" for f in courses_failed)
-    _send_with_buttons(
-        token, chat_id,
-        text=(
-            f"✅ <b>Phase 1 готов (пакетный режим).</b>\n\n"
-            f"Успешных курсов: <b>{courses_done}/{len(url_groups)}</b>\n"
-            f"Всего уроков: <b>{len(all_lesson_rows)}</b>\n\n"
-            f"{summary_text}{fail_text}\n\n"
-            f"📋 Открой таб <b>Lessons</b>, проверь описания, "
-            f"отметь <b>Approved=TRUE</b> у нужных строк:\n"
-            f"{sheet_url}\n\n"
-            f"Когда готов — нажми кнопку:"
-        ),
-        buttons=[[{"text": f"🚀 Запустить обработку ({courses_done} курсов)",
-                   "callback_data": "wiz:start_phase2"},
-                  {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
-    )
+    _send(token, chat_id,
+          f"🏁 <b>Phase 1 завершён (пакет URL).</b>\n\n"
+          f"Успешных курсов: <b>{courses_done}/{len(url_groups)}</b>\n"
+          f"Всего уроков: <b>{len(all_lesson_rows)}</b>\n\n"
+          f"{summary_text}{fail_text}\n\n"
+          "Каждый курс выше — со своей кнопкой "
+          "<b>«🚀 Запустить Курс N»</b>.")
 
 
 def _process_one_url_course(*, course_idx: int, run_id: str,
@@ -1393,9 +1382,18 @@ def _process_one_url_course(*, course_idx: int, run_id: str,
 
     summary = (f"{course_idx}. {final_title} "
                f"({len(enriched['videos'])} уроков, {channel_name})")
-    _send(token, chat_id,
-          f"  ✅ Курс {course_idx} готов: <b>{_html_escape(final_title)}</b> "
-          f"({len(enriched['videos'])} уроков)")
+    sheet_url_safe = sheets.sheet_url(sheet_id) if sheet_id else ""
+    if sheet_url_safe:
+        _send_per_course_phase2_button(
+            token, chat_id, sheet_url_safe,
+            run_id=run_id, course_idx=course_idx, count=0,
+            course_title=final_title, video_count=len(enriched["videos"]),
+            channel_name=channel_name,
+        )
+    else:
+        _send(token, chat_id,
+              f"  ✅ Курс {course_idx} готов: <b>{_html_escape(final_title)}</b> "
+              f"({len(enriched['videos'])} уроков)")
     return rows, summary
 
 
@@ -1539,24 +1537,16 @@ def _run_topic_batch(token: str, agent: str, cfg: dict, chat_id: int,
                   step="awaiting_approval",
                   courses_summary=completed_topics)
 
-    sheet_url = sheets.sheet_url(sheet_id)
     success_block = "\n".join(completed_topics)
     fail_block = ("\n\n⚠️ <b>Не сработали:</b>\n" + "\n".join(failed_topics)
                   if failed_topics else "")
-    _send_with_buttons(
-        token, chat_id,
-        text=(
-            f"✅ <b>Phase 1 готов (пакет тем).</b>\n\n"
-            f"Успешных: <b>{len(completed_topics)}/{len(topic_groups)}</b>\n\n"
-            f"{success_block}{fail_block}\n\n"
-            f"📋 Открой <b>Lessons</b>, отметь <b>Approved=TRUE</b> у нужных строк:\n"
-            f"{sheet_url}\n\n"
-            f"Когда готов — нажми кнопку:"
-        ),
-        buttons=[[{"text": f"🚀 Запустить обработку",
-                   "callback_data": "wiz:start_phase2"},
-                  {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
-    )
+    _send(token, chat_id,
+          f"🏁 <b>Phase 1 завершён (пакет тем).</b>\n\n"
+          f"Успешных тем: <b>{len(completed_topics)}/{len(topic_groups)}</b>\n"
+          f"Всего курсов: <b>{course_idx_offset}</b>\n\n"
+          f"{success_block}{fail_block}\n\n"
+          "Каждый курс выше — со своей кнопкой "
+          "<b>«🚀 Запустить Курс N»</b>. Жми по одной.")
 
 
 # ---------------------------------------------------------------------------
@@ -1645,6 +1635,29 @@ def _send_with_buttons(token: str, chat_id: int, text: str,
     thread_id = int(getattr(_TLS, "thread_id", 0) or 0)
     send_message_with_buttons(token, chat_id, text, buttons,
                               message_thread_id=thread_id)
+
+
+def _send_per_course_phase2_button(token: str, chat_id: int, sheet_url: str, *,
+                                   run_id: str, course_idx: int, count: int,
+                                   course_title: str, video_count: int,
+                                   channel_name: str) -> None:
+    """Sent right after a course's rows hit the Sheet — gives the operator
+    a course-specific «🚀 Запустить Курс N» button so they can launch Phase 2
+    for that one course without waiting for the rest of Phase 1.
+    """
+    text = (
+        f"✅ <b>Курс {course_idx} готов</b> "
+        f"<i>({_html_escape(channel_name)})</i>\n"
+        f"<b>{_html_escape(course_title)}</b>\n\n"
+        f"📋 {video_count} видео в Sheet. Проверь, поставь "
+        f"<b>Approved=TRUE</b> у нужных строк и жми кнопку:\n"
+        f"{sheet_url}"
+    )
+    _send_with_buttons(
+        token, chat_id, text,
+        buttons=[[{"text": f"🚀 Запустить Курс {course_idx}",
+                   "callback_data": f"wiz:p2c:{run_id}:{course_idx}"}]],
+    )
 
 
 def _html_escape(s: str) -> str:
