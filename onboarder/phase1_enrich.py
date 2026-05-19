@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
-from . import cache, ffmpeg_cut, llm, pipeline_db, proxy_pool, whisper
+from . import _global_throttle, cache, ffmpeg_cut, llm, pipeline_db, proxy_pool, whisper
 from .elevenlabs_dub import _iso as _lang_iso
 from .proxy_pool import CookiesNeededError, ProxyRotator
 
@@ -66,6 +66,16 @@ def enrich_course(*, course_idx: int, run_id: str,
                   compose_model: str = llm.DEFAULT_MODEL_QUALITY,
                   pain: str = "",
                   audience: str = "",
+                  # ── Streaming sheet writes (optional, opt-in) ──
+                  # When all three are provided, each completed video
+                  # gets its Sheet row updated incrementally (status,
+                  # transcript_excerpt, lesson_description). Reviewer
+                  # can audit lessons as soon as they're ready instead
+                  # of waiting for the whole course compose.
+                  sheets_client: Any = None,
+                  sheet_id: str | None = None,
+                  lesson_row_map: dict[int, int] | None = None,
+                  streaming_describe: bool = False,
                   ) -> dict[str, Any]:
     """Heavy lift: download, transcribe, mark cuts, describe, research author, compose.
 
@@ -122,6 +132,11 @@ def enrich_course(*, course_idx: int, run_id: str,
                 failed.append(result)
                 _emit(f"  ✗ {result['title'][:50]}: {result.get('error', '?')[:120]}")
 
+    # Pre-compute order map so the streaming hook can look up lesson row
+    # numbers by video_id without re-doing the dict comprehension per video.
+    selected_order_for_stream: dict[str, int] = {
+        v["video_id"]: int(v.get("order", i)) for i, v in enumerate(selected_videos)
+    }
     with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as ex:
         futures = []
         for v in selected_videos:
@@ -155,6 +170,24 @@ def enrich_course(*, course_idx: int, run_id: str,
                 log.error(f"phase1_enrich: worker crashed: {e}", exc_info=True)
                 continue
             _on_video_done(result)
+            # Streaming-write per-video: only when sheets_client+sheet_id+
+            # lesson_row_map are all provided. Same try/except so a Sheets
+            # failure can never break the video loop.
+            if sheets_client is not None and sheet_id and lesson_row_map:
+                try:
+                    _stream_write_video_row(
+                        sheets_client=sheets_client,
+                        sheet_id=sheet_id,
+                        lesson_row_map=lesson_row_map,
+                        result=result,
+                        selected_order=selected_order_for_stream,
+                        streaming_describe=streaming_describe,
+                        course_topic=course_topic_input,
+                        course_title=course_title_from_llm,
+                        pain=pain, audience=audience,
+                    )
+                except Exception as e:
+                    log.warning(f"phase1_enrich: streaming write failed: {e}")
 
     if cookies_needed is not None:
         # Propagate so phase1_discovery pauses and asks for cookies refresh
@@ -417,7 +450,13 @@ def enrich_course(*, course_idx: int, run_id: str,
 # Per-video pipeline (called from a worker thread)
 # ---------------------------------------------------------------------------
 
-def _process_video_for_enrich(*, video_id: str, title: str, url: str,
+def _process_video_for_enrich(**kwargs) -> dict:
+    """Public wrapper: enforce global slot budget then call impl."""
+    with _global_throttle.acquire_video_slot():
+        return _process_video_for_enrich_impl(**kwargs)
+
+
+def _process_video_for_enrich_impl(*, video_id: str, title: str, url: str,
                               course_topic: str, cookies_file: str | None,
                               rotator: ProxyRotator | None,
                               openai_key: str) -> dict[str, Any]:
@@ -614,3 +653,117 @@ def _extract_target_audience(about: str) -> str:
                 return chunk.split(sep, 1)[0].strip()
         return chunk.strip()
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Streaming sheet writes — public helpers
+# ---------------------------------------------------------------------------
+
+def pre_allocate_for_streaming(client, sheet_id, *, run_id, course_idx,
+                               channel_id, channel_name, selected_videos,
+                               videos_metadata=None):
+    """Pre-append minimal rows (status=pending) for streaming Phase 1.
+
+    Returns {order_int: row_number_int} (1-based sheet row) or {} on dedup/append
+    failure. Done under sheets.sheet_lock() so two concurrent wizards do not
+    race on the dedup window.
+
+    Pre-allocated rows carry only the basic identifiers (course, channel,
+    lesson_idx, lesson_title, url, video_id, duration_sec, course_idx) — the
+    reviewer-facing description columns stay empty until per-video updates
+    arrive via _stream_write_video_row.
+    """
+    from . import sheets as _sheets
+    if not selected_videos:
+        return {}
+    videos_metadata = videos_metadata or {}
+    pre_full_title = f"Курс {course_idx}: {channel_name}"
+    initial_rows = []
+    for v in selected_videos:
+        vid = v.get("video_id")
+        if not vid:
+            continue
+        meta = videos_metadata.get(vid) or {}
+        order = int(v.get("order", 0)) or (len(initial_rows) + 1)
+        is_first = (order == 1)
+        initial_rows.append({
+            "course": pre_full_title if is_first else f"Курс {course_idx}",
+            "lesson_idx": order,
+            "channel": channel_name,
+            "lesson_title": v.get("title") or meta.get("title", ""),
+            "url": meta.get("url") or v.get("url") or f"https://youtu.be/{vid}",
+            "duration_sec": int(meta.get("duration_sec") or v.get("duration_sec") or 0),
+            "video_id": vid,
+            "channel_id": channel_id,
+            "course_idx": course_idx,
+        })
+    if not initial_rows:
+        return {}
+    with _sheets.sheet_lock():
+        latest_seen = _sheets.get_active_video_ids(client, sheet_id)
+        latest_blocked = _sheets.get_seen_channel_ids(client, sheet_id)
+        rows_to_write = [
+            r for r in initial_rows
+            if r["video_id"] not in latest_seen
+            and r["channel_id"] not in latest_blocked
+        ]
+        if not rows_to_write:
+            return {}
+        try:
+            row_numbers = _sheets.append_lesson_rows(
+                client, sheet_id, run_id=run_id, rows=rows_to_write,
+            )
+        except Exception as e:
+            log.warning(f"pre_allocate_for_streaming: append failed: {e}")
+            return {}
+    result: dict[int, int] = {}
+    for r, rn in zip(rows_to_write, row_numbers):
+        result[int(r["lesson_idx"])] = rn
+    return result
+
+
+def finalize_streaming_row1(client, sheet_id, *, lesson_row_map, enriched,
+                            full_course_title, final_course_title,
+                            author_name_fallback):
+    """After compose: write course-level fields onto the lesson_idx=1 row.
+
+    Streaming already wrote per-lesson fields (status=done, lesson_description,
+    transcript_excerpt). The course-level payload (course_title, author_*,
+    plan/science/about, RU translations) is known only after compose, so we
+    finalise those on row #1 here. Other rows already carry status=done and
+    need no further updates.
+
+    Sheets failures are non-fatal — logged but swallowed.
+    """
+    from . import sheets as _sheets
+    if not lesson_row_map:
+        return
+    row1 = lesson_row_map.get(1)
+    if not row1:
+        return
+    fields = {
+        "course": full_course_title,
+        "course_title": final_course_title,
+        "course_description": enriched.get("course_description", ""),
+        "course_tagline": enriched.get("course_tagline", ""),
+        "course_what_you_learn": enriched.get("course_what_you_learn", ""),
+        "course_target_audience": enriched.get("course_target_audience", ""),
+        "author_name": enriched.get("author_name", "") or author_name_fallback,
+        "author_bio": enriched.get("author_bio", ""),
+        "author_expertise": enriched.get("author_expertise", ""),
+        "course_about": enriched.get("course_about", ""),
+        "course_plan": enriched.get("course_plan", ""),
+        "course_science": enriched.get("course_science", ""),
+        "course_description_ru": enriched.get("course_description_ru", ""),
+        "course_tagline_ru": enriched.get("course_tagline_ru", ""),
+        "course_what_you_learn_ru": enriched.get("course_what_you_learn_ru", ""),
+        "course_target_audience_ru": enriched.get("course_target_audience_ru", ""),
+        "author_bio_ru": enriched.get("author_bio_ru", ""),
+        "author_expertise_ru": enriched.get("author_expertise_ru", ""),
+    }
+    try:
+        _sheets.update_lesson_row_partial(
+            client, sheet_id, row_number=row1, fields=fields,
+        )
+    except Exception as e:
+        log.warning(f"finalize_streaming_row1: update failed: {e}")

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -334,7 +335,7 @@ def get_seen_channel_ids(client: Any, sheet_id: str) -> set[str]:
 
 
 def append_lesson_rows(client: Any, sheet_id: str, *, run_id: str,
-                       rows: list[dict[str, Any]]) -> None:
+                       rows: list[dict[str, Any]]) -> list[int]:
     """Append new lesson candidates to the Lessons tab as `pending`.
 
     Each row dict (input) keys (all optional unless noted):
@@ -345,13 +346,28 @@ def append_lesson_rows(client: Any, sheet_id: str, *, run_id: str,
             course_what_you_learn, course_target_audience, author_name,
             author_bio, author_expertise, transcript_excerpt
     Unknown/missing extended fields default to empty string.
+
+    Returns: list of 1-based absolute sheet row numbers, one per appended
+    row in the same order as `rows`. Empty list if rows was empty.
+    Streaming updates (update_lesson_row_partial) use these row numbers
+    as anchors.
     """
     if not rows:
-        return
+        return []
     ws = ensure_lessons_tab(client, sheet_id)
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     values: list[list[Any]] = [_lesson_row_to_values(r, run_id=run_id, ts=ts) for r in rows]
-    ws.append_rows(values, value_input_option="USER_ENTERED")
+    resp = ws.append_rows(values, value_input_option="USER_ENTERED",
+                          insert_data_option="INSERT_ROWS",
+                          include_values_in_response=False)
+    # Parse "Lessons!A11:AJ15" → starting row 11
+    updated_range = (resp or {}).get("updates", {}).get("updatedRange", "")
+    m = re.search(r"![A-Z]+(\d+):[A-Z]+(\d+)", updated_range)
+    if not m:
+        log.warning(f"append_lesson_rows: could not parse updatedRange '{updated_range}'")
+        return []
+    start_row = int(m.group(1))
+    return list(range(start_row, start_row + len(rows)))
 
 
 def _lesson_row_to_values(r: dict[str, Any], *, run_id: str, ts: str) -> list[Any]:
@@ -503,6 +519,39 @@ def update_status(client: Any, sheet_id: str, *, sheet_rows: list[int],
                 updates.append({"range": f"{col_reason}{r}", "values": [[failure_reason[:300]]]})
         ws.batch_update(updates, value_input_option="USER_ENTERED")
 
+
+
+def update_lesson_row_partial(client: Any, sheet_id: str, *, row_number: int,
+                              fields: dict[str, Any],
+                              status: str | None = None,
+                              failure_reason: str | None = None) -> None:
+    """Update only specified columns of a single Lessons row. Preserves all
+    other cells (including user-set `approved` checkbox).
+
+    `row_number` is 1-based absolute sheet row (as returned by append_lesson_rows).
+    `fields` maps LESSONS_HEADER column names to new values. Unknown keys ignored.
+    `status` and `failure_reason` are shortcuts for the same-named columns.
+    Empty/None values in fields are skipped — they won't blank existing cells.
+    """
+    with _SHEET_LOCK:
+        ws = ensure_lessons_tab(client, sheet_id)
+        updates: list[dict[str, Any]] = []
+        # Merge convenience args into fields dict
+        merged = dict(fields or {})
+        if status is not None:
+            merged["status"] = status
+        if failure_reason is not None:
+            merged["failure_reason"] = failure_reason[:300]
+        for header_name, value in merged.items():
+            if header_name not in LESSONS_HEADER:
+                continue
+            if value is None or value == "":
+                continue
+            col = _col_letter(header_name)
+            updates.append({"range": f"{col}{row_number}", "values": [[value]]})
+        if not updates:
+            return
+        ws.batch_update(updates, value_input_option="USER_ENTERED")
 
 # ---------------------------------------------------------------------------
 # Helpers

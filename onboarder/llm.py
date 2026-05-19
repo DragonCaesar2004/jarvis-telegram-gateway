@@ -288,21 +288,109 @@ def _call_json(*, model: str, system: str, user: str,
                 text = text[idx:]
                 break
 
-    # Use raw_decode so trailing prose after the JSON object/array doesn't fail
-    # the parse. Claude occasionally appends commentary like "Here's the scoring
-    # explanation..." after the JSON; raw_decode reads the JSON value and tells
-    # us where it ended, ignoring whatever comes after.
+    # raw_decode tolerates trailing prose after the JSON (Claude sometimes
+    # appends commentary). Reads the JSON value, returns it + end position.
     try:
         obj, end_idx = json.JSONDecoder().raw_decode(text)
         if end_idx < len(text):
             tail = text[end_idx:].strip()
             if tail:
-                log.info(f"llm: ignored {len(tail)} chars of trailing text after JSON "
-                         f"(preview: {tail[:120]!r})")
+                log.info(f"llm: ignored {len(tail)} chars of trailing text after JSON")
         return obj
     except json.JSONDecodeError as e:
         log.error(f"llm: JSON parse failed. Raw: {text[:500]}")
         raise ValueError(f"LLM returned non-JSON: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 0: search query generation
+# ---------------------------------------------------------------------------
+
+GENERATE_QUERIES_SYSTEM = """You are an expert at finding educational YouTube content for a SPECIFIC course topic.
+
+Given a course topic (and optional description), generate diverse search queries that ALL preserve the topic's core meaning. The goal: surface creators who teach the EXACT same thing, just phrased differently — not adjacent topics, not broader categories.
+
+## CRITICAL — preserve ALL core concepts in every query
+
+First, identify the core concepts in the topic. Examples:
+- "Kegel yoga for men" → core concepts: {Kegel, yoga, men}
+- "Postpartum pelvic floor recovery" → {postpartum, pelvic floor, recovery}
+- "Knee rehabilitation after meniscus surgery" → {knee, rehabilitation, meniscus, surgery (post-op)}
+- "Children's posture correction exercises" → {children, posture, correction, exercises}
+
+Then EVERY query you generate MUST contain a representation of EVERY core concept. You may swap synonyms inside a concept (yoga → yogic / yoga routine / yoga practice; men → male / mens / for men), but never DROP a concept to broaden the search.
+
+## What NOT to do (these are forbidden)
+
+- DO NOT drop the audience/gender qualifier. "Kegel yoga for men" must NOT become just "Kegel yoga" or just "yoga for men".
+- DO NOT drop the condition/scenario. "Knee rehab after surgery" must NOT become just "knee exercises".
+- DO NOT widen to a category. "Myofascial release" must NOT become "self massage" or "muscle therapy" (those are larger categories).
+- DO NOT replace a specific technique with a related-but-different one. "Kundalini yoga" must NOT become "vinyasa yoga".
+- DO NOT generate queries that would surface creators on RELATED but distinct topics.
+
+## What you CAN vary (surface form only)
+
+- Word order: "Kegel yoga for men" / "yoga Kegel routine men" / "men's yoga Kegel practice"
+- Synonyms for the SAME concept: men ↔ male ↔ mens ↔ for guys; exercises ↔ routine ↔ practice ↔ workout
+- Add neutral teaching qualifiers: "tutorial", "step by step", "for beginners", "at home", "complete guide"
+- Add neutral expert qualifiers ONLY if implied by the topic: "PT", "physical therapist" for rehab; "instructor", "trainer". Don't invent specialties not implied by the topic.
+- Add neutral format qualifiers: "class", "session", "course"
+
+## Rules
+
+- Write all queries in ENGLISH regardless of input language (YouTube's algorithm works best with English)
+- Each query 3-7 words — long enough to keep ALL core concepts, short enough for search
+- No duplicate intents — if two queries would return the same channels, merge them
+- Return exactly N queries (the requested count)
+- Return ONLY valid JSON array of strings, no prose
+
+## Examples
+
+Topic: "Kegel yoga for men", n=6
+Good output (preserves Kegel + yoga + men in EVERY query):
+["Kegel yoga for men", "Kegel exercises yoga men", "men Kegel yoga routine",
+ "male Kegel yoga practice", "mens Kegel yoga tutorial", "yoga Kegel workout for men"]
+
+Bad output (drops one or more concepts):
+["yoga for men", "Kegel exercises", "pelvic floor training", "men wellness routine", ...]
+
+Topic: "Postpartum pelvic floor recovery", n=5
+Good:
+["postpartum pelvic floor recovery", "pelvic floor recovery after birth",
+ "post-birth pelvic floor rehabilitation", "postpartum pelvic floor exercises",
+ "pelvic floor recovery for new mothers"]
+
+Bad (drops postpartum or recovery):
+["pelvic floor exercises", "after birth fitness", "Kegel for women", ...]
+
+Topic: "Knee rehabilitation after meniscus surgery", n=4
+Good:
+["knee rehabilitation after meniscus surgery", "meniscus surgery knee rehab",
+ "post meniscus surgery knee exercises", "knee recovery after meniscectomy"]
+"""
+
+
+def generate_search_queries(*, topic: str, pain: str = "",
+                            n: int = 6,
+                            model: str = DEFAULT_MODEL_FAST) -> list[str]:
+    """Generate N diverse YouTube search queries for the given topic.
+
+    Falls back to [topic] if Claude call fails so Phase 1 always has at least one query.
+    """
+    payload = {"topic": topic, "n": n}
+    if pain:
+        payload["course_description"] = pain
+    user = json.dumps(payload, ensure_ascii=False)
+    system = GENERATE_QUERIES_SYSTEM
+    try:
+        parsed = _call_json(model=model, system=system, user=user)
+        if isinstance(parsed, list):
+            queries = [str(q).strip() for q in parsed if q and str(q).strip()]
+            if queries:
+                return queries[:n]
+    except Exception as e:
+        log.warning(f"generate_search_queries failed ({e}), falling back to raw topic")
+    return [topic]
 
 
 # ---------------------------------------------------------------------------
@@ -346,10 +434,6 @@ def score_channels(*, topic: str, criteria: dict[str, Any],
         payload["target_audience"] = audience
     user = json.dumps(payload, ensure_ascii=False, indent=2)
     system = SCORE_CHANNELS_SYSTEM + _pain_audience_block(pain, audience)
-    # 15-min timeout: with HARD_CAP_CHANNELS_TO_CHECK at 100, the prompt can
-    # carry 50-100 channels (30K+ tokens). Default 180s isn't enough for Claude
-    # to process this much input; we raise specifically for score_channels so
-    # other callers keep their tighter timeouts.
     parsed = _call_json(model=model, system=system, user=user, timeout=900)  # 15 min for score_channels
     if not isinstance(parsed, list):
         raise ValueError(f"score_channels: expected list, got {type(parsed).__name__}")

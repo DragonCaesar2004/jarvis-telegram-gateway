@@ -23,6 +23,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from . import _global_throttle
 from pathlib import Path
 from typing import Any
 
@@ -718,7 +719,13 @@ def _download_with_rotation(*, token: str, chat_id: int, prefix: str,
             raise
 
 
-def _process_one_video(*, token: str, chat_id: int, prefix: str,
+def _process_one_video(**kwargs) -> dict:
+    """Public wrapper: enforce global slot budget then call impl."""
+    with _global_throttle.acquire_video_slot():
+        return _process_one_video_impl(**kwargs)
+
+
+def _process_one_video_impl(*, token: str, chat_id: int, prefix: str,
                        lesson: dict[str, Any], scratch_dir: Path,
                        openai_key: str,
                        get_google_translate_key, get_google_tts_key,

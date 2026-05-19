@@ -40,8 +40,9 @@ log = logging.getLogger("gateway")
 
 # Tuning knobs (some now overridable via Criteria)
 DEFAULT_SEARCH_RESULTS = 50   # criteria.search_results overrides
+DEFAULT_SEARCH_QUERIES = 6    # criteria.search_queries overrides — number of query variations
 TARGET_PASSING_PER_COURSE = 4  # legacy soft target; no longer used as early-exit
-HARD_CAP_CHANNELS_TO_CHECK = 50  # absolute ceiling on metadata fetches
+HARD_CAP_CHANNELS_TO_CHECK = 100  # absolute ceiling on metadata fetches
 MIN_LLM_SCORE = 0.4  # lowered from 0.5: more channels pass scoring → more
                      # candidates for the per-channel loop, less chance of
                      # Phase 1 failing because the top-3 didn't have on-topic
@@ -170,6 +171,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     )
     parallel_per_course = int(onb.get("phase1_parallel_per_course") or 4)
     compose_model = (onb.get("models") or {}).get("compose") or llm.DEFAULT_MODEL_QUALITY
+    streaming_enabled = bool(onb.get("streaming_sheet_writes", False))
 
     client = sheets.open_client(sa_path)
     criteria = sheets.read_criteria(client, sheet_id)
@@ -221,14 +223,47 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     else:
         _send(token, chat_id, "⚠️ Прокси не настроен — пробую напрямую с VPS-IP")
 
-    # ── 3. yt-dlp search → unique channels ───────────────────────────────
+    # ── 3. Generate query variations + parallel search → unique channels ──
     search_results = _criteria_int(criteria, "search_results", DEFAULT_SEARCH_RESULTS)
-    _send(token, chat_id, f"🔎 <i>Ищу каналы по теме «{_html_escape(topic)}»…</i>")
-    videos = ytdl.search_videos(topic, max_results=search_results)
-    if not videos:
-        raise RuntimeError(f"yt-dlp search returned 0 results for '{topic}'")
-    candidates = ytdl.unique_channels_from_search(videos)
-    log.info(f"phase1[{user_id}] {len(candidates)} unique channel candidates from {len(videos)} videos")
+    num_queries = _criteria_int(criteria, "search_queries", DEFAULT_SEARCH_QUERIES)
+
+    _send(token, chat_id, f"🔎 <i>Генерирую поисковые запросы по теме «{_html_escape(topic)}»…</i>")
+    queries = llm.generate_search_queries(topic=topic, pain=pain, n=num_queries)
+    _send(token, chat_id,
+          f"🔍 Ищу по <b>{len(queries)}</b> запросам:\n" +
+          "\n".join(f"  • <i>{_html_escape(q)}</i>" for q in queries))
+
+    all_videos: list[dict[str, Any]] = []
+    seen_video_ids: set[str] = set()
+    search_ex = ThreadPoolExecutor(max_workers=min(len(queries), 4))
+    try:
+        search_futures = {search_ex.submit(ytdl.search_videos, q, search_results): q
+                          for q in queries}
+        for fut in as_completed(search_futures, timeout=120):
+            q = search_futures[fut]
+            try:
+                vids = fut.result()
+                added = 0
+                for v in vids:
+                    vid = v.get("video_id")
+                    if vid and vid not in seen_video_ids:
+                        seen_video_ids.add(vid)
+                        all_videos.append(v)
+                        added += 1
+                log.info(f"phase1[{user_id}] query {q!r}: {len(vids)} results, {added} new")
+            except Exception as e:
+                log.warning(f"phase1[{user_id}] search query failed {q!r}: {e}")
+    except FuturesTimeoutError:
+        log.warning(f"phase1[{user_id}] search queries timed out, using partial results")
+    finally:
+        search_ex.shutdown(wait=False, cancel_futures=True)
+
+    if not all_videos:
+        raise RuntimeError(f"yt-dlp search returned 0 results for all queries: {queries}")
+
+    candidates = ytdl.unique_channels_from_search(all_videos)
+    log.info(f"phase1[{user_id}] {len(candidates)} unique channel candidates "
+             f"from {len(all_videos)} videos across {len(queries)} queries")
 
     # ── 4. Probe metadata for ALL candidates (up to HARD_CAP) ────────────
     # We used to early-exit once `target_passing` channels passed the hard
@@ -442,6 +477,18 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
 
         # ── 6a. ENRICH: download + transcribe + cuts + describe + compose ──
         videos_metadata = {v["video_id"]: v for v in all_videos}
+        # Streaming pre-allocate (opt-in via streaming_sheet_writes flag).
+        # Each selected video gets a pending row in the Sheet BEFORE enrich
+        # starts, so the reviewer can audit lessons as soon as each one
+        # finishes transcribe+describe (status=done).
+        streaming_row_map: dict[int, int] = {}
+        if streaming_enabled:
+            streaming_row_map = phase1_enrich.pre_allocate_for_streaming(
+                client, sheet_id, run_id=run_id, course_idx=course_idx,
+                channel_id=ch["channel_id"], channel_name=ch_name,
+                selected_videos=dedup_lessons,
+                videos_metadata=videos_metadata,
+            )
         try:
             enriched = phase1_enrich.enrich_course(
                 course_idx=course_idx, run_id=run_id,
@@ -459,6 +506,10 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                 max_parallel=parallel_per_course,
                 compose_model=compose_model,
                 pain=pain, audience=audience,
+                sheets_client=(client if streaming_enabled else None),
+                sheet_id=(sheet_id if streaming_enabled else None),
+                lesson_row_map=(streaming_row_map if streaming_enabled else None),
+                streaming_describe=streaming_enabled,
             )
         except CookiesNeededError:
             raise  # propagate to _worker for graceful pause
@@ -505,6 +556,22 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         course_target_ru = enriched.get("course_target_audience_ru", "")
         author_bio_ru = enriched.get("author_bio_ru", "")
         author_expertise_ru = enriched.get("author_expertise_ru", "")
+
+        # When streaming is active, rows are already in the Sheet (pre-allocated
+        # + per-video updates). Finalize row 1 with course-level fields and
+        # SKIP the local all_lesson_rows aggregation for this course — the
+        # final batch append below will see fewer rows but the Sheet is correct.
+        if streaming_enabled and streaming_row_map:
+            phase1_enrich.finalize_streaming_row1(
+                client, sheet_id,
+                lesson_row_map=streaming_row_map,
+                enriched=enriched,
+                full_course_title=full_course_title,
+                final_course_title=final_course_title,
+                author_name_fallback=ch_name,
+            )
+            successful_courses += 1
+            continue
 
         for v in enriched["videos"]:
             is_first = (v["lesson_idx"] == 1)
@@ -693,6 +760,7 @@ def _run_from_urls(token: str, agent: str, cfg: dict, chat_id: int, user_id: int
     )
     parallel_per_course = int(onb.get("phase1_parallel_per_course") or 4)
     compose_model = (onb.get("models") or {}).get("compose") or llm.DEFAULT_MODEL_QUALITY
+    streaming_enabled = bool(onb.get("streaming_sheet_writes", False))
 
     client = sheets.open_client(sa_path)
     sheets.ensure_lessons_tab(client, sheet_id)
@@ -808,6 +876,14 @@ def _run_from_urls(token: str, agent: str, cfg: dict, chat_id: int, user_id: int
     _send(token, chat_id,
           f"🎬 Обрабатываю {len(selected_videos)} видео "
           f"(скачивание + транскрибация + Claude)…")
+    streaming_row_map: dict[int, int] = {}
+    if streaming_enabled:
+        streaming_row_map = phase1_enrich.pre_allocate_for_streaming(
+            client, sheet_id, run_id=run_id, course_idx=1,
+            channel_id=channel_id, channel_name=channel_name,
+            selected_videos=selected_videos,
+            videos_metadata=videos_metadata,
+        )
     try:
         enriched = phase1_enrich.enrich_course(
             course_idx=1, run_id=run_id,
@@ -828,6 +904,10 @@ def _run_from_urls(token: str, agent: str, cfg: dict, chat_id: int, user_id: int
             on_progress=lambda msg: _send(token, chat_id, _html_escape(msg)),
             max_parallel=parallel_per_course,
             compose_model=compose_model,
+            sheets_client=(client if streaming_enabled else None),
+            sheet_id=(sheet_id if streaming_enabled else None),
+            lesson_row_map=(streaming_row_map if streaming_enabled else None),
+            streaming_describe=streaming_enabled,
         )
     except CookiesNeededError:
         raise
@@ -838,6 +918,36 @@ def _run_from_urls(token: str, agent: str, cfg: dict, chat_id: int, user_id: int
     # ── 5. Build Sheet rows and write ─────────────────────────────────────
     final_title = enriched.get("course_title") or channel_name
     full_title = f"Курс 1: {channel_name} — {final_title}"
+
+    if streaming_enabled and streaming_row_map:
+        # Rows already in Sheet (pre-allocated + per-video streamed). Finalize
+        # row 1 with course-level fields and short-circuit the batch path.
+        phase1_enrich.finalize_streaming_row1(
+            client, sheet_id,
+            lesson_row_map=streaming_row_map,
+            enriched=enriched,
+            full_course_title=full_title,
+            final_course_title=final_title,
+            author_name_fallback=channel_name,
+        )
+        _state.update(agent, user_id, thread_id=int(thread_id or 0),
+                      step="awaiting_approval",
+                      courses_summary=[f"1. {final_title} ({len(enriched['videos'])} уроков)"])
+        sheet_url = sheets.sheet_url(sheet_id)
+        _send_with_buttons(
+            token, chat_id,
+            text=(
+                f"✅ <b>Phase 1 готов (прямые ссылки, streaming).</b>\n\n"
+                f"Курс: <b>{_html_escape(final_title)}</b>\n"
+                f"Уроков: {len(enriched['videos'])}\n\n"
+                f"📋 Открой таб <b>Lessons</b>, проверь описания, "
+                f"отметь <b>Approved=TRUE</b>:\n"
+                f"{sheet_url}\n\nКогда готов — нажми кнопку:"
+            ),
+            buttons=[[{"text": "🚀 Запустить обработку", "callback_data": "wiz:start_phase2"},
+                      {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
+        )
+        return
 
     all_lesson_rows: list[dict[str, Any]] = []
     for v in enriched["videos"]:
@@ -982,6 +1092,7 @@ def _run_from_url_groups(token: str, agent: str, cfg: dict, chat_id: int,
     )
     parallel_per_course = int(onb.get("phase1_parallel_per_course") or 4)
     compose_model = (onb.get("models") or {}).get("compose") or llm.DEFAULT_MODEL_QUALITY
+    streaming_enabled = bool(onb.get("streaming_sheet_writes", False))
 
     client = sheets.open_client(sa_path)
     sheets.ensure_lessons_tab(client, sheet_id)
@@ -1039,6 +1150,9 @@ def _run_from_url_groups(token: str, agent: str, cfg: dict, chat_id: int,
                 openai_key=openai_key, cookies_file=youtube_cookies_file,
                 rotator=rotator, parallel_per_course=parallel_per_course,
                 compose_model=compose_model, token=token, chat_id=chat_id,
+                streaming_enabled=streaming_enabled,
+                sheets_client=client,
+                sheet_id=sheet_id,
             )
         except CookiesNeededError:
             raise  # propagate to worker handler
@@ -1050,7 +1164,9 @@ def _run_from_url_groups(token: str, agent: str, cfg: dict, chat_id: int,
             courses_failed.append(f"Курс {course_idx}: {str(e)[:80]}")
             continue
 
-        if not course_rows:
+        if not course_rows and not streaming_enabled:
+            # In streaming mode, an empty list means "rows already in Sheet"
+            # — it is success, not failure.
             courses_failed.append(f"Курс {course_idx}: нет уроков после обработки")
             continue
 
@@ -1068,7 +1184,9 @@ def _run_from_url_groups(token: str, agent: str, cfg: dict, chat_id: int,
                 sheets.append_lesson_rows(client, sheet_id, run_id=run_id,
                                           rows=new_rows)
 
-    if not all_lesson_rows:
+    # In streaming mode, all_lesson_rows stays empty (rows live only in Sheet),
+    # so a non-zero courses_done with empty all_lesson_rows is still success.
+    if courses_done == 0:
         raise RuntimeError(
             "Ни один курс из пакета не дал валидных уроков. "
             + ("\n".join(courses_failed) if courses_failed else "")
@@ -1110,6 +1228,14 @@ def _process_one_url_course(*, course_idx: int, run_id: str,
                             rotator: proxy_pool.ProxyRotator,
                             parallel_per_course: int, compose_model: str,
                             token: str, chat_id: int,
+                            # Streaming sheet writes (opt-in; default OFF). When
+                            # all three are provided, the helper pre-allocates +
+                            # streams writes + finalizes row 1 with course-level
+                            # fields, then returns [] so the orchestrator's batch
+                            # append is a no-op.
+                            streaming_enabled: bool = False,
+                            sheets_client: Any = None,
+                            sheet_id: str | None = None,
                             ) -> tuple[list[dict[str, Any]], str]:
     """Process ONE course of a URL batch. Returns (sheet_rows, summary_str).
 
@@ -1182,6 +1308,15 @@ def _process_one_url_course(*, course_idx: int, run_id: str,
           f"  🎬 Курс {course_idx} — <b>{_html_escape(channel_name)}</b>: "
           f"скачиваю + транскрибирую + compose ({len(selected_videos)} видео)…")
 
+    streaming_row_map: dict[int, int] = {}
+    if streaming_enabled and sheets_client is not None and sheet_id:
+        streaming_row_map = phase1_enrich.pre_allocate_for_streaming(
+            sheets_client, sheet_id, run_id=run_id, course_idx=course_idx,
+            channel_id=channel_id, channel_name=channel_name,
+            selected_videos=selected_videos,
+            videos_metadata=videos_metadata,
+        )
+
     enriched = phase1_enrich.enrich_course(
         course_idx=course_idx, run_id=run_id,
         channel_id=channel_id, channel_name=channel_name,
@@ -1195,6 +1330,10 @@ def _process_one_url_course(*, course_idx: int, run_id: str,
                                       f"  [Курс {course_idx}] {_html_escape(msg)}"),
         max_parallel=parallel_per_course,
         compose_model=compose_model,
+        sheets_client=(sheets_client if streaming_enabled else None),
+        sheet_id=(sheet_id if streaming_enabled else None),
+        lesson_row_map=(streaming_row_map if streaming_enabled else None),
+        streaming_describe=streaming_enabled,
     )
 
     if not enriched.get("videos"):
@@ -1238,6 +1377,19 @@ def _process_one_url_course(*, course_idx: int, run_id: str,
             "author_bio_ru": enriched.get("author_bio_ru", "") if is_first else "",
             "author_expertise_ru": enriched.get("author_expertise_ru", "") if is_first else "",
         })
+
+    if streaming_enabled and streaming_row_map and sheets_client is not None and sheet_id:
+        phase1_enrich.finalize_streaming_row1(
+            sheets_client, sheet_id,
+            lesson_row_map=streaming_row_map,
+            enriched=enriched,
+            full_course_title=full_title,
+            final_course_title=final_title,
+            author_name_fallback=channel_name,
+        )
+        # Rows already streamed — short-circuit so orchestrator's batch append
+        # is a no-op for this course.
+        rows = []
 
     summary = (f"{course_idx}. {final_title} "
                f"({len(enriched['videos'])} уроков, {channel_name})")
