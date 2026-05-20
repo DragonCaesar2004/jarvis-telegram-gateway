@@ -28,8 +28,9 @@ from typing import Any
 log = logging.getLogger("gateway")
 
 # CLI model aliases (claude -p --model <alias>)
-DEFAULT_MODEL_FAST = "sonnet"
-DEFAULT_MODEL_QUALITY = "opus"
+DEFAULT_MODEL_CHEAP = "haiku"     # mechanical tasks: cut detection, translation
+DEFAULT_MODEL_FAST = "sonnet"     # default reasoning: scoring, selection
+DEFAULT_MODEL_QUALITY = "opus"    # creative long-form: course compose, author research
 
 
 # ---------------------------------------------------------------------------
@@ -595,7 +596,7 @@ Use exact timestamps from the transcript (snap cut boundaries to the nearest seg
 
 
 def mark_cuts(*, course_topic: str, transcript: dict[str, Any],
-              model: str = DEFAULT_MODEL_FAST,
+              model: str = DEFAULT_MODEL_CHEAP,
               word_level: bool = False) -> list[dict[str, Any]]:
     """Identify ranges to remove from a video.
 
@@ -768,7 +769,7 @@ _RU_TRANSLATION_SEP = "\n\n— Перевод на русский —\n\n"
 
 
 def translate_batch_to_russian(items: list[dict[str, str]],
-                               model: str = DEFAULT_MODEL_FAST,
+                               model: str = DEFAULT_MODEL_CHEAP,
                                timeout: int = 180) -> dict[str, str]:
     """Translate many short texts in one Claude call.
 
