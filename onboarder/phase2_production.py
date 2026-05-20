@@ -307,6 +307,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                 youtube_cookies_file=youtube_cookies_file,
                 rotator=rotator,
                 parallel_videos=int(onb.get("phase2_parallel_videos", 1) or 1),
+                mark_cuts_word_level=bool(onb.get("mark_cuts_word_level", False)),
             )
         finally:
             # Free disk regardless of outcome
@@ -604,7 +605,8 @@ def _process_course_videos(*, token: str, chat_id: int, agent: str, user_id: int
                            course_topic: str,
                            youtube_cookies_file: str | None = None,
                            rotator=None,
-                           parallel_videos: int = 1) -> list[dict[str, Any]]:
+                           parallel_videos: int = 1,
+                           mark_cuts_word_level: bool = False) -> list[dict[str, Any]]:
     """Process every approved video in a course → list of NMS lesson payloads."""
     total = len(lessons)
     parallel = max(1, min(int(parallel_videos or 1), total))
@@ -622,6 +624,7 @@ def _process_course_videos(*, token: str, chat_id: int, agent: str, user_id: int
             "course_topic": course_topic,
             "youtube_cookies_file": youtube_cookies_file,
             "rotator": rotator,
+            "mark_cuts_word_level": mark_cuts_word_level,
         }
 
     # ── Sequential path (original behavior, default). ───────────────────
@@ -773,7 +776,8 @@ def _process_one_video_impl(*, token: str, chat_id: int, prefix: str,
                        bunny_lib: str, bunny_key: str,
                        course_topic: str,
                        youtube_cookies_file: str | None = None,
-                       rotator=None) -> dict[str, Any]:
+                       rotator=None,
+                       mark_cuts_word_level: bool = False) -> dict[str, Any]:
     """Phase 2: download → cut → dub (Google TTS) → upload."""
     from .google_dub import _iso as _lang_iso
 
@@ -820,7 +824,8 @@ def _process_one_video_impl(*, token: str, chat_id: int, prefix: str,
         working = whisper.transcribe(api_key=openai_key, file_path=raw_path,
                                      with_word_timestamps=True)
         detected_lang = _lang_iso((working.get("language") or "").lower())
-        cuts = llm.mark_cuts(course_topic=course_topic, transcript=working) or []
+        cuts = llm.mark_cuts(course_topic=course_topic, transcript=working,
+                             word_level=mark_cuts_word_level) or []
         cached_segments = working.get("segments") or []
 
     cuts_summary = f"{len(cuts)} кусков" if cuts else "нет вырезок"

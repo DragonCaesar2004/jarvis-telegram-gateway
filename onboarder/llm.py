@@ -542,7 +542,7 @@ def select_videos(*, topic: str, criteria: dict[str, Any],
 # Phase 2: cut markers from transcript
 # ---------------------------------------------------------------------------
 
-MARK_CUTS_SYSTEM = """You edit educational videos by identifying segments to remove.
+MARK_CUTS_SYSTEM_WORD_LEVEL = """You edit educational videos by identifying segments to remove.
 
 Given a Whisper transcript with word-level timestamps, return time ranges (in seconds) to CUT OUT. Target:
 - Channel intros (logo animations, "Hi everyone, welcome back to my channel")
@@ -564,16 +564,89 @@ Use exact timestamps from the transcript. Cuts must not overlap. Empty list if n
 """
 
 
+# Segment-level variant. The transcript is fed with compact keys to minimize
+# input-token cost — `s` = start (seconds), `e` = end (seconds), `t` = text.
+# The model is asked to use the same compact schema in its reply (`s`, `e`, `r`).
+# Boundary precision drops from ~0.3s to the segment width (~3-5s), which is
+# fine because FFmpeg re-encodes from the closest keyframe (~2s grid) anyway.
+MARK_CUTS_SYSTEM_SEGMENT = """You edit educational videos by identifying segments to remove.
+
+Input format (compact to save tokens):
+- `course_topic`: string
+- `transcript`: an array of segments, each as {"s": start_seconds, "e": end_seconds, "t": text}
+
+Identify ranges to CUT OUT. Target:
+- Channel intros (logo animations, "Hi everyone, welcome back to my channel")
+- Outros ("Like and subscribe", "Hit the notification bell", "See you next time")
+- Mid-roll promotional segments (mentions of the host's paid course, sponsorship reads, "join my Patreon")
+- Off-topic personal stories that don't serve the course topic
+- Excessive filler (30+ seconds of repeated false starts; isolated "ums" are fine)
+
+Be CONSERVATIVE: if unsure, KEEP the segment. The course topic context is provided so you can judge relevance.
+
+Return ONLY valid JSON, no prose, using the SAME compact keys (`s` = start, `e` = end, `r` = reason):
+[
+  {"s": 0.0, "e": 18.4, "r": "intro animation + greeting"},
+  {"s": 754.2, "e": 770.1, "r": "subscribe call mid-video"}
+]
+
+Use exact timestamps from the transcript (snap cut boundaries to the nearest segment `s`/`e`). Cuts must not overlap. Empty list `[]` if nothing to cut.
+"""
+
+
 def mark_cuts(*, course_topic: str, transcript: dict[str, Any],
-              model: str = DEFAULT_MODEL_FAST) -> list[dict[str, Any]]:
-    """Return list of {start, end, reason} time ranges to remove."""
-    user = json.dumps({"course_topic": course_topic, "transcript": transcript},
-                      ensure_ascii=False)
-    parsed = _call_json(model=model, system=MARK_CUTS_SYSTEM, user=user,
-                        max_tokens=4096)
+              model: str = DEFAULT_MODEL_FAST,
+              word_level: bool = False) -> list[dict[str, Any]]:
+    """Identify ranges to remove from a video.
+
+    `word_level=False` (default): feed the LLM only segment-level start/end/text
+    using compact `s`/`e`/`t` keys. ~10-13× cheaper on input tokens than the
+    word-level version because we drop the `words` array, the BPE `tokens`
+    list, and the Whisper noise stats (logprob/compression/etc).
+
+    `word_level=True`: legacy behavior — pass the full Whisper response
+    including word-level timestamps and BPE tokens. Use only when you need
+    sub-second boundary precision (rarely worth it — FFmpeg snaps to ~2s
+    keyframes during re-encode anyway).
+
+    Returns list of cuts in canonical {start, end, reason} shape regardless
+    of which mode was used (compact `s`/`e`/`r` from the model gets normalised).
+    """
+    if word_level:
+        user = json.dumps({"course_topic": course_topic, "transcript": transcript},
+                          ensure_ascii=False)
+        system = MARK_CUTS_SYSTEM_WORD_LEVEL
+    else:
+        lean = [
+            {"s": s.get("start"), "e": s.get("end"), "t": s.get("text")}
+            for s in (transcript.get("segments") or [])
+        ]
+        user = json.dumps({"course_topic": course_topic, "transcript": lean},
+                          ensure_ascii=False)
+        system = MARK_CUTS_SYSTEM_SEGMENT
+
+    parsed = _call_json(model=model, system=system, user=user, max_tokens=4096)
     if not isinstance(parsed, list):
         raise ValueError(f"mark_cuts: expected list, got {type(parsed).__name__}")
-    return parsed
+
+    # Normalise compact (s/e/r) → canonical (start/end/reason). Tolerate either
+    # form so a model that drifts back to the verbose keys still works.
+    out: list[dict[str, Any]] = []
+    for c in parsed:
+        if not isinstance(c, dict):
+            continue
+        start = c.get("start") if "start" in c else c.get("s")
+        end = c.get("end") if "end" in c else c.get("e")
+        reason = c.get("reason") if "reason" in c else c.get("r", "")
+        if start is None or end is None:
+            continue
+        out.append({"start": float(start), "end": float(end),
+                    "reason": str(reason or "")})
+    return out
+
+
+# Backwards-compat alias for any caller that imported the original symbol name.
+MARK_CUTS_SYSTEM = MARK_CUTS_SYSTEM_WORD_LEVEL
 
 
 # ---------------------------------------------------------------------------

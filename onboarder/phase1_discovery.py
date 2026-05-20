@@ -172,6 +172,10 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     parallel_per_course = int(onb.get("phase1_parallel_per_course") or 4)
     compose_model = (onb.get("models") or {}).get("compose") or llm.DEFAULT_MODEL_QUALITY
     streaming_enabled = bool(onb.get("streaming_sheet_writes", False))
+    # Opt-in: send full Whisper word-level transcript to mark_cuts (~10× input
+    # token cost). Default off — segment-level is enough for intro/outro cuts
+    # since FFmpeg snaps to ~2s keyframes during re-encode anyway.
+    mark_cuts_word_level = bool(onb.get("mark_cuts_word_level", False))
 
     client = sheets.open_client(sa_path)
     criteria = sheets.read_criteria(client, sheet_id)
@@ -510,6 +514,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                 sheet_id=(sheet_id if streaming_enabled else None),
                 lesson_row_map=(streaming_row_map if streaming_enabled else None),
                 streaming_describe=streaming_enabled,
+                mark_cuts_word_level=mark_cuts_word_level,
             )
         except CookiesNeededError:
             raise  # propagate to _worker for graceful pause
@@ -776,6 +781,7 @@ def _run_from_urls(token: str, agent: str, cfg: dict, chat_id: int, user_id: int
     parallel_per_course = int(onb.get("phase1_parallel_per_course") or 4)
     compose_model = (onb.get("models") or {}).get("compose") or llm.DEFAULT_MODEL_QUALITY
     streaming_enabled = bool(onb.get("streaming_sheet_writes", False))
+    mark_cuts_word_level = bool(onb.get("mark_cuts_word_level", False))
 
     client = sheets.open_client(sa_path)
     sheets.ensure_lessons_tab(client, sheet_id)
@@ -923,6 +929,7 @@ def _run_from_urls(token: str, agent: str, cfg: dict, chat_id: int, user_id: int
             sheet_id=(sheet_id if streaming_enabled else None),
             lesson_row_map=(streaming_row_map if streaming_enabled else None),
             streaming_describe=streaming_enabled,
+            mark_cuts_word_level=bool(onb.get("mark_cuts_word_level", False)),
         )
     except CookiesNeededError:
         raise
@@ -1091,6 +1098,7 @@ def _run_from_url_groups(token: str, agent: str, cfg: dict, chat_id: int,
     parallel_per_course = int(onb.get("phase1_parallel_per_course") or 4)
     compose_model = (onb.get("models") or {}).get("compose") or llm.DEFAULT_MODEL_QUALITY
     streaming_enabled = bool(onb.get("streaming_sheet_writes", False))
+    mark_cuts_word_level = bool(onb.get("mark_cuts_word_level", False))
 
     client = sheets.open_client(sa_path)
     sheets.ensure_lessons_tab(client, sheet_id)
@@ -1151,6 +1159,7 @@ def _run_from_url_groups(token: str, agent: str, cfg: dict, chat_id: int,
                 streaming_enabled=streaming_enabled,
                 sheets_client=client,
                 sheet_id=sheet_id,
+                mark_cuts_word_level=mark_cuts_word_level,
             )
         except CookiesNeededError:
             raise  # propagate to worker handler
@@ -1225,6 +1234,7 @@ def _process_one_url_course(*, course_idx: int, run_id: str,
                             streaming_enabled: bool = False,
                             sheets_client: Any = None,
                             sheet_id: str | None = None,
+                            mark_cuts_word_level: bool = False,
                             ) -> tuple[list[dict[str, Any]], str]:
     """Process ONE course of a URL batch. Returns (sheet_rows, summary_str).
 
@@ -1323,6 +1333,7 @@ def _process_one_url_course(*, course_idx: int, run_id: str,
         sheet_id=(sheet_id if streaming_enabled else None),
         lesson_row_map=(streaming_row_map if streaming_enabled else None),
         streaming_describe=streaming_enabled,
+        mark_cuts_word_level=mark_cuts_word_level,
     )
 
     if not enriched.get("videos"):

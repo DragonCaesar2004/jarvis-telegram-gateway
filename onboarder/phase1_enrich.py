@@ -76,6 +76,7 @@ def enrich_course(*, course_idx: int, run_id: str,
                   sheet_id: str | None = None,
                   lesson_row_map: dict[int, int] | None = None,
                   streaming_describe: bool = False,
+                  mark_cuts_word_level: bool = False,
                   ) -> dict[str, Any]:
     """Heavy lift: download, transcribe, mark cuts, describe, research author, compose.
 
@@ -153,6 +154,7 @@ def enrich_course(*, course_idx: int, run_id: str,
                 cookies_file=cookies_file,
                 rotator=rotator,
                 openai_key=openai_key,
+                mark_cuts_word_level=mark_cuts_word_level,
             ))
         cookies_needed: CookiesNeededError | None = None
         for fut in as_completed(futures):
@@ -459,7 +461,8 @@ def _process_video_for_enrich(**kwargs) -> dict:
 def _process_video_for_enrich_impl(*, video_id: str, title: str, url: str,
                               course_topic: str, cookies_file: str | None,
                               rotator: ProxyRotator | None,
-                              openai_key: str) -> dict[str, Any]:
+                              openai_key: str,
+                              mark_cuts_word_level: bool = False) -> dict[str, Any]:
     """One video: download to cache → working transcribe → mark cuts → save to db.
 
     Returns a dict with `ok=True` on success or `ok=False` + `error` on failure.
@@ -486,7 +489,8 @@ def _process_video_for_enrich_impl(*, video_id: str, title: str, url: str,
 
         cuts: list[dict[str, Any]] = []
         try:
-            cuts = llm.mark_cuts(course_topic=course_topic, transcript=working) or []
+            cuts = llm.mark_cuts(course_topic=course_topic, transcript=working,
+                                 word_level=mark_cuts_word_level) or []
         except Exception as e:
             log.warning(f"phase1_enrich: mark_cuts failed for {video_id}: {e}")
             cuts = []
