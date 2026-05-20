@@ -65,12 +65,54 @@ def _parse_course_id_from_admin_url(url: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _read_failed_rows(client: Any, sheet_id: str, *, run_id: str,
-                     course_idx: int | None) -> list[dict[str, Any]]:
-    """Return Sheet rows with status=failed and a usable course_admin_url.
+# Whisper labels that mark a video as actually-English-mis-detected. Rows
+# whose video_id resolves to one of these in pipeline.db are the ones that
+# google_dub.translate_batch killed with 400 Invalid Value, even though
+# phase2's outer success path then stamped the WHOLE course's rows DONE
+# (including the failed ones). We treat such "phantom-done" rows as
+# recovery candidates the same as explicit `status=failed` rows.
+PHANTOM_MISDETECT_LANGS = {
+    "welsh", "cymraeg", "javanese", "jawa",
+    "nynorsk", "norwegian nynorsk",
+    "latin", "esperanto", "haitian creole",
+}
 
-    Each item carries enough data to feed phase2_production._process_one_video
-    (video_id, title, url, course, course_idx, lesson_idx, …).
+
+def _scan_pipeline_db_misdetected_video_ids() -> set[str]:
+    """Return every video_id in pipeline.db whose detected_lang is one of
+    the known Whisper misdetect labels. Used to find "phantom-done" rows."""
+    import sqlite3
+    db_path = Path(__file__).resolve().parent.parent / "state" / "pipeline.db"
+    if not db_path.exists():
+        log.warning(f"pipeline.db not found at {db_path}")
+        return set()
+    out: set[str] = set()
+    try:
+        c = sqlite3.connect(str(db_path))
+        for row in c.execute("SELECT video_id, detected_lang FROM video_cuts"):
+            vid, lang = row
+            if (lang or "").strip().lower() in PHANTOM_MISDETECT_LANGS:
+                out.add(vid)
+        c.close()
+    except Exception as e:
+        log.warning(f"pipeline.db scan failed: {e}")
+    return out
+
+
+def _read_recovery_candidates(client: Any, sheet_id: str, *, run_id: str,
+                              course_idx: int | None,
+                              include_misdetect: bool,
+                              video_ids_filter: set[str] | None) -> list[dict[str, Any]]:
+    """Return Sheet rows that are candidates for recovery.
+
+    A row qualifies when:
+      • it has a populated course_admin_url (= a real course exists), AND
+      • one of:
+          - status=failed (the originally-intended path), OR
+          - `--video-ids` filter explicitly includes its video_id, OR
+          - include_misdetect AND pipeline.db says its video_id was
+            mis-detected by Whisper (welsh/javanese/etc) — these are
+            "phantom-done" rows that we don't trust.
     """
     from .sheets import (
         ensure_lessons_tab, _row_to_dict, _safe_int,
@@ -83,32 +125,55 @@ def _read_failed_rows(client: Any, sheet_id: str, *, run_id: str,
         return []
     header = rows[0]
 
+    misdetect_ids: set[str] = set()
+    if include_misdetect:
+        misdetect_ids = _scan_pipeline_db_misdetected_video_ids()
+        log.info(f"pipeline.db: {len(misdetect_ids)} misdetected video_ids "
+                 f"({sorted(misdetect_ids)[:6]}{'…' if len(misdetect_ids) > 6 else ''})")
+
     out: list[dict[str, Any]] = []
     for i, raw in enumerate(rows[1:], start=2):
         d = _row_to_dict(raw, header)
         if d.get("run_id", "").strip() != run_id:
             continue
-        if d.get("status", "").strip().lower() != STATUS_FAILED:
-            continue
-        admin_url = d.get("course_admin_url", "").strip()
-        course_id = _parse_course_id_from_admin_url(admin_url)
-        if not course_id:
-            log.warning(f"row {i}: status=failed but no course_admin_url — skip")
-            continue
         if course_idx is not None and _safe_int(d.get("course_idx", "")) != int(course_idx):
             continue
+
+        vid = d.get("video_id", "").strip()
+        status_lower = d.get("status", "").strip().lower()
+        admin_url = d.get("course_admin_url", "").strip()
+
+        is_failed = status_lower == STATUS_FAILED
+        is_explicit = video_ids_filter is not None and vid in video_ids_filter
+        is_phantom = include_misdetect and vid in misdetect_ids
+
+        if not (is_failed or is_explicit or is_phantom):
+            continue
+
+        course_id = _parse_course_id_from_admin_url(admin_url)
+        if not course_id:
+            log.warning(f"row {i}: candidate but no course_admin_url — skip")
+            continue
+
         try:
             duration_sec = int(d.get("duration_sec") or 0)
         except ValueError:
             duration_sec = 0
+
+        reason = (
+            "status=failed" if is_failed
+            else "phantom-done (misdetect)" if is_phantom
+            else "explicit video_id"
+        )
         out.append({
             "_sheet_row": i,
             "_course_id": course_id,
             "_admin_url": admin_url,
+            "_reason": reason,
             "course": d.get("course", ""),
             "course_idx": _safe_int(d.get("course_idx", "")),
             "lesson_idx": _safe_int(d.get("lesson_idx", "")),
-            "video_id": d.get("video_id", "").strip(),
+            "video_id": vid,
             "title": d.get("lesson_title", "").strip(),
             "url": d.get("url", "").strip(),
             "channel": d.get("channel", "").strip(),
@@ -118,6 +183,14 @@ def _read_failed_rows(client: Any, sheet_id: str, *, run_id: str,
             "transcript_excerpt": d.get("transcript_excerpt", "").strip(),
         })
     return out
+
+
+# Back-compat alias for old callers / inline tests
+def _read_failed_rows(client, sheet_id, *, run_id, course_idx):
+    return _read_recovery_candidates(
+        client, sheet_id, run_id=run_id, course_idx=course_idx,
+        include_misdetect=False, video_ids_filter=None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +293,15 @@ def main() -> int:
                    help="Optional: only this course within the run")
     p.add_argument("--voice-gender", default="MALE", choices=["MALE", "FEMALE"],
                    help="Voice gender for any dub that DOES happen (default MALE)")
+    p.add_argument("--include-misdetect", action="store_true",
+                   help="Also recover rows marked status=done but whose video "
+                        "is in pipeline.db with a Whisper-misdetect language "
+                        "(welsh/javanese/etc) — these are 'phantom-done' rows "
+                        "from before the welsh-skip fix.")
+    p.add_argument("--video-ids", default="",
+                   help="Comma-separated list of explicit video_ids to recover "
+                        "(overrides status filter for those rows; useful when "
+                        "you know exactly which lessons need redoing).")
     p.add_argument("--dry-run", action="store_true",
                    help="List what would be done, don't process or append")
     p.add_argument("--verbose", "-v", action="store_true")
@@ -245,11 +327,19 @@ def main() -> int:
         log.error("config: nms_endpoint or nms_api_token missing")
         return 2
 
+    video_ids_filter: set[str] | None = None
+    if args.video_ids.strip():
+        video_ids_filter = {v.strip() for v in args.video_ids.split(",") if v.strip()}
+
     client = sheets.open_client(sa_path)
-    rows = _read_failed_rows(client, sheet_id,
-                             run_id=args.run_id, course_idx=args.course_idx)
+    rows = _read_recovery_candidates(
+        client, sheet_id,
+        run_id=args.run_id, course_idx=args.course_idx,
+        include_misdetect=args.include_misdetect,
+        video_ids_filter=video_ids_filter,
+    )
     if not rows:
-        log.info(f"No failed rows for run_id={args.run_id}"
+        log.info(f"No recovery candidates for run_id={args.run_id}"
                  + (f" course_idx={args.course_idx}" if args.course_idx else "")
                  + " — nothing to recover.")
         return 0
@@ -261,9 +351,12 @@ def main() -> int:
     log.info(f"Recovery plan for run_id={args.run_id}:")
     for cid, rs in by_course_id.items():
         course_idx = rs[0]["course_idx"]
-        titles = ", ".join(r["title"][:40] for r in rs[:3])
-        more = f" (+{len(rs) - 3} more)" if len(rs) > 3 else ""
-        log.info(f"  • Курс {course_idx} → admin {cid}: {len(rs)} видео ({titles}{more})")
+        reasons = {r["_reason"] for r in rs}
+        log.info(f"  • Курс {course_idx} → admin {cid}: {len(rs)} видео  "
+                 f"[{', '.join(reasons)}]")
+        for r in rs:
+            log.info(f"      lesson_idx={r['lesson_idx']:3} "
+                     f"video_id={r['video_id']:12} title={r['title'][:60]}")
 
     if args.dry_run:
         log.info("--dry-run: stopping here.")
