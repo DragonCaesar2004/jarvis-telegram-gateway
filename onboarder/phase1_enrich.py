@@ -538,21 +538,44 @@ flaky for this specific video (bandwidth cap, server-side throttle, or
 mid-stream connection reset). Rotating to a fresh proxy usually recovers."""
 
 
+# How many DIFFERENT proxies to try when a video keeps tripping 403 Forbidden
+# from the CDN. This is independent of the bot-check pool-exhaustion path —
+# 403 usually means the specific googlevideo edge IP rate-limited THIS proxy,
+# not that cookies are dead, so we just hop to another residential exit.
+MAX_403_PROXY_ROTATIONS = 4
+
+
 def _download_with_rotation(*, video_id: str, url: str, output_path: Path,
                             cookies_file: str | None,
                             rotator: ProxyRotator | None) -> Path:
-    """Download with thread-aware proxy rotation.
+    """Download a YouTube video with per-video proxy rotation.
 
-    Handles two distinct failure modes:
-      1. Bot-check ("Sign in to confirm you're not a bot") — rotate until pool
-         exhausted, then raise CookiesNeededError so wizard prompts for cookies.
-      2. Truncated download ("Giving up after N retries", "X bytes read, Y more
-         expected") — rotate up to MAX_TRUNCATED_PROXY_ROTATIONS different proxies,
-         then give up and raise FFmpegError (caller skips this one video).
+    Strategy:
+      * Each call picks a FRESH proxy from `rotator.next_round_robin()` —
+        distributes load across the whole pool so YouTube's CDN per-IP rate
+        limit can't lock the entire pipeline behind one IP. Previously every
+        video re-used `rotator.current`, which is exactly how we got the
+        wave of HTTP 403's: 8 parallel downloads went through one proxy,
+        googlevideo banned that IP, all 8 failed at once.
+
+      * On failure, three distinct paths:
+          1. Bot-check ("Sign in to confirm you're not a bot") — blacklist
+             this proxy for 10 min and rotate to next. If we exhaust the
+             pool (every proxy hits bot-check), raise CookiesNeededError so
+             the wizard asks the operator for fresh YouTube cookies.
+          2. HTTP 403 Forbidden — blacklist this proxy for 5 min and rotate.
+             Give up after MAX_403_PROXY_ROTATIONS so a permanently-bad
+             video can't run forever.
+          3. Truncated mid-stream download — same 5-min blacklist + rotate,
+             bounded by MAX_TRUNCATED_PROXY_ROTATIONS.
     """
+    bot_check_tries = 0
     truncated_tries = 0
+    forbidden_tries = 0
     while True:
-        proxy = rotator.current if rotator else None
+        # Per-video: pick a different proxy each call. Falls back to None
+        # when the pool is empty (= no proxies configured).
+        proxy = rotator.next_round_robin() if rotator else None
         try:
             return ffmpeg_cut.download_video(
                 url=url, output_path=output_path,
@@ -560,27 +583,40 @@ def _download_with_rotation(*, video_id: str, url: str, output_path: Path,
             )
         except ffmpeg_cut.FFmpegError as e:
             if _is_bot_check(e) and rotator is not None:
-                new_proxy = rotator.rotate_if_still(proxy)
-                if new_proxy is None:
+                rotator.mark_bad(proxy, ttl_seconds=600)
+                bot_check_tries += 1
+                # If we've cycled through every proxy in the pool and they
+                # ALL bot-check, cookies are the only remaining lever.
+                if bot_check_tries >= len(rotator.pool):
                     raise CookiesNeededError(
                         f"Все {len(rotator.pool)} прокси из пула заблокированы "
                         f"YouTube'ом в Phase 1 (видео {video_id}). Cookies "
                         f"скорее всего тоже устарели."
                     ) from e
                 continue
+            if _is_forbidden(e) and rotator is not None:
+                rotator.mark_bad(proxy, ttl_seconds=300)
+                forbidden_tries += 1
+                if forbidden_tries > MAX_403_PROXY_ROTATIONS:
+                    log.warning(
+                        f"phase1_enrich: video {video_id} got 403 on "
+                        f"{forbidden_tries} different proxies, giving up"
+                    )
+                    raise
+                log.info(
+                    f"phase1_enrich: video {video_id} 403 on "
+                    f"{proxy_pool._proxy_label(proxy)}, "
+                    f"rotating ({forbidden_tries}/{MAX_403_PROXY_ROTATIONS})"
+                )
+                continue
             if _is_truncated_download(e) and rotator is not None:
+                rotator.mark_bad(proxy, ttl_seconds=300)
                 truncated_tries += 1
                 if truncated_tries > MAX_TRUNCATED_PROXY_ROTATIONS:
                     log.warning(
                         f"phase1_enrich: video {video_id} truncated on "
                         f"{truncated_tries} different proxies, giving up"
                     )
-                    raise
-                new_proxy = rotator.rotate_if_still(proxy)
-                if new_proxy is None:
-                    # Pool exhausted before hitting the rotation budget — surface
-                    # the truncation error, not CookiesNeededError (cookies are
-                    # not the issue here).
                     raise
                 log.info(
                     f"phase1_enrich: video {video_id} truncated, trying proxy "
@@ -594,6 +630,12 @@ def _download_with_rotation(*, video_id: str, url: str, output_path: Path,
 def _is_bot_check(err: Exception) -> bool:
     s = str(err).lower()
     return "sign in to confirm" in s or "not a bot" in s
+
+
+def _is_forbidden(err: Exception) -> bool:
+    """Match yt-dlp's 403-from-CDN error string."""
+    s = str(err).lower()
+    return "http error 403" in s or "403 forbidden" in s
 
 
 def _is_truncated_download(err: Exception) -> bool:

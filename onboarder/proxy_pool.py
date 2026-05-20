@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -148,6 +149,12 @@ class ProxyRotator:
         self.tried: set[str] = set()
         self.current: str | None = None
         self._lock = threading.Lock()
+        # Round-robin index for per-video proxy assignment.
+        self._rr_idx = 0
+        # Short-term blacklist: proxy → epoch-time when it can be tried again.
+        # Used by mark_bad() so 403/timeout proxies are skipped for a few
+        # minutes instead of being hammered repeatedly.
+        self._blacklist: dict[str, float] = {}
 
     def init(self, on_progress=None) -> str | None:
         """Pick the first working proxy. Returns it or raises NoWorkingProxyError."""
@@ -199,6 +206,48 @@ class ProxyRotator:
         if already_rotated:
             return current_snapshot
         return self.rotate(on_progress=on_progress)
+
+    def next_round_robin(self) -> str | None:
+        """Hand out the next non-blacklisted proxy from the pool. No probe.
+
+        Distributes load across all proxies — each video gets a different IP,
+        so YouTube CDN's per-IP rate limit doesn't lock the whole pipeline on
+        the first request burst. Wraps around at the end of the pool.
+
+        Skips proxies in the short-term blacklist (set by mark_bad). If every
+        proxy is currently blacklisted, returns the one whose ban expires
+        soonest — keeps the pipeline moving even when everyone's flaky.
+        """
+        if not self.pool:
+            return None
+        now = time.time()
+        with self._lock:
+            n = len(self.pool)
+            # Try up to N positions to find a non-blacklisted one.
+            for _ in range(n):
+                proxy = self.pool[self._rr_idx % n]
+                self._rr_idx = (self._rr_idx + 1) % (n * 1000 or 1)  # keep bounded
+                unblock = self._blacklist.get(proxy)
+                if unblock is None or unblock <= now:
+                    return proxy
+            # All blacklisted: pick the one whose ban expires soonest.
+            if self._blacklist:
+                best = min(self._blacklist.items(), key=lambda kv: kv[1])
+                return best[0]
+            return self.pool[0]
+
+    def mark_bad(self, proxy: str | None, ttl_seconds: int = 300) -> None:
+        """Add `proxy` to the short-term blacklist so next_round_robin skips it.
+
+        Default TTL is 5 min — long enough for YouTube to drop a CDN rate
+        limit, short enough that good proxies aren't lost for the rest of the
+        run. Called by phase1_enrich when a proxy returns 403 / bot-check /
+        truncated download.
+        """
+        if not proxy:
+            return
+        with self._lock:
+            self._blacklist[proxy] = time.time() + max(1, int(ttl_seconds))
 
 
 def normalise_pool(cfg_value) -> list[str]:

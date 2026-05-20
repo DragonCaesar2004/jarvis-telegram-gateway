@@ -692,6 +692,12 @@ def _is_bot_check_error(err: Exception) -> bool:
     return "sign in to confirm" in s or "not a bot" in s
 
 
+def _is_forbidden_error(err: Exception) -> bool:
+    """Match yt-dlp's HTTP 403 Forbidden from the googlevideo CDN."""
+    s = str(err).lower()
+    return "http error 403" in s or "403 forbidden" in s
+
+
 def _is_truncated_download_error(err: Exception) -> bool:
     """Match yt-dlp's mid-stream truncation errors so we can rotate proxy."""
     s = str(err).lower()
@@ -707,22 +713,36 @@ def _is_truncated_download_error(err: Exception) -> bool:
 MAX_TRUNCATED_PROXY_ROTATIONS = 5
 """How many fresh proxies to try when yt-dlp's internal retries are exhausted."""
 
+MAX_403_PROXY_ROTATIONS = 4
+"""How many proxies to try when YouTube's CDN returns 403 Forbidden.
+   Independent of bot-check — 403 means this IP got CDN rate-limited, not
+   that cookies are dead, so we just hop to a different residential exit."""
+
 
 def _download_with_rotation(*, token: str, chat_id: int, prefix: str,
                             url: str, output_path, cookies_file: str | None,
                             rotator) -> "Path":
-    """Download with proxy rotation on bot-check OR truncation failures.
+    """Download with PER-VIDEO proxy rotation + retry-on-failure.
 
-    - Bot-check ("Sign in to confirm"): rotate until pool exhausted, then raise
-      CookiesNeededError (wizard prompts user to refresh cookies).
-    - Truncation ("Giving up after N retries", "X bytes read, Y more expected"):
-      rotate up to MAX_TRUNCATED_PROXY_ROTATIONS times; if all fail, give up on
-      this video and let caller skip it (no cookies prompt — cookies are fine).
-    - Anything else: surface immediately.
+    Each call picks a fresh proxy via `rotator.next_round_robin()` so the
+    load is distributed across the whole pool — previously every download
+    re-used `rotator.current`, which let one rate-limited IP fail every
+    in-flight worker at once.
+
+    Failure handling:
+      * Bot-check ("Sign in to confirm"): blacklist this proxy for 10 min
+        and try another. If every proxy bot-checks, raise CookiesNeededError.
+      * 403 Forbidden (CDN rate-limit on the residential IP): blacklist for
+        5 min and rotate. Bounded by MAX_403_PROXY_ROTATIONS so a doomed
+        video can't loop forever.
+      * Truncated mid-stream: same 5-min blacklist + rotate, bounded by
+        MAX_TRUNCATED_PROXY_ROTATIONS.
     """
+    bot_check_tries = 0
     truncated_tries = 0
+    forbidden_tries = 0
     while True:
-        proxy = rotator.current if rotator else None
+        proxy = rotator.next_round_robin() if rotator else None
         try:
             return ffmpeg_cut.download_video(
                 url=url, output_path=output_path,
@@ -731,36 +751,42 @@ def _download_with_rotation(*, token: str, chat_id: int, prefix: str,
         except ffmpeg_cut.FFmpegError as e:
             if _is_bot_check_error(e) and rotator is not None:
                 label = proxy_pool._proxy_label(proxy) if proxy else "no-proxy"
+                rotator.mark_bad(proxy, ttl_seconds=600)
+                bot_check_tries += 1
                 _send(token, chat_id,
                       f"🔁 {prefix}: bot-check на <code>{label}</code>, ищу другой прокси…")
-                new_proxy = rotator.rotate()
-                if new_proxy is None:
+                if bot_check_tries >= len(rotator.pool):
                     raise CookiesNeededError(
                         f"Все {len(rotator.pool)} прокси из пула заблокированы "
                         f"YouTube'ом. Cookies скорее всего тоже устарели — "
                         f"нужно обновить и повторить."
                     ) from e
+                continue
+            if _is_forbidden_error(e) and rotator is not None:
+                label = proxy_pool._proxy_label(proxy) if proxy else "no-proxy"
+                rotator.mark_bad(proxy, ttl_seconds=300)
+                forbidden_tries += 1
+                if forbidden_tries > MAX_403_PROXY_ROTATIONS:
+                    _send(token, chat_id,
+                          f"❌ {prefix}: 403 на {forbidden_tries} разных прокси подряд, пропускаю.")
+                    raise
                 _send(token, chat_id,
-                      f"➡️ {prefix}: переключился на <code>{proxy_pool._proxy_label(new_proxy)}</code>, повторяю…")
+                      f"🔁 {prefix}: 403 на <code>{label}</code> "
+                      f"(попытка {forbidden_tries}/{MAX_403_PROXY_ROTATIONS}), меняю прокси…")
                 continue
             if _is_truncated_download_error(e) and rotator is not None:
+                label = proxy_pool._proxy_label(proxy) if proxy else "no-proxy"
+                rotator.mark_bad(proxy, ttl_seconds=300)
                 truncated_tries += 1
                 if truncated_tries > MAX_TRUNCATED_PROXY_ROTATIONS:
                     _send(token, chat_id,
                           f"❌ {prefix}: видео не докачалось на "
                           f"{truncated_tries} разных прокси, пропускаю.")
                     raise
-                label = proxy_pool._proxy_label(proxy) if proxy else "no-proxy"
                 _send(token, chat_id,
                       f"⚠️ {prefix}: обрыв на <code>{label}</code> "
                       f"(попытка {truncated_tries}/{MAX_TRUNCATED_PROXY_ROTATIONS}), "
                       f"меняю прокси…")
-                new_proxy = rotator.rotate_if_still(proxy)
-                if new_proxy is None:
-                    raise
-                _send(token, chat_id,
-                      f"➡️ {prefix}: переключился на "
-                      f"<code>{proxy_pool._proxy_label(new_proxy)}</code>, повторяю…")
                 continue
             raise
 
