@@ -108,3 +108,69 @@ def create_draft_course(*, endpoint: str, token: str,
         if key not in payload:
             raise NMSError(f"NMS response missing '{key}': {payload}")
     return payload
+
+
+def append_lessons_to_course(*, endpoint: str, token: str,
+                             course_id: str,
+                             lessons: list[dict[str, Any]],
+                             section_title: str | None = None,
+                             timeout: int = 60) -> dict[str, Any]:
+    """POST extra lessons to an EXISTING course.
+
+    Calls `/api/agent/courses/{course_id}/append-lessons`. Used for the
+    recovery flow: when a Phase 2 run fails on some videos (e.g. Whisper
+    mis-detected language → translate 400), the operator can fix the bug,
+    re-process JUST the failed videos, and append them to the partial
+    course instead of deleting and re-creating from scratch.
+
+    `course_id` may be a Prisma id OR a slug — NMS resolves both.
+    `section_title` is optional. If matches an existing section
+    (case-insensitive), lessons land there; otherwise they go into the
+    last existing section.
+
+    Returns: {courseId, sectionId, appendedLessonIds, appendedCount, adminUrl}.
+    """
+    if not lessons:
+        raise NMSError("append_lessons_to_course: lessons[] is empty")
+
+    url = (
+        endpoint.rstrip("/")
+        + f"/api/agent/courses/{course_id}/append-lessons"
+    )
+    body: dict[str, Any] = {"lessons": lessons}
+    if section_title:
+        body["sectionTitle"] = section_title
+
+    try:
+        r = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            json=body,
+            timeout=timeout,
+        )
+    except requests.RequestException as e:
+        raise NMSError(f"network error calling {url}: {e}") from e
+
+    try:
+        data = r.json()
+    except ValueError:
+        data = None
+
+    if r.status_code >= 400:
+        detail = ""
+        if isinstance(data, dict):
+            detail = data.get("error") or data.get("result_message") or ""
+        raise NMSError(f"NMS {r.status_code}: {detail or r.text[:300]}")
+
+    if not isinstance(data, dict) or not isinstance(data.get("data"), dict):
+        raise NMSError(f"NMS unexpected response shape: {str(data)[:300]}")
+
+    payload = data["data"]
+    for key in ("courseId", "appendedLessonIds", "appendedCount", "adminUrl"):
+        if key not in payload:
+            raise NMSError(f"NMS response missing '{key}': {payload}")
+    return payload

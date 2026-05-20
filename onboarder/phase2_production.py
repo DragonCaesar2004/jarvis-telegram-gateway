@@ -901,8 +901,24 @@ def _process_one_video_impl(*, token: str, chat_id: int, prefix: str,
             cached_segments = []  # force fallback below
 
     # ── 5. Dub if not English (Google Translate + TTS) ───────────────────
-    if detected_lang == "en":
-        _send(token, chat_id, f"🇬🇧 {prefix}: уже на английском, дубляж пропускаем")
+    # Whisper occasionally mis-labels English-accented content as Welsh,
+    # Javanese, Nynorsk, Latin etc. These produce invalid ISO codes downstream
+    # (e.g. "welsh" → "we" → Google Translate 400 Invalid Value). Treat any
+    # known-misdetect language as English and skip dubbing entirely — the
+    # actual audio is virtually always English in these cases.
+    WHISPER_MISDETECT_LANGS = {
+        "welsh", "cymraeg", "javanese", "jawa",
+        "nynorsk", "norwegian nynorsk",
+        "latin", "esperanto", "haitian creole",
+    }
+    if detected_lang == "en" or detected_lang in WHISPER_MISDETECT_LANGS:
+        if detected_lang in WHISPER_MISDETECT_LANGS:
+            _send(token, chat_id,
+                  f"🇬🇧 {prefix}: Whisper отдал <code>{detected_lang}</code> — "
+                  f"скорее всего ошибочно (контент на английском). "
+                  f"Пропускаю дубляж, оставляю оригинал.")
+        else:
+            _send(token, chat_id, f"🇬🇧 {prefix}: уже на английском, дубляж пропускаем")
         final_path = cleaned_path
         was_dubbed = False
         # Final EN transcript: join shifted segments, or re-transcribe as fallback
