@@ -626,32 +626,116 @@ def _extract_tagline(course_description: str, about: str) -> str:
     return src[:200]
 
 
+# Lead-line keywords that mark the "what you'll learn" bullet group. Lower-case,
+# substring match. Keep generous — compose templates vary phrasing.
+_LEARN_LEAD_KEYWORDS = (
+    "what this course covers", "what this course", "what you'll learn",
+    "what you will learn", "you'll learn", "you will learn", "by the end",
+    "outcomes", "key takeaways", "what's included", "this course covers",
+    "what we cover", "topics covered",
+    # Russian (rare for compose; output is EN, but be safe)
+    "что узнаешь", "чему научишься", "вы научитесь", "что включено",
+    "ключевые навыки",
+)
+
+# Lead-line keywords that mark the "who this is for" bullet group.
+_AUDIENCE_LEAD_KEYWORDS = (
+    "who is this for", "who this is for", "who it's for", "for whom",
+    "this course is for", "this lesson is for", "this program is for",
+    "especially valuable for", "valuable for", "ideal for", "perfect for",
+    "designed for", "for those", "best for", "you'll benefit",
+    "this is for you if", "this course will help", "this lesson is especially",
+    # Russian
+    "для кого", "этот курс для", "этот урок для", "подходит для",
+    "идеально для", "особенно полезн",
+)
+
+
+def _lead_matches(lead: str, keywords: tuple[str, ...]) -> bool:
+    """Substring match (lower-cased, markdown stripped)."""
+    low = lead.lower()
+    # Strip basic markdown wrappers so "**Who is this for:**" still matches.
+    for ch in ("*", "#", "_", "`"):
+        low = low.replace(ch, "")
+    low = low.strip()
+    return any(k in low for k in keywords)
+
+
+def _split_about_into_bullet_groups(about: str) -> list[tuple[str, list[str]]]:
+    """Walk ABOUT markdown and group consecutive bullets under their nearest
+    preceding non-bullet line (the lead). Returns [(lead, bullets), ...].
+
+    Adjacent bullets stick together; a non-bullet line resets the lead. This
+    lets us route bullets to the right Sheet column (`course_what_you_learn`
+    vs `course_target_audience`) based on what their lead says.
+    """
+    groups: list[tuple[str, list[str]]] = []
+    current_lead = ""
+    current_bullets: list[str] = []
+    for raw in (about or "").splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        if s.startswith(("- ", "* ", "• ")):
+            current_bullets.append(s[2:].strip())
+            continue
+        # Non-bullet line. Flush any pending bullet block, then this line
+        # becomes the new lead.
+        if current_bullets:
+            groups.append((current_lead, current_bullets))
+            current_bullets = []
+        current_lead = s
+    if current_bullets:
+        groups.append((current_lead, current_bullets))
+    return groups
+
+
 def _extract_what_you_learn(composed: dict[str, Any] | None) -> str:
-    """Pull bullet-list outcomes from the ABOUT section (markdown bullets)."""
+    """Pull the bullet group whose lead says "what you'll learn" (or similar).
+
+    Falls back to the first bullet group that is NOT marked as the audience
+    section. Used to be: grab the first 6 bullets seen anywhere in ABOUT —
+    that merged audience bullets into what-you-learn when compose put both
+    groups in ABOUT (which is the standard template now).
+    """
     if not composed:
         return ""
     about = composed.get("course", {}).get("aboutContent", "")
-    bullets: list[str] = []
-    for line in (about or "").splitlines():
-        s = line.strip()
-        if s.startswith(("- ", "* ", "• ")):
-            bullets.append(s[2:].strip())
-        if len(bullets) >= 6:
-            break
-    return "\n".join(f"• {b}" for b in bullets[:6])
+    groups = _split_about_into_bullet_groups(about)
+    if not groups:
+        return ""
+    # 1) Strong match: a lead that explicitly says "what you'll learn".
+    for lead, bullets in groups:
+        if _lead_matches(lead, _LEARN_LEAD_KEYWORDS):
+            return "\n".join(f"• {b}" for b in bullets[:6])
+    # 2) Fallback: first non-audience bullet group.
+    for lead, bullets in groups:
+        if not _lead_matches(lead, _AUDIENCE_LEAD_KEYWORDS):
+            return "\n".join(f"• {b}" for b in bullets[:6])
+    return ""
 
 
 def _extract_target_audience(about: str) -> str:
-    """Best-effort 'who it's for' line. Looks for a 'who is this for' marker."""
+    """Pull the bullet group whose lead says "who this is for" (or similar).
+
+    Returns bullet list when found, falls back to first sentence of the lead
+    when the section is prose-only (no bullets).
+    """
     if not about:
         return ""
+    groups = _split_about_into_bullet_groups(about)
+    for lead, bullets in groups:
+        if _lead_matches(lead, _AUDIENCE_LEAD_KEYWORDS):
+            if bullets:
+                return "\n".join(f"• {b}" for b in bullets[:6])
+            return lead.strip("*# _`").rstrip(":").strip()
+    # Last-resort: scan raw text for the legacy markers we used to use.
     lower = about.lower()
-    for marker in ("who is this for", "for whom", "who it's for", "this course is for"):
+    for marker in _AUDIENCE_LEAD_KEYWORDS:
         idx = lower.find(marker)
         if idx == -1:
             continue
         chunk = about[idx:idx + 400]
-        # Clip at the next blank line
         for sep in ("\n\n", "\n"):
             if sep in chunk[len(marker):]:
                 return chunk.split(sep, 1)[0].strip()
