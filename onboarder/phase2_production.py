@@ -308,6 +308,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                 rotator=rotator,
                 parallel_videos=int(onb.get("phase2_parallel_videos", 1) or 1),
                 mark_cuts_word_level=bool(onb.get("mark_cuts_word_level", False)),
+                blur_watermarks=bool(onb.get("blur_watermarks", False)),
             )
         finally:
             # Free disk regardless of outcome
@@ -606,7 +607,8 @@ def _process_course_videos(*, token: str, chat_id: int, agent: str, user_id: int
                            youtube_cookies_file: str | None = None,
                            rotator=None,
                            parallel_videos: int = 1,
-                           mark_cuts_word_level: bool = False) -> list[dict[str, Any]]:
+                           mark_cuts_word_level: bool = False,
+                           blur_watermarks: bool = False) -> list[dict[str, Any]]:
     """Process every approved video in a course → list of NMS lesson payloads."""
     total = len(lessons)
     parallel = max(1, min(int(parallel_videos or 1), total))
@@ -625,6 +627,7 @@ def _process_course_videos(*, token: str, chat_id: int, agent: str, user_id: int
             "youtube_cookies_file": youtube_cookies_file,
             "rotator": rotator,
             "mark_cuts_word_level": mark_cuts_word_level,
+            "blur_watermarks": blur_watermarks,
         }
 
     # ── Sequential path (original behavior, default). ───────────────────
@@ -777,7 +780,8 @@ def _process_one_video_impl(*, token: str, chat_id: int, prefix: str,
                        course_topic: str,
                        youtube_cookies_file: str | None = None,
                        rotator=None,
-                       mark_cuts_word_level: bool = False) -> dict[str, Any]:
+                       mark_cuts_word_level: bool = False,
+                       blur_watermarks: bool = False) -> dict[str, Any]:
     """Phase 2: download → cut → dub (Google TTS) → upload."""
     from .google_dub import _iso as _lang_iso
 
@@ -834,6 +838,48 @@ def _process_one_video_impl(*, token: str, chat_id: int, prefix: str,
     _send(token, chat_id, f"✂️ {prefix}: вырезка ({cuts_summary})…")
     cleaned_path = ffmpeg_cut.cut_segments(input_path=raw_path, cuts=cuts,
                                            output_path=cleaned_path)
+
+    # ── 3.5. Blur watermarks (opt-in via config.onboarder.blur_watermarks) ──
+    # Detection: Claude Haiku vision on 3 downscaled frames (~3K tokens).
+    # Blur: ffmpeg gblur over each detected bbox. Failure here is non-fatal —
+    # we keep the un-blurred cleaned video and continue.
+    if blur_watermarks:
+        from . import watermark_blur
+        blurred_path = scratch_dir / f"{video_id}.blurred.mp4"
+        _send(token, chat_id, f"🕶️ {prefix}: ищу водяные знаки…")
+        try:
+            wm_report = watermark_blur.process(
+                cleaned_path, blurred_path,
+                n_frames=3, max_height=480, model="haiku",
+            )
+            found = wm_report.get("watermarks") or []
+            if found:
+                reasons = ", ".join(
+                    (w.get("reason") or "watermark")[:60] for w in found[:3]
+                )
+                _send(token, chat_id,
+                      f"🟦 {prefix}: замутил {len(found)} ватермарк(ов) — "
+                      f"<i>{_html_escape(reasons)}</i>")
+                cleaned_path = blurred_path
+            else:
+                _send(token, chat_id,
+                      f"✨ {prefix}: водяных знаков не найдено")
+                # blurred_path is just a copy of cleaned_path — discard
+                try:
+                    blurred_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning(f"phase2: watermark_blur failed for {video_id}: {e}",
+                        exc_info=True)
+            _send(token, chat_id,
+                  f"⚠️ {prefix}: blur ватермарок упал "
+                  f"(<code>{_html_escape(str(e))[:120]}</code>) — "
+                  f"продолжаю с оригинальным видео.")
+            try:
+                blurred_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     # ── 4. Derive cleaned-video segments — reuse Phase 1 cache when possible ──
     # Old flow re-ran Whisper on the cleaned video (extra $0.006/min + minute(s)
