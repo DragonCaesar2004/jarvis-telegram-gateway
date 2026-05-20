@@ -34,43 +34,58 @@ log = logging.getLogger("watermark_blur")
 # Vision detection
 # ---------------------------------------------------------------------------
 
-DETECTION_SYSTEM = """You analyze video frames to find LOGOS and WATERMARKS that should be blurred out before publishing.
+DETECTION_SYSTEM = """You analyze video frames to find LOGOS and WATERMARKS that the editor needs to blur out before publishing.
 
-A watermark / logo is:
-- A small graphic, text mark, or symbol placed at the same position across every frame.
-- Channel branding (channel name, "subscribe" bug, social handle, URL).
-- Often semi-transparent but with hard, designed edges.
+## What COUNTS as a watermark (REPORT these — they are exactly what we are looking for)
 
-A watermark / logo is NOT:
-- A person's face, hands, or body.
-- On-screen instructional text used in the lesson (exercise names, captions, timestamps, anatomical labels).
-- The actual video content.
+- **Social media handles** prefixed with `@` (e.g. `@username`, `@nancybadillo13`)
+- **Platform icons** burned into a corner: Instagram camera, TikTok note, YouTube play, Facebook `f`, X / Twitter bird
+- **Channel names or brand text** placed in a corner or along an edge
+- **Subscribe bugs** ("Subscribe", "Follow", "Like and subscribe", bell-icon overlays)
+- **URLs / domain names** burned into the frame (`example.com`, `www.…`)
+- **Show / channel logos** (a designed mark or wordmark in a corner)
+- **Hashtags** in a static corner position (`#brandname`)
 
-I will give you N frames sampled from the SAME video. A real watermark appears in the same place across all of them — that's the signal. If a candidate region is in different places across frames, it's content, not branding.
+If you see ANY of those in a fixed position across frames, you MUST report it. Do not second-guess these — they are unambiguous brand marks.
 
-Return ONLY a JSON object with this exact schema:
+## What does NOT count (do NOT report)
+
+- The presenter's face, hands, body, hair, clothing
+- On-screen instructional text directly tied to the lesson (exercise names, anatomical labels, timestamps, captions/subtitles, set counts)
+- Furniture, plants, decor in the background
+- Lighting flares, reflections
+- The actual lesson content
+
+## How to be sure
+
+I give you N frames sampled from the SAME video. A real watermark sits in the **same pixel position** in every one of them. If a candidate is in different spots between frames, it is content, not a watermark — skip it.
+
+## Output format
+
+Return ONLY a JSON object, no commentary, no code fences:
 
 ```
 {
   "watermarks": [
     {
-      "x": 0.85,
-      "y": 0.85,
-      "w": 0.12,
-      "h": 0.10,
-      "reason": "channel logo in bottom-right corner"
+      "x": 0.00,
+      "y": 0.00,
+      "w": 0.22,
+      "h": 0.08,
+      "reason": "Instagram handle @nancybadillo13 in top-left corner"
     }
   ]
 }
 ```
 
-- `x`, `y` = top-left corner, fractional (0-1) of frame width / height
-- `w`, `h` = width / height, fractional
-- Add 2% padding on each side beyond the tight bbox so the blur fully covers the mark.
+- `x`, `y` = top-left corner of the bbox, as a fraction (0.0 - 1.0) of frame width / height.
+- `w`, `h` = width / height of the bbox, same fraction units.
+- Pad the tight bbox by ~2% of frame width/height on each side so the blur fully covers the mark.
 - If no watermarks: `{"watermarks": []}`.
-- Multiple watermarks: list each one.
-- BE CONSERVATIVE — if you're not sure it's a watermark/logo, do not report it. False positives are worse than misses here because we'd blur over real content.
-- Never report a region in the central 60% × 60% of the frame (that's almost always content, not branding).
+- Multiple watermarks: list each one separately.
+- Reject any candidate whose center lies in the **central 60% × 60%** of the frame — that area is almost always content.
+
+Default toward REPORTING when you see a handle, an icon, a URL, or branded text in an edge position. Misses are worse than blurring over a corner of background.
 """
 
 
@@ -245,8 +260,12 @@ def _build_blur_filter(bboxes: list[dict[str, Any]], video_w: int, video_h: int,
     parts = [f"[0:v]split={n + 1}" + "".join(f"[{lbl}]" for lbl in split_labels)]
 
     for i, (x, y, w, h) in enumerate(pixel_boxes):
+        # gblur (Gaussian blur) instead of boxblur — `sigma` has no upper
+        # cap, unlike boxblur where chroma radius is hard-capped at 14.
+        # Visual quality is also smoother. `sigma=N` ≈ a moderately stronger
+        # blur than `boxblur=N/2`.
         parts.append(
-            f"[b{i}_in]crop={w}:{h}:{x}:{y},boxblur={blur_strength}[b{i}]"
+            f"[b{i}_in]crop={w}:{h}:{x}:{y},gblur=sigma={blur_strength}[b{i}]"
         )
 
     prev = "base"
