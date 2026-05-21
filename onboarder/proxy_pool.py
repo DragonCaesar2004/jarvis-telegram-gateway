@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -149,12 +150,20 @@ class ProxyRotator:
         self.tried: set[str] = set()
         self.current: str | None = None
         self._lock = threading.Lock()
-        # Round-robin index for per-video proxy assignment.
+        # Round-robin index — kept for back-compat but no longer the primary
+        # picker. The LRU policy in next_round_robin() supersedes it.
         self._rr_idx = 0
         # Short-term blacklist: proxy → epoch-time when it can be tried again.
         # Used by mark_bad() so 403/timeout proxies are skipped for a few
         # minutes instead of being hammered repeatedly.
         self._blacklist: dict[str, float] = {}
+        # LRU tracking: proxy → epoch-time it was last handed out via
+        # next_round_robin(). Picker prefers the proxy with the OLDEST entry
+        # (or 0 for never-used proxies — they get picked first). This is
+        # smoother than naïve round-robin: when one proxy is blacklisted and
+        # comes back, it sits "cold" at the head of the queue, getting one
+        # request to test the waters before being slammed again.
+        self._last_used: dict[str, float] = {}
 
     def init(self, on_progress=None) -> str | None:
         """Pick the first working proxy. Returns it or raises NoWorkingProxyError."""
@@ -207,34 +216,70 @@ class ProxyRotator:
             return current_snapshot
         return self.rotate(on_progress=on_progress)
 
-    def next_round_robin(self) -> str | None:
-        """Hand out the next non-blacklisted proxy from the pool. No probe.
+    def next_round_robin(self, *, jitter_seconds: float = 0.5) -> str | None:
+        """Pick the least-recently-used non-blacklisted proxy + apply jitter.
 
-        Distributes load across all proxies — each video gets a different IP,
-        so YouTube CDN's per-IP rate limit doesn't lock the whole pipeline on
-        the first request burst. Wraps around at the end of the pool.
+        Algorithm:
+          1. Among non-blacklisted proxies, pick the one with the OLDEST
+             `_last_used` timestamp (0 for never-used → these go first).
+          2. Mark it as just-used (update _last_used[picked] = now).
+          3. Release the lock.
+          4. Sleep a small random amount (0..jitter_seconds, default 0..0.5s)
+             OUTSIDE the lock — this desynchronises parallel workers who
+             would otherwise all hit their picked proxy in the same
+             millisecond and look bot-like to YouTube's CDN.
+          5. Return the proxy.
 
-        Skips proxies in the short-term blacklist (set by mark_bad). If every
-        proxy is currently blacklisted, returns the one whose ban expires
-        soonest — keeps the pipeline moving even when everyone's flaky.
+        Why LRU instead of strict round-robin:
+          * If proxy 7 got blacklisted for 5 min, came back, and is now
+            "cold" — LRU picks it FIRST among the candidates, which lets it
+            ease back in with one request instead of being slammed.
+          * Brand-new proxies (never used in this process) tie at
+            _last_used=0 and get picked deterministically in pool order
+            until each has been used once. After that, true LRU cycle.
+
+        Fallback if EVERY proxy is currently blacklisted: returns the one
+        whose ban expires soonest (no _last_used update — we're using a
+        desperate fallback, not a "fresh" pick).
+
+        Thread-safe: critical section under self._lock; jitter sleep happens
+        after release so 16 parallel callers don't block each other.
+
+        Args:
+          jitter_seconds: max random delay before returning. Pass 0.0 to
+            disable (useful for tests or fast smoke-checks).
         """
         if not self.pool:
             return None
         now = time.time()
+        picked: str | None = None
+        used_fallback = False
         with self._lock:
-            n = len(self.pool)
-            # Try up to N positions to find a non-blacklisted one.
-            for _ in range(n):
-                proxy = self.pool[self._rr_idx % n]
-                self._rr_idx = (self._rr_idx + 1) % (n * 1000 or 1)  # keep bounded
-                unblock = self._blacklist.get(proxy)
-                if unblock is None or unblock <= now:
-                    return proxy
-            # All blacklisted: pick the one whose ban expires soonest.
-            if self._blacklist:
-                best = min(self._blacklist.items(), key=lambda kv: kv[1])
-                return best[0]
-            return self.pool[0]
+            candidates = [p for p in self.pool
+                          if self._blacklist.get(p, 0.0) <= now]
+            if candidates:
+                # Pick the proxy that has been idle the longest. .get(p, 0.0)
+                # makes never-used proxies "infinitely old" (tied at 0) — they
+                # win against all already-used proxies on first selection.
+                picked = min(candidates, key=lambda p: self._last_used.get(p, 0.0))
+                self._last_used[picked] = now
+            elif self._blacklist:
+                # Every proxy is blacklisted. Return the one whose ban expires
+                # soonest so the pipeline keeps moving. Do NOT update
+                # _last_used: this isn't a fresh pick, it's a desperate fallback.
+                picked = min(self._blacklist.items(), key=lambda kv: kv[1])[0]
+                used_fallback = True
+            else:
+                # Pool exists but has no entries we know about — shouldn't
+                # happen in practice, but return first for safety.
+                picked = self.pool[0]
+
+        # Jitter is applied OUTSIDE the lock so parallel callers don't
+        # serialize on it. Skip jitter when we're using the fallback —
+        # waiting just delays a probably-doomed retry.
+        if picked is not None and jitter_seconds > 0 and not used_fallback:
+            time.sleep(random.uniform(0.0, float(jitter_seconds)))
+        return picked
 
     def mark_bad(self, proxy: str | None, ttl_seconds: int = 300) -> None:
         """Add `proxy` to the short-term blacklist so next_round_robin skips it.
