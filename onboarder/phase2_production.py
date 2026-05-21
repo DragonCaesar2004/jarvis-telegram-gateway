@@ -487,7 +487,17 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                 except Exception as e:
                     log.warning(f"phase2: failed to parse sheet course_science: {e}")
 
-        # Sheet rows for this course (used for status updates)
+        # Sheet rows for this course, split by per-video outcome so the final
+        # status update doesn't mark failed videos as "done" alongside survivors.
+        # Was a real bug: marked ALL lessons of a course DONE even when half
+        # the videos failed inside _process_course_videos, producing "phantom-
+        # done" rows that recovery scripts couldn't easily find later.
+        survived_video_ids = {p.get("video_id") for p in processed_lessons if p.get("video_id")}
+        done_sheet_rows = [r["_sheet_row"] for r in lessons
+                           if r.get("video_id") in survived_video_ids]
+        failed_sheet_rows = [r["_sheet_row"] for r in lessons
+                             if r.get("video_id") and r.get("video_id") not in survived_video_ids]
+        # Keep the old name pointing at the union for any code that still uses it.
         course_sheet_rows = [r["_sheet_row"] for r in lessons]
 
         # ── 4.5 Sanitize: force every user-facing field to Latin script ───
@@ -534,18 +544,30 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
                     "course_idx": course_idx, "title": clean_title,
                     "admin_url": resp["adminUrl"], "course_id": resp["courseId"],
                 })
-                # Mark all videos in this course as DONE with admin URL
-                sheets.update_status(
-                    client, sheet_id,
-                    sheet_rows=course_sheet_rows,
-                    new_status=sheets.STATUS_DONE,
-                    course_admin_url=resp["adminUrl"],
-                )
+                # Mark only SURVIVED videos as DONE (got into the admin course).
+                if done_sheet_rows:
+                    sheets.update_status(
+                        client, sheet_id,
+                        sheet_rows=done_sheet_rows,
+                        new_status=sheets.STATUS_DONE,
+                        course_admin_url=resp["adminUrl"],
+                    )
+                # Mark FAILED videos so they don't pretend they made it in.
+                if failed_sheet_rows:
+                    sheets.update_status(
+                        client, sheet_id,
+                        sheet_rows=failed_sheet_rows,
+                        new_status=sheets.STATUS_FAILED,
+                        failure_reason="dropped during Phase 2 (cut/dub/upload)",
+                    )
                 _send(token, chat_id,
                       f"✅ <b>Курс {course_idx} создан в админке (DRAFT):</b>\n"
                       f"<a href=\"{resp['adminUrl']}\">{_html_escape(course_payload['title'])}</a>\n\n"
                       f"План: {len(plan_sections)} | Science: {'есть' if science_plan else 'нет'} | "
-                      f"Отзывы: {len(testimonials)} | Коллекция: {collection_name or '—'}")
+                      f"Отзывы: {len(testimonials)} | Коллекция: {collection_name or '—'}\n"
+                      + (f"⚠️ {len(failed_sheet_rows)} видео упало в Phase 2 и НЕ в курсе. "
+                         f"Они помечены status=failed в Sheet."
+                         if failed_sheet_rows else ""))
             except Exception as e:
                 log.error(f"phase2: NMS push failed for course {course_idx}: {e}", exc_info=True)
                 # Mark videos failed (Bunny upload was OK but draft creation died)
@@ -1018,6 +1040,7 @@ def _process_one_video_impl(*, token: str, chat_id: int, prefix: str,
     _send(token, chat_id, f"✅ {prefix}: готово")
 
     return {
+        "video_id": video_id,
         "title": title,
         "videoKey": bunny_meta["videoKey"],
         "videoLibraryId": bunny_meta["videoLibraryId"],
