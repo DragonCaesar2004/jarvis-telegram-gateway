@@ -53,6 +53,21 @@ def create_draft_course(*, endpoint: str, token: str,
     if not lessons and not curriculum:
         raise NMSError("must provide either lessons or curriculum")
 
+    # NMS Zod schema enforces strict length limits on a few user-facing
+    # fields. If compose generates something longer the POST returns 422
+    # and the whole DRAFT creation is lost (videos already on Bunny become
+    # orphans). Defensive truncation keeps that from sinking a successful
+    # Phase 2 just because the LLM produced one paragraph too long.
+    # Limits: course.title ≤200, author.name ≤200, course.excerpt ≤1000.
+    course = dict(course)  # don't mutate caller's dict
+    if course.get("title"):
+        course["title"] = str(course["title"])[:200]
+    if course.get("excerpt"):
+        course["excerpt"] = str(course["excerpt"])[:1000]
+    author = dict(author)
+    if author.get("name"):
+        author["name"] = str(author["name"])[:200]
+
     url = endpoint.rstrip("/") + "/api/agent/onboard-course"
     body: dict[str, Any] = {
         "author": author,
