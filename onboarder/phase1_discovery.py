@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 from typing import Any
 
 from . import (_secrets, llm, phase1_enrich, proxy_pool, sheets,
-               state as _state, youtube_dl as ytdl)
+               state as _state, whisper, youtube_dl as ytdl)
 from .proxy_pool import CookiesNeededError
 
 log = logging.getLogger("gateway")
@@ -164,7 +164,16 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     # Phase 1 now downloads + transcribes + composes — needs Whisper key,
     # cookies for YouTube downloads, and the proxy pool for rotating around
     # bot-checks. Resolve early so we fail fast on misconfiguration.
-    openai_key = _secrets.resolve(onb, "openai_api_key", env="OPENAI_API_KEY")
+    # Resolve Whisper provider + key. The variable is still named `openai_key`
+    # everywhere downstream for back-compat (it really just means "the API key
+    # for the configured Whisper provider"). config.json toggle:
+    #   "whisper_provider": "openai"  (default) | "groq"
+    whisper_provider = (onb.get("whisper_provider") or "openai").lower()
+    whisper.set_default_provider(whisper_provider)
+    if whisper_provider == "groq":
+        openai_key = _secrets.resolve(onb, "groq_api_key", env="GROQ_API_KEY")
+    else:
+        openai_key = _secrets.resolve(onb, "openai_api_key", env="OPENAI_API_KEY")
     youtube_cookies_file = onb.get("youtube_cookies_file") or None
     proxy_pool_list = proxy_pool.normalise_pool(
         onb.get("youtube_proxies") or onb.get("youtube_proxy")
@@ -773,7 +782,16 @@ def _run_from_urls(token: str, agent: str, cfg: dict, chat_id: int, user_id: int
     sheet_id = onb.get("google_sheet_id") or ""
     if not sheet_id:
         raise RuntimeError("config: onboarder.google_sheet_id not set")
-    openai_key = _secrets.resolve(onb, "openai_api_key", env="OPENAI_API_KEY")
+    # Resolve Whisper provider + key. The variable is still named `openai_key`
+    # everywhere downstream for back-compat (it really just means "the API key
+    # for the configured Whisper provider"). config.json toggle:
+    #   "whisper_provider": "openai"  (default) | "groq"
+    whisper_provider = (onb.get("whisper_provider") or "openai").lower()
+    whisper.set_default_provider(whisper_provider)
+    if whisper_provider == "groq":
+        openai_key = _secrets.resolve(onb, "groq_api_key", env="GROQ_API_KEY")
+    else:
+        openai_key = _secrets.resolve(onb, "openai_api_key", env="OPENAI_API_KEY")
     youtube_cookies_file = onb.get("youtube_cookies_file") or None
     proxy_pool_list = proxy_pool.normalise_pool(
         onb.get("youtube_proxies") or onb.get("youtube_proxy")
@@ -1090,7 +1108,16 @@ def _run_from_url_groups(token: str, agent: str, cfg: dict, chat_id: int,
     sheet_id = onb.get("google_sheet_id") or ""
     if not sheet_id:
         raise RuntimeError("config: onboarder.google_sheet_id not set")
-    openai_key = _secrets.resolve(onb, "openai_api_key", env="OPENAI_API_KEY")
+    # Resolve Whisper provider + key. The variable is still named `openai_key`
+    # everywhere downstream for back-compat (it really just means "the API key
+    # for the configured Whisper provider"). config.json toggle:
+    #   "whisper_provider": "openai"  (default) | "groq"
+    whisper_provider = (onb.get("whisper_provider") or "openai").lower()
+    whisper.set_default_provider(whisper_provider)
+    if whisper_provider == "groq":
+        openai_key = _secrets.resolve(onb, "groq_api_key", env="GROQ_API_KEY")
+    else:
+        openai_key = _secrets.resolve(onb, "openai_api_key", env="OPENAI_API_KEY")
     youtube_cookies_file = onb.get("youtube_cookies_file") or None
     proxy_pool_list = proxy_pool.normalise_pool(
         onb.get("youtube_proxies") or onb.get("youtube_proxy")

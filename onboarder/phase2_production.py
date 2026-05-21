@@ -144,7 +144,17 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int, onb: dic
     sheet_id = onb.get("google_sheet_id") or ""
     if not sheet_id:
         raise RuntimeError("config: onboarder.google_sheet_id not set")
-    openai_key = _secrets.resolve(onb, "openai_api_key", env="OPENAI_API_KEY")
+    # Resolve Whisper provider + key. The variable is still named `openai_key`
+    # for back-compat across the call chain (downstream callers like
+    # _process_one_video_impl take it as `openai_key` and pass to
+    # whisper.transcribe — provider is read separately from the module-level
+    # default set just below).
+    whisper_provider = (onb.get("whisper_provider") or "openai").lower()
+    whisper.set_default_provider(whisper_provider)
+    if whisper_provider == "groq":
+        openai_key = _secrets.resolve(onb, "groq_api_key", env="GROQ_API_KEY")
+    else:
+        openai_key = _secrets.resolve(onb, "openai_api_key", env="OPENAI_API_KEY")
     youtube_cookies_file = onb.get("youtube_cookies_file") or None
     proxy_pool_list = proxy_pool.normalise_pool(
         onb.get("youtube_proxies") or onb.get("youtube_proxy")

@@ -1,18 +1,30 @@
-"""OpenAI Whisper API wrapper for the onboarder pipeline.
+"""Whisper API wrapper for the onboarder pipeline.
+
+Supports TWO providers via the same OpenAI-compatible SDK surface:
+
+  * "openai" (default) — whisper-1 model on api.openai.com.
+    Pricing $0.006/min ($0.36/h). Battle-tested, slower (~1-3× realtime).
+
+  * "groq" — whisper-large-v3 model on api.groq.com/openai/v1.
+    Pricing $0.00185/min ($0.111/h) — 3.2× cheaper. Faster (~10-20× realtime).
+    Slightly better language detection (v3 > v2 of the model).
+    Newer service — slightly less proven uptime than OpenAI.
 
 Two operations:
-    transcribe(file_path, *, language=None) -> {text, language, words, duration}
+    transcribe(file_path, *, language=None, provider=None) ->
+        {text, language, words, duration, segments}
         word-level timestamps for cut detection.
-    detect_language(file_path) -> str (ISO 639-1)
+    detect_language(file_path, provider=None) -> str
         cheap pass that uses verbose_json with no word timestamps.
 
-Whisper pricing (~$0.006/min) — pretty cheap. For phase 2 we transcribe
-twice per video (once on original to find cuts, once on final post-edit
-output to store in DB), so budget ~$0.012/min × ~25 min × 7 lessons ≈ $2/course.
+The `provider` kwarg overrides the module-level default set via
+`set_default_provider()` from gateway startup. Per-call override lets us
+add a future fallback path (try groq, on error fall back to openai).
 
-File size limit: OpenAI enforces 25 MB. Before sending we compress audio to
-16kHz mono 64kbps mp3. 90-min video ≈ 43 MB uncompressed → 43 MB, so for
-very long files we also split and merge transcriptions.
+File size limit: 25 MB for both providers. Before sending we compress audio
+to 16kHz mono 64kbps mp3. 90-min video ≈ 43 MB uncompressed → 43 MB, so for
+very long files we also split and merge transcriptions. Groq also caps
+audio duration at ~25 min per request — handled by a smaller chunk_bytes.
 """
 
 from __future__ import annotations
@@ -26,19 +38,71 @@ from typing import Any
 
 log = logging.getLogger("gateway")
 
-WHISPER_MODEL = "whisper-1"
-WHISPER_MAX_BYTES = 24 * 1024 * 1024   # 24 MB hard cap (API limit is 25 MB)
+# ---------------------------------------------------------------------------
+# Provider config
+# ---------------------------------------------------------------------------
+
+# Per-provider settings. Both expose OpenAI-compatible client surface.
+WHISPER_PROVIDERS: dict[str, dict[str, Any]] = {
+    "openai": {
+        "model": "whisper-1",
+        "base_url": None,  # OpenAI SDK default
+        # OpenAI accepts up to 25 MB, no explicit per-request duration cap
+        "max_chunk_bytes": 24 * 1024 * 1024,
+    },
+    "groq": {
+        "model": "whisper-large-v3",
+        "base_url": "https://api.groq.com/openai/v1",
+        # Groq enforces BOTH 25 MB file size AND a hard 25-min audio duration
+        # cap per request when response_format=verbose_json with timestamps.
+        # At 64 kbps that's ~11 MB worst case → use 10 MB to stay under both.
+        "max_chunk_bytes": 10 * 1024 * 1024,
+    },
+}
+
+_DEFAULT_PROVIDER: str = "openai"  # mutated by set_default_provider()
+WHISPER_MAX_BYTES = 24 * 1024 * 1024   # legacy back-compat constant
+
+
+def set_default_provider(provider: str) -> None:
+    """Set the module-level default provider. Idempotent. Validates input."""
+    global _DEFAULT_PROVIDER
+    p = (provider or "openai").lower()
+    if p not in WHISPER_PROVIDERS:
+        raise WhisperError(
+            f"unknown whisper provider {provider!r}; "
+            f"known: {sorted(WHISPER_PROVIDERS)}"
+        )
+    if p != _DEFAULT_PROVIDER:
+        log.info(f"whisper: default provider switched {_DEFAULT_PROVIDER!r} → {p!r}")
+    _DEFAULT_PROVIDER = p
+
+
+def _resolve_provider(provider: str | None) -> str:
+    """Return validated provider name (per-call override falls back to default)."""
+    p = (provider or _DEFAULT_PROVIDER).lower()
+    if p not in WHISPER_PROVIDERS:
+        raise WhisperError(
+            f"unknown whisper provider {provider!r}; "
+            f"known: {sorted(WHISPER_PROVIDERS)}"
+        )
+    return p
 
 
 class WhisperError(RuntimeError):
     pass
 
 
-def _client(api_key: str) -> Any:
-    """Lazy-import OpenAI client."""
+def _client(api_key: str, provider: str | None = None) -> Any:
+    """Lazy-import OpenAI-compatible client. Points at Groq endpoint when
+    provider='groq' (Groq exposes a subset of the OpenAI API surface, so
+    the same SDK works as drop-in)."""
     from openai import OpenAI
     if not api_key:
-        raise WhisperError("openai api key is empty")
+        raise WhisperError(f"{provider or _DEFAULT_PROVIDER} api key is empty")
+    cfg = WHISPER_PROVIDERS[_resolve_provider(provider)]
+    if cfg["base_url"]:
+        return OpenAI(api_key=api_key, base_url=cfg["base_url"])
     return OpenAI(api_key=api_key)
 
 
@@ -89,19 +153,21 @@ def _split_audio(src: Path, tmpdir: Path, chunk_bytes: int = WHISPER_MAX_BYTES) 
 
 
 def _transcribe_one(client: Any, path: Path, language: str | None,
-                    with_word_timestamps: bool) -> dict[str, Any]:
-    """Transcribe a single file (already ≤25 MB)."""
+                    with_word_timestamps: bool, *,
+                    provider: str | None = None) -> dict[str, Any]:
+    """Transcribe a single file (already ≤ provider's per-request limit)."""
+    model = WHISPER_PROVIDERS[_resolve_provider(provider)]["model"]
     granularities = ["word", "segment"] if with_word_timestamps else ["segment"]
     with path.open("rb") as f:
         try:
             resp = client.audio.transcriptions.create(
-                model=WHISPER_MODEL, file=f,
+                model=model, file=f,
                 response_format="verbose_json",
                 timestamp_granularities=granularities,
                 language=language,
             )
         except Exception as e:
-            raise WhisperError(f"whisper API error: {e}") from e
+            raise WhisperError(f"whisper API error ({provider or _DEFAULT_PROVIDER}): {e}") from e
     data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
     return {
         "text": data.get("text", ""),
@@ -114,7 +180,8 @@ def _transcribe_one(client: Any, path: Path, language: str | None,
 
 def transcribe(*, api_key: str, file_path: str | Path,
                language: str | None = None,
-               with_word_timestamps: bool = True) -> dict[str, Any]:
+               with_word_timestamps: bool = True,
+               provider: str | None = None) -> dict[str, Any]:
     """Transcribe an audio/video file. Returns:
         {
           "text": str,                # plain transcript
@@ -123,27 +190,34 @@ def transcribe(*, api_key: str, file_path: str | Path,
           "words": [{"word": str, "start": float, "end": float}, ...],
           "segments": [...]           # raw whisper segments (caller may ignore)
         }
+
+    `provider` overrides module-level default (set via set_default_provider).
+    Use this for fallback flows ("try groq, on error retry with openai").
     """
     p = Path(file_path)
     if not p.exists():
         raise WhisperError(f"whisper: file not found: {p}")
 
-    client = _client(api_key)
-    log.info(f"whisper: transcribing {p.name} ({p.stat().st_size/1024/1024:.1f} MB), "
-             f"lang={language or 'auto'}")
+    resolved = _resolve_provider(provider)
+    client = _client(api_key, provider=resolved)
+    chunk_cap = WHISPER_PROVIDERS[resolved]["max_chunk_bytes"]
+    log.info(f"whisper[{resolved}]: transcribing {p.name} "
+             f"({p.stat().st_size/1024/1024:.1f} MB), lang={language or 'auto'}")
 
     with tempfile.TemporaryDirectory(prefix="whisper-") as tmpdir:
         tmp = Path(tmpdir)
         # Compress to 16kHz mono 64kbps — keeps quality good for speech, cuts size ~5x
         compressed = _compress_audio(p, tmp / "audio.mp3")
-        log.info(f"whisper: compressed {p.stat().st_size/1024/1024:.1f} MB → "
+        log.info(f"whisper[{resolved}]: compressed "
+                 f"{p.stat().st_size/1024/1024:.1f} MB → "
                  f"{compressed.stat().st_size/1024/1024:.1f} MB")
 
-        chunks = _split_audio(compressed, tmp)
-        log.info(f"whisper: {len(chunks)} chunk(s)")
+        chunks = _split_audio(compressed, tmp, chunk_bytes=chunk_cap)
+        log.info(f"whisper[{resolved}]: {len(chunks)} chunk(s)")
 
         if len(chunks) == 1:
-            return _transcribe_one(client, chunks[0], language, with_word_timestamps)
+            return _transcribe_one(client, chunks[0], language,
+                                   with_word_timestamps, provider=resolved)
 
         # Multi-chunk: transcribe each, merge text + shift timestamps
         merged_text = ""
@@ -155,7 +229,7 @@ def transcribe(*, api_key: str, file_path: str | Path,
 
         for chunk in chunks:
             res = _transcribe_one(client, chunk, language or detected_lang or None,
-                                  with_word_timestamps)
+                                  with_word_timestamps, provider=resolved)
             if not detected_lang:
                 detected_lang = res.get("language", "")
             merged_text += (" " if merged_text else "") + res["text"]
@@ -180,10 +254,11 @@ def transcribe(*, api_key: str, file_path: str | Path,
         }
 
 
-def detect_language(*, api_key: str, file_path: str | Path) -> str:
+def detect_language(*, api_key: str, file_path: str | Path,
+                    provider: str | None = None) -> str:
     """Quick language detection. Same cost as full transcription, but caller
     may call this before deciding whether to do the full word-timestamp pass.
     """
     result = transcribe(api_key=api_key, file_path=file_path,
-                        with_word_timestamps=False)
+                        with_word_timestamps=False, provider=provider)
     return result["language"]
