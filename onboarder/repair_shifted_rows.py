@@ -43,14 +43,17 @@ from . import _secrets, sheets
 log = logging.getLogger("repair_shifted_rows")
 
 
-def _looks_shifted(raw_row: list[str]) -> bool:
-    """Detect the specific shift pattern documented at the top of this module.
+def _looks_shifted_v1(raw_row: list[str]) -> bool:
+    """Pattern 1 (Pain Academy / Course 3):
 
-    Two strong signals:
-      * col 8 (course_admin_url) starts with a year prefix like '2026-' — it
-        should be either empty or an http://… admin URL.
-      * col 10 (timestamp) is not empty AND doesn't start with a year prefix
-        (typically holds an 11-char video_id instead).
+    Two empty placeholders (course_admin_url, failure_reason) were skipped
+    so everything from col 8 onwards is shifted left by 2.
+
+    Signals:
+      * col 8 (course_admin_url) starts with a year prefix like '2026-' —
+        should be empty or http://…
+      * col 10 (timestamp) is not empty AND doesn't start with a year
+        prefix (it holds an 11-char video_id instead).
     """
     pad = raw_row + [""] * (16 - len(raw_row))
     col8 = pad[8].strip()
@@ -67,14 +70,61 @@ def _looks_shifted(raw_row: list[str]) -> bool:
     return bool(col8_suspect and col10_suspect)
 
 
+def _looks_shifted_v2(raw_row: list[str]) -> bool:
+    """Pattern 2 (Body Articulate / Course 5):
+
+    Different writer-bug — lesson_idx got duplicated into col 8, while
+    course_idx + duration_sec got hijacked into cols 24 / 25.
+
+    Signals:
+      * col 8 (course_admin_url) is a SHORT digit string (1..99) and equals
+        col 4 (lesson_idx) — clear "lesson_idx misrouted into admin_url".
+      * col 14 (course_idx) is empty AND col 24 (transcript_excerpt) is a
+        single digit (course_idx value misplaced).
+      * cols 10-13 (ts/run_id/video_id/channel_id) ARE correctly populated.
+    """
+    pad = raw_row + [""] * (26 - len(raw_row))
+    col4 = pad[4].strip()
+    col8 = pad[8].strip()
+    col14 = pad[14].strip()
+    col24 = pad[24].strip()
+    col10 = pad[10].strip()
+    col8_is_lesson_idx_dup = (
+        col8.isdigit()
+        and len(col8) <= 3
+        and col4 and col4 == col8
+    )
+    col14_empty_but_col24_digit = (
+        not col14
+        and col24.isdigit()
+        and len(col24) <= 3
+    )
+    col10_ok = col10.startswith("2026-") or col10.startswith("2025-") or col10.startswith("2027-")
+    return bool(col8_is_lesson_idx_dup and col14_empty_but_col24_digit and col10_ok)
+
+
+def _looks_shifted(raw_row: list[str]) -> bool:
+    """Return True if the row matches any known shift pattern."""
+    return _looks_shifted_v1(raw_row) or _looks_shifted_v2(raw_row)
+
+
 def _repair_row(raw_row: list[str], target_width: int) -> dict[int, str]:
     """Compute the cell-by-cell updates that move shifted values back to canonical
     columns.
 
     Returns a dict {col_index: new_value} containing ONLY the cells whose value
     needs to change. Caller turns this into a batched ws.update.
+
+    Dispatches by pattern: v1 (Pain Academy) vs v2 (Body Articulate).
     """
     pad = raw_row + [""] * (max(target_width, 26) - len(raw_row))
+    if _looks_shifted_v2(raw_row):
+        return _repair_row_v2(pad)
+    return _repair_row_v1(pad)
+
+
+def _repair_row_v1(pad: list[str]) -> dict[int, str]:
+    """Pain Academy pattern — values from col 8 onwards shifted left by 2."""
     updates: dict[int, str] = {}
 
     # Save the shifted values BEFORE blanking anything.
@@ -89,7 +139,6 @@ def _repair_row(raw_row: list[str], target_width: int) -> dict[int, str]:
     shifted_transcript  = pad[23] if len(pad) > 23 else ""  # → target col 24
     shifted_desc_ru     = pad[24] if len(pad) > 24 else ""  # → target col 25
 
-    # Now build the updates.
     # course_admin_url (col 8) and failure_reason (col 9) become empty.
     if pad[8] != "":
         updates[8] = ""
@@ -112,15 +161,43 @@ def _repair_row(raw_row: list[str], target_width: int) -> dict[int, str]:
     if shifted_lesson_desc:
         updates[16] = shifted_lesson_desc
     if shifted_transcript:
-        # The current author_expertise cell (col 23) holds an EN transcript;
-        # blank it so the repaired row doesn't carry junk in the author field.
         updates[23] = ""
         updates[24] = shifted_transcript
     if shifted_desc_ru:
-        # Same for transcript_excerpt cell (col 24) — it holds the RU translation
-        # in the shifted layout. After repair col 24 carries transcript (above)
-        # and col 25 carries the Russian description.
         updates[25] = shifted_desc_ru
+
+    return updates
+
+
+def _repair_row_v2(pad: list[str]) -> dict[int, str]:
+    """Body Articulate pattern — col 8 has lesson_idx duplicate; course_idx and
+    duration_sec got misrouted to cols 24/25 (transcript_excerpt /
+    lesson_description_ru). Cols 10-13 are already correct.
+
+    Recovery:
+      * col 8 → empty (clear the lesson_idx duplicate)
+      * col 14 (course_idx) ← pad[24] (where it actually lived)
+      * col 15 (duration_sec) ← pad[25]
+      * cols 24, 25 → empty (the hijacked positions; transcript text and RU
+        translation were never written, nothing to preserve)
+    """
+    updates: dict[int, str] = {}
+
+    if pad[8] != "":
+        updates[8] = ""
+
+    hijacked_course_idx = pad[24].strip() if len(pad) > 24 else ""
+    hijacked_duration   = pad[25].strip() if len(pad) > 25 else ""
+
+    if hijacked_course_idx:
+        updates[14] = hijacked_course_idx
+    if hijacked_duration:
+        updates[15] = hijacked_duration
+
+    if hijacked_course_idx:
+        updates[24] = ""
+    if hijacked_duration:
+        updates[25] = ""
 
     return updates
 
@@ -180,12 +257,25 @@ def main() -> int:
         if not _looks_shifted(raw):
             continue
         pad = raw + [""] * (target_width - len(raw))
-        # Apply filters: in shifted rows the run_id is at col 9, course_idx at col 13.
-        if args.run_id and pad[9].strip() != args.run_id:
+
+        # Determine which pattern this row matches so we know which column
+        # currently holds run_id / course_idx values.
+        is_v2 = _looks_shifted_v2(raw)
+
+        # Where does the run_id live in this row's current (broken) layout?
+        # v1 (Pain Academy): in col 9 (the failure_reason slot)
+        # v2 (Body Articulate): in col 11 (already correct position)
+        run_id_col = 11 if is_v2 else 9
+        # Where does the course_idx value live?
+        # v1: in col 13 (the channel_id slot)
+        # v2: in col 24 (the transcript_excerpt slot, hijacked)
+        course_idx_col = 24 if is_v2 else 13
+
+        if args.run_id and pad[run_id_col].strip() != args.run_id:
             continue
         if args.course_idx is not None:
             try:
-                ci_raw = int(pad[13].strip())
+                ci_raw = int(pad[course_idx_col].strip())
             except ValueError:
                 continue
             if ci_raw != int(args.course_idx):
@@ -199,11 +289,18 @@ def main() -> int:
     log.info(f"Found {len(candidates)} shifted rows. Planned moves:")
     for row_num, raw in candidates:
         pad = raw + [""] * (target_width - len(raw))
-        log.info(f"  row {row_num}: status={pad[0]!r} course={pad[2][:30]!r} "
-                 f"channel={pad[3][:25]!r} lesson_idx={pad[4]!r}")
-        log.info(f"    will move: col9→11 (run_id={pad[9]!r}), "
-                 f"col13→14 (course_idx={pad[13]!r}), "
-                 f"col10→12 (video_id={pad[10]!r})")
+        pattern = "v2 (course_idx in col24)" if _looks_shifted_v2(raw) else "v1 (shift -2 from col8)"
+        log.info(f"  row {row_num} [{pattern}]: status={pad[0]!r} "
+                 f"course={pad[2][:30]!r} channel={pad[3][:25]!r} "
+                 f"lesson_idx={pad[4]!r}")
+        if _looks_shifted_v2(raw):
+            log.info(f"    will move: col24→14 (course_idx={pad[24]!r}), "
+                     f"col25→15 (duration_sec={pad[25]!r}), "
+                     f"col8→clear (was lesson_idx dup={pad[8]!r})")
+        else:
+            log.info(f"    will move: col9→11 (run_id={pad[9]!r}), "
+                     f"col13→14 (course_idx={pad[13]!r}), "
+                     f"col10→12 (video_id={pad[10]!r})")
 
     if args.dry_run:
         log.info("--dry-run: stopping here. Re-run without --dry-run to apply.")

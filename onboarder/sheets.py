@@ -357,26 +357,63 @@ def append_lesson_rows(client: Any, sheet_id: str, *, run_id: str,
     ws = ensure_lessons_tab(client, sheet_id)
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     values: list[list[Any]] = [_lesson_row_to_values(r, run_id=run_id, ts=ts) for r in rows]
-    # Defensive guard: every row must have exactly len(LESSONS_HEADER) cells —
-    # otherwise Google Sheets writes the shorter row starting at column A and
-    # everything beyond the last cell ends up in the WRONG named column. We
-    # saw this once in production (10 rows of Pain Academy ended up shifted
-    # left because some upstream code path skipped the empty course_admin_url
-    # and failure_reason placeholders). Pad/truncate to the canonical width
-    # and warn loudly so the root-cause writer is visible in logs next time.
+    # Defensive guards: each row that goes to Google Sheets must
+    #   (a) have exactly len(LESSONS_HEADER) cells AND
+    #   (b) have values that match the expected SEMANTICS of canonical columns.
+    #
+    # We hit two distinct shifted-column bugs in production where rows reached
+    # Sheets with values silently placed in the wrong columns:
+    #   - Pain Academy / Курс 3: values shifted left by 2 from col I (writer
+    #     skipped the two empty placeholders course_admin_url + failure_reason)
+    #   - Body Articulate / Курс 5: course_idx + duration_sec hijacked into
+    #     cols 24/25 (transcript_excerpt / lesson_description_ru), and col 8
+    #     filled with a duplicate of lesson_idx
+    # Length check alone didn't catch either of these — the lists WERE
+    # 36 cells but with values in wrong slots. We now sanity-check signature
+    # cells (timestamp, run_id, course_idx) before writing.
     expected_width = len(LESSONS_HEADER)
     for idx, row_values in enumerate(values):
         if len(row_values) != expected_width:
             log.error(
                 f"append_lesson_rows: row {idx} has {len(row_values)} cells, "
-                f"expected {expected_width} — PADDING/TRUNCATING to prevent column shift. "
-                f"This means some writer code path is constructing rows the wrong way. "
+                f"expected {expected_width} — PADDING/TRUNCATING. "
                 f"First few values: {row_values[:8]!r}"
             )
             if len(row_values) < expected_width:
                 row_values.extend([""] * (expected_width - len(row_values)))
             else:
                 del row_values[expected_width:]
+        # Value-shape checks. We do NOT raise — that would lose the user's
+        # work — but we log loudly so the broken writer is visible.
+        ts_val   = str(row_values[10] or "").strip()
+        run_val  = str(row_values[11] or "").strip()
+        ci_val   = str(row_values[14] or "").strip()
+        admin_val = str(row_values[8]  or "").strip()
+        if ts_val and not (ts_val.startswith("2024-") or ts_val.startswith("2025-")
+                           or ts_val.startswith("2026-") or ts_val.startswith("2027-")):
+            log.error(
+                f"append_lesson_rows: row {idx} col K (timestamp) expected ISO "
+                f"date, got {ts_val[:40]!r}. Likely column shift — Phase 2 will "
+                f"not find this row by run_id later."
+            )
+        if run_val and not (run_val.startswith("2024-") or run_val.startswith("2025-")
+                            or run_val.startswith("2026-") or run_val.startswith("2027-")
+                            or run_val.startswith("legacy_")):
+            log.error(
+                f"append_lesson_rows: row {idx} col L (run_id) expected ISO-ish "
+                f"id, got {run_val[:40]!r}. Likely column shift."
+            )
+        if admin_val and not admin_val.lower().startswith("http"):
+            log.error(
+                f"append_lesson_rows: row {idx} col I (course_admin_url) expected "
+                f"empty or http URL, got {admin_val[:40]!r}. Likely column shift "
+                f"or a stray writer dumping the wrong field here."
+            )
+        if ci_val and not ci_val.isdigit():
+            log.error(
+                f"append_lesson_rows: row {idx} col O (course_idx) expected "
+                f"integer, got {ci_val[:40]!r}. Likely column shift."
+            )
     resp = ws.append_rows(values, value_input_option="USER_ENTERED",
                           insert_data_option="INSERT_ROWS",
                           include_values_in_response=False)
