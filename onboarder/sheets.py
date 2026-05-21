@@ -357,6 +357,26 @@ def append_lesson_rows(client: Any, sheet_id: str, *, run_id: str,
     ws = ensure_lessons_tab(client, sheet_id)
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     values: list[list[Any]] = [_lesson_row_to_values(r, run_id=run_id, ts=ts) for r in rows]
+    # Defensive guard: every row must have exactly len(LESSONS_HEADER) cells —
+    # otherwise Google Sheets writes the shorter row starting at column A and
+    # everything beyond the last cell ends up in the WRONG named column. We
+    # saw this once in production (10 rows of Pain Academy ended up shifted
+    # left because some upstream code path skipped the empty course_admin_url
+    # and failure_reason placeholders). Pad/truncate to the canonical width
+    # and warn loudly so the root-cause writer is visible in logs next time.
+    expected_width = len(LESSONS_HEADER)
+    for idx, row_values in enumerate(values):
+        if len(row_values) != expected_width:
+            log.error(
+                f"append_lesson_rows: row {idx} has {len(row_values)} cells, "
+                f"expected {expected_width} — PADDING/TRUNCATING to prevent column shift. "
+                f"This means some writer code path is constructing rows the wrong way. "
+                f"First few values: {row_values[:8]!r}"
+            )
+            if len(row_values) < expected_width:
+                row_values.extend([""] * (expected_width - len(row_values)))
+            else:
+                del row_values[expected_width:]
     resp = ws.append_rows(values, value_input_option="USER_ENTERED",
                           insert_data_option="INSERT_ROWS",
                           include_values_in_response=False)
