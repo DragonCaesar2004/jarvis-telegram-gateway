@@ -398,7 +398,7 @@ def append_lesson_rows(client: Any, sheet_id: str, *, run_id: str,
             )
         if run_val and not (run_val.startswith("2024-") or run_val.startswith("2025-")
                             or run_val.startswith("2026-") or run_val.startswith("2027-")
-                            or run_val.startswith("legacy_")):
+                            or run_val.startswith("legacy_") or run_val.startswith("test_")):
             log.error(
                 f"append_lesson_rows: row {idx} col L (run_id) expected ISO-ish "
                 f"id, got {run_val[:40]!r}. Likely column shift."
@@ -414,8 +414,23 @@ def append_lesson_rows(client: Any, sheet_id: str, *, run_id: str,
                 f"append_lesson_rows: row {idx} col O (course_idx) expected "
                 f"integer, got {ci_val[:40]!r}. Likely column shift."
             )
+    # ROOT-CAUSE FIX for the shifted-column bug:
+    #
+    # Without an explicit `table_range`, gspread sends `range=<tab>` to the
+    # Sheets API, which auto-detects "a logical table" using a heuristic that
+    # is unreliable on a wide sheet (~36 columns + buffer to ~70) with the
+    # second row containing operator-friendly 📖 descriptions. The API picks
+    # up the rightmost-used column from row 2 as the anchor, then writes new
+    # rows starting from that column — shifting all values to the right.
+    #
+    # We reproduced this in production: a test row of 36 cells landed at
+    # cols 24-59 instead of 0-35. Pinning `table_range` to the canonical
+    # header row (`A1:AJ1`) forces the API to anchor every new row at
+    # column A regardless of what other rows look like.
+    table_range = f"A1:{_col_letter_idx(expected_width - 1)}1"
     resp = ws.append_rows(values, value_input_option="USER_ENTERED",
                           insert_data_option="INSERT_ROWS",
+                          table_range=table_range,
                           include_values_in_response=False)
     # Parse "Lessons!A11:AJ15" → starting row 11
     updated_range = (resp or {}).get("updates", {}).get("updatedRange", "")

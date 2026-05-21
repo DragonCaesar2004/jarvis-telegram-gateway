@@ -221,7 +221,13 @@ def main() -> int:
         return 0
 
     ws = sheets.ensure_lessons_tab(client, our_sheet_id)
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    # Pin table_range to canonical header so Sheets API doesn't auto-detect a
+    # wider table and shift columns. (See the root-cause comment in
+    # sheets.append_lesson_rows for full details.)
+    header_width = len(sheets.LESSONS_HEADER)
+    end_col = sheets._col_letter_idx(header_width - 1)
+    ws.append_rows(rows, value_input_option="USER_ENTERED",
+                   table_range=f"A1:{end_col}1")
     log.info(f"Imported {stats['videos_imported']} videos across "
              f"{stats['courses_imported']} courses (run_id={run_id})")
     return 0
