@@ -25,9 +25,11 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from typing import Any, Callable
 
 from . import state as _state
+from . import clarify as _clarify
 
 # Matches youtube.com/watch?v=ID and youtu.be/ID (with or without https://).
 # Handles URLs separated by spaces, newlines, or multiple spaces.
@@ -135,6 +137,7 @@ STEP_ASK_TOPIC = "ask_topic"
 STEP_ASK_PAIN = "ask_pain"          # specific customer pain the course solves
 STEP_ASK_AUDIENCE = "ask_audience"  # who the course is for
 STEP_ASK_COUNT = "ask_count"
+STEP_CLARIFY = "clarify"            # awaiting operator's free-form answer to clarify_questions
 STEP_CONFIRM = "confirm"
 STEP_PHASE1_RUNNING = "phase1_running"
 STEP_AWAITING_APPROVAL = "awaiting_approval"
@@ -287,28 +290,36 @@ def handle_wizard_message(token: str, agent: str, cfg: dict, chat_id: int,
         # since the description is already in each block.
         topic_groups = _parse_topic_groups(topic)
         if len(topic_groups) >= 2:
+            # Persist topic_groups + reset any prior clarify state. Step is
+            # NOT set to CONFIRM yet — we spawn a clarify round for topic 0,
+            # which sets step=STEP_CLARIFY (or auto-advances if LLM returns
+            # no questions). The final confirm screen is rendered by
+            # _send_confirm_after_clarify() once all topics are done.
             _state.update(agent, user_id, thread_id=thread_id,
                           topic_groups=topic_groups,
                           topic="", pain="",
-                          count=len(topic_groups), step=STEP_CONFIRM)
+                          count=len(topic_groups),
+                          clarify_questions_per_topic=[],
+                          clarify_answers=[])
             summary = "\n".join(
                 f"  Курс {i+1}: <b>{_html_escape(tg['topic'])}</b>"
                 + (f"\n    <i>{_html_escape(tg['pain'][:120])}{'…' if len(tg['pain']) > 120 else ''}</i>"
                    if tg.get('pain') else "")
                 for i, tg in enumerate(topic_groups)
             )
-            _send_with_buttons(
-                token, chat_id,
-                f"📦 <b>Пакетный режим тем — {len(topic_groups)} тем(ы)</b>\n\n"
-                f"{summary}\n\n"
-                f"По каждой теме найду <b>до 5 курсов</b> "
-                f"(отдельный канал = отдельный курс). Если каналов меньше — "
-                f"сколько прошло критерии Sheet, столько и будет. "
-                f"~20-40 мин на тему. Запустить?",
-                [[{"text": f"🚀 Поехали ({len(topic_groups)} курсов)",
-                   "callback_data": "wiz:start_phase1"},
-                  {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
+            _send(token, chat_id,
+                  f"📦 <b>Пакетный режим — {len(topic_groups)} тем(ы)</b>\n\n"
+                  f"{summary}\n\n"
+                  f"Сейчас я задам по каждой теме 2-4 уточняющих вопроса — "
+                  f"они помогут точнее отобрать каналы.\n\n"
+                  f"🤔 Тема 1/{len(topic_groups)}: подбираю вопросы…",
+                  thread_id=thread_id)
+            _spawn_clarify_round(
+                token, agent, cfg, chat_id, user_id,
                 thread_id=thread_id,
+                topic=topic_groups[0].get("topic", ""),
+                description=topic_groups[0].get("pain", ""),
+                topic_index=0, total_topics=len(topic_groups),
             )
             return
 
@@ -335,21 +346,58 @@ def handle_wizard_message(token: str, agent: str, cfg: dict, chat_id: int,
         # matching the topic. If criteria match fewer, Phase 1 stops at what
         # it found (won't fail unless 0 succeed). To request exactly one
         # course per topic, use the multi-topic batch (===) format.
+        # Step is NOT set to CONFIRM here — first we run a clarify round.
+        # _spawn_clarify_round will either set step=STEP_CLARIFY (with
+        # questions) or auto-advance to STEP_CONFIRM (when LLM had nothing
+        # worth asking).
         st = _state.update(agent, user_id, thread_id=thread_id,
-                           pain=description, count=5, step=STEP_CONFIRM)
+                           pain=description, count=5,
+                           clarify_questions_per_topic=[],
+                           clarify_answers=[])
         topic = st.get("topic", "")
-        desc_line = (_html_escape(description)
-                     if description else "<i>(не указано)</i>")
-        _send_with_buttons(
-            token, chat_id,
-            f"<b>Подтверждение:</b>\n\n"
-            f"Тема: <b>{_html_escape(topic)}</b>\n"
-            f"Описание курса: {desc_line}\n\n"
-            f"Запустить Phase 1? Соберу <b>до 5 курсов</b> на эту тему "
-            f"(каждый — отдельный канал, прошедший критерии Sheet).",
-            [[{"text": "🚀 Поехали", "callback_data": "wiz:start_phase1"},
-              {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
+        _send(token, chat_id,
+              "🤔 Подбираю уточняющие вопросы (5-15 сек)…",
+              thread_id=thread_id)
+        _spawn_clarify_round(
+            token, agent, cfg, chat_id, user_id,
             thread_id=thread_id,
+            topic=topic, description=description,
+            topic_index=0, total_topics=1,
+        )
+        return
+
+    if step == STEP_CLARIFY:
+        answer = text.strip()
+        if not answer:
+            _send(token, chat_id,
+                  "Пустой ответ. Напиши что-то одним сообщением, "
+                  "или нажми «⏭ Без уточнений» чтобы пропустить.",
+                  thread_id=thread_id)
+            return
+
+        st = _state.load(agent, user_id, thread_id)
+        answers = list(st.get("clarify_answers") or [])
+        topic_groups = list(st.get("topic_groups") or [])
+        total = len(topic_groups) if topic_groups else 1
+
+        # The current round's index is whichever slot we're about to fill.
+        # `_spawn_clarify_round` only appends an "" answer for AUTO-SKIPPED
+        # rounds (LLM returned no questions). For rounds that asked the user,
+        # `answers` is still at the pre-round length.
+        current_index = len(answers)
+        # Defensive: if somehow we lost track, clamp.
+        if current_index >= total:
+            current_index = total - 1
+        answers.append(answer)
+
+        _state.update(agent, user_id, thread_id=thread_id,
+                      clarify_answers=answers)
+
+        _advance_after_clarify(
+            token, agent, cfg, chat_id, user_id,
+            thread_id=thread_id,
+            just_finished_index=current_index,
+            total_topics=total,
         )
         return
 
@@ -444,6 +492,27 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
             pass
         return
 
+    if action == "skip_clarify":
+        # Operator chose to skip all (remaining) clarifications and jump
+        # straight to confirm. Pad the clarify_answers list with empty
+        # strings for every topic that didn't get an answer yet, so the
+        # confirm screen and start_phase1 handler see a consistent shape.
+        st = _state.load(agent, user_id, thread_id)
+        topic_groups = list(st.get("topic_groups") or [])
+        answers = list(st.get("clarify_answers") or [])
+        qpt = list(st.get("clarify_questions_per_topic") or [])
+        total = len(topic_groups) if topic_groups else 1
+        while len(answers) < total:
+            answers.append("")
+        while len(qpt) < total:
+            qpt.append([])
+        _state.update(agent, user_id, thread_id=thread_id,
+                      clarify_answers=answers,
+                      clarify_questions_per_topic=qpt)
+        answer_callback_query(token, cq_id, "Без уточнений")
+        _send_confirm_after_clarify(token, agent, chat_id, user_id, thread_id)
+        return
+
     if action == "start_phase1":
         st = _state.load(agent, user_id, thread_id)
         url_mode = bool(st.get("url_mode"))
@@ -452,6 +521,12 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
         video_ids = list(st.get("video_ids") or [])
         topic = st.get("topic") or ""
         description = st.get("pain", "")  # stored under `pain` for back-compat
+        # Clarification arrays (filled during the clarify rounds, parallel
+        # to topic_groups for multi or length-1 for single topic). Used
+        # below to enrich `pain` before launching Phase 1.
+        clarify_answers = list(st.get("clarify_answers") or [])
+        clarify_questions_per_topic = list(
+            st.get("clarify_questions_per_topic") or [])
         if url_groups:
             count = len(url_groups)
         elif topic_groups:
@@ -480,6 +555,18 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
 
         # Topic multi-batch (operator pasted multiple TOPICS separated by ===)
         if topic_groups and not url_mode:
+            # Enrich each topic's `pain` with its operator-given clarification
+            # (free-form answer to the clarify questions). The downstream
+            # llm._pain_audience_block() picks the augmented pain up via the
+            # existing prompt path — no other code needs to change.
+            enriched_topic_groups: list[dict[str, str]] = []
+            for i, tg in enumerate(topic_groups):
+                base_pain = tg.get("pain", "") or ""
+                ans = clarify_answers[i] if i < len(clarify_answers) else ""
+                qs = (clarify_questions_per_topic[i]
+                      if i < len(clarify_questions_per_topic) else [])
+                new_pain = _combine_pain_with_clarification(base_pain, qs, ans)
+                enriched_topic_groups.append({**tg, "pain": new_pain})
             try:
                 tg_api(token, "sendMessage", chat_id=chat_id,
                        message_thread_id=thread_id or None,
@@ -500,7 +587,7 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
                 from . import phase1_discovery
                 phase1_discovery.launch_topic_batch(
                     token, agent, cfg, chat_id, user_id,
-                    topic_groups=topic_groups, thread_id=thread_id,
+                    topic_groups=enriched_topic_groups, thread_id=thread_id,
                 )
             except Exception as e:
                 log.exception(f"[{agent}] failed to launch phase1_topic_batch: {e}")
@@ -583,7 +670,16 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
                 _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
             return
 
-        # Normal topic-based flow
+        # Normal topic-based flow.
+        # Enrich the single-topic pain with the operator's clarification
+        # answer (if any). This is the entry point for the "1 topic up to
+        # 5 courses" flow; both the topic and clarify state live in the
+        # wizard state under length-1 lists.
+        single_ans = clarify_answers[0] if clarify_answers else ""
+        single_qs = (clarify_questions_per_topic[0]
+                     if clarify_questions_per_topic else [])
+        enriched_pain = _combine_pain_with_clarification(
+            description, single_qs, single_ans)
         desc_block = (f"\nОписание: <b>{_html_escape(description)[:300]}</b>"
                       if description else "")
         try:
@@ -609,7 +705,7 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
             from . import phase1_discovery
             phase1_discovery.launch(token, agent, cfg, chat_id, user_id,
                                     topic, count,
-                                    pain=description,
+                                    pain=enriched_pain,
                                     thread_id=thread_id)
         except Exception as e:
             log.exception(f"[{agent}] failed to launch phase1: {e}")
@@ -831,6 +927,224 @@ def _html_escape(s: str) -> str:
          .replace("<", "&lt;")
          .replace(">", "&gt;")
     )
+
+
+# ---------------------------------------------------------------------------
+# Clarification round (between description and confirm)
+# ---------------------------------------------------------------------------
+#
+# State shape (set when we enter the clarify step):
+#
+#   step                            = STEP_CLARIFY
+#   clarify_questions_per_topic     = list[list[str]] — parallel to
+#                                     topic_groups (or length 1 for single
+#                                     topic). [] for topics that the LLM
+#                                     decided needed no clarification.
+#   clarify_answers                 = list[str] — parallel to above. "" for
+#                                     skipped / no-questions topics.
+#
+# Both lists grow incrementally during multi-topic batches: we generate
+# questions for one topic, collect the answer, then generate for the next.
+
+def _spawn_clarify_round(token: str, agent: str, cfg: dict,
+                         chat_id: int, user_id: int, *,
+                         thread_id: int, topic: str, description: str,
+                         topic_index: int, total_topics: int) -> None:
+    """Generate clarify questions for `topic` in a daemon thread, then either:
+      * if LLM produced questions → set step=STEP_CLARIFY and message the
+        operator with the questions + a "Без уточнений" button, OR
+      * if LLM returned [] (description already exhaustive) → record an empty
+        answer for this topic and either auto-advance to the next topic in a
+        batch, or jump to STEP_CONFIRM for single-topic flows.
+
+    Runs in a background thread so the Telegram polling loop isn't blocked
+    by the 5-15s Claude CLI call. Multiple concurrent clarify rounds for the
+    same (user, thread) are NOT expected (one wizard per topic-id) so no
+    locking is needed beyond the state file's own atomic-replace.
+    """
+    def _bg() -> None:
+        try:
+            questions = _clarify.generate_questions(
+                topic=topic, description=description)
+        except Exception as e:
+            log.warning(f"wizard: clarify generation crashed: {e}")
+            questions = []
+
+        st = _state.load(agent, user_id, thread_id)
+        qpt = list(st.get("clarify_questions_per_topic") or [])
+        answers = list(st.get("clarify_answers") or [])
+        # Pad if we somehow skipped indexes (shouldn't happen, but be safe)
+        while len(qpt) < topic_index:
+            qpt.append([])
+        while len(answers) < topic_index:
+            answers.append("")
+
+        # Append THIS topic's questions (may be empty list).
+        if len(qpt) == topic_index:
+            qpt.append(questions)
+        else:
+            qpt[topic_index] = questions
+
+        # If LLM had no questions for this topic — auto-fill empty answer
+        # and advance. The operator never sees this round.
+        if not questions:
+            if len(answers) == topic_index:
+                answers.append("")
+            else:
+                answers[topic_index] = ""
+            _state.update(agent, user_id, thread_id=thread_id,
+                          clarify_questions_per_topic=qpt,
+                          clarify_answers=answers)
+            _advance_after_clarify(token, agent, cfg, chat_id, user_id,
+                                   thread_id=thread_id,
+                                   just_finished_index=topic_index,
+                                   total_topics=total_topics)
+            return
+
+        # We have questions — show them and wait for operator's text reply.
+        _state.update(agent, user_id, thread_id=thread_id,
+                      step=STEP_CLARIFY,
+                      clarify_questions_per_topic=qpt,
+                      clarify_answers=answers)
+
+        if total_topics > 1:
+            header = (f"💡 <b>Тема {topic_index + 1}/{total_topics}:</b> "
+                      f"<b>{_html_escape(topic)}</b>\n\n"
+                      f"Уточняющие вопросы:\n")
+        else:
+            header = "💡 <b>Уточняющие вопросы перед запуском</b>\n\n"
+
+        qs_text = "\n".join(
+            f"{i + 1}. {_html_escape(q)}" for i, q in enumerate(questions))
+
+        msg = (
+            header + qs_text + "\n\n"
+            "<i>Ответь одним сообщением — свободным текстом по всем вопросам "
+            "сразу. Или нажми «Без уточнений» чтобы пропустить.</i>"
+        )
+
+        _send_with_buttons(
+            token, chat_id, msg,
+            [[{"text": "⏭ Без уточнений", "callback_data": "wiz:skip_clarify"},
+              {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
+            thread_id=thread_id,
+        )
+
+    threading.Thread(
+        target=_bg, daemon=True,
+        name=f"clarify-{agent}-{user_id}-{topic_index}",
+    ).start()
+
+
+def _advance_after_clarify(token: str, agent: str, cfg: dict,
+                            chat_id: int, user_id: int, *,
+                            thread_id: int, just_finished_index: int,
+                            total_topics: int) -> None:
+    """Decide what to do after a clarify round ended (either answered or
+    auto-skipped because LLM produced no questions).
+
+    If there are more topics in a multi-batch → kick off the next round.
+    Otherwise → show the final confirmation screen.
+    """
+    next_index = just_finished_index + 1
+    if next_index < total_topics:
+        # More topics to clarify
+        st = _state.load(agent, user_id, thread_id)
+        topic_groups = list(st.get("topic_groups") or [])
+        next_tg = topic_groups[next_index] if next_index < len(topic_groups) else {}
+        _send(token, chat_id,
+              f"🤔 Тема {next_index + 1}/{total_topics}: подбираю вопросы…",
+              thread_id=thread_id)
+        _spawn_clarify_round(
+            token, agent, cfg, chat_id, user_id,
+            thread_id=thread_id,
+            topic=next_tg.get("topic", ""),
+            description=next_tg.get("pain", ""),
+            topic_index=next_index, total_topics=total_topics,
+        )
+        return
+
+    # All clarify rounds done → show confirm screen
+    _send_confirm_after_clarify(token, agent, chat_id, user_id, thread_id)
+
+
+def _send_confirm_after_clarify(token: str, agent: str,
+                                 chat_id: int, user_id: int,
+                                 thread_id: int) -> None:
+    """Final confirmation screen after all clarify rounds completed.
+
+    Sets step=STEP_CONFIRM, shows topic(s), description(s), and any
+    clarifications the operator gave. Buttons: 🚀 Поехали / ✖️ Отмена.
+    """
+    _state.update(agent, user_id, thread_id=thread_id, step=STEP_CONFIRM)
+    st = _state.load(agent, user_id, thread_id)
+    topic_groups = list(st.get("topic_groups") or [])
+    answers = list(st.get("clarify_answers") or [])
+
+    if topic_groups:
+        # Multi-topic batch
+        lines = []
+        for i, tg in enumerate(topic_groups):
+            t = _html_escape(tg.get("topic", "") or "(без темы)")
+            ans = (answers[i] if i < len(answers) else "").strip()
+            line = f"  Курс {i + 1}: <b>{t}</b>"
+            if ans:
+                snip = _html_escape(ans[:160])
+                if len(ans) > 160:
+                    snip += "…"
+                line += f"\n    <i>уточнения: {snip}</i>"
+            lines.append(line)
+        msg = (
+            f"📦 <b>Пакетный режим — {len(topic_groups)} тем(ы)</b>\n\n"
+            + "\n".join(lines) + "\n\n"
+            f"Запустить Phase 1 для всех {len(topic_groups)} курсов?"
+        )
+        _send_with_buttons(
+            token, chat_id, msg,
+            [[{"text": f"🚀 Поехали ({len(topic_groups)} курсов)",
+               "callback_data": "wiz:start_phase1"},
+              {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
+            thread_id=thread_id,
+        )
+        return
+
+    # Single topic
+    topic = st.get("topic", "")
+    description = st.get("pain", "")
+    desc_line = (_html_escape(description) if description
+                 else "<i>(не указано)</i>")
+    ans = (answers[0] if answers else "").strip()
+    clar_block = ""
+    if ans:
+        snip = _html_escape(ans[:300])
+        if len(ans) > 300:
+            snip += "…"
+        clar_block = f"\nУточнения: <i>{snip}</i>"
+
+    _send_with_buttons(
+        token, chat_id,
+        f"<b>Подтверждение:</b>\n\n"
+        f"Тема: <b>{_html_escape(topic)}</b>\n"
+        f"Описание курса: {desc_line}{clar_block}\n\n"
+        f"Запустить Phase 1? Соберу <b>до 5 курсов</b> на эту тему "
+        f"(каждый — отдельный канал, прошедший критерии Sheet).",
+        [[{"text": "🚀 Поехали", "callback_data": "wiz:start_phase1"},
+          {"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
+        thread_id=thread_id,
+    )
+
+
+def _combine_pain_with_clarification(pain: str, questions: list[str],
+                                      answer: str) -> str:
+    """Concatenate the operator's free-form clarification answer onto the
+    end of `pain` so downstream prompts (discovery, scoring, compose) pick
+    it up automatically via the existing OPERATOR-SPECIFIED COURSE DIRECTION
+    block in llm._pain_audience_block().
+    """
+    extra = _clarify.format_for_pain(questions, answer)
+    if not extra:
+        return pain
+    return (pain or "") + extra
 
 
 # ---------------------------------------------------------------------------
