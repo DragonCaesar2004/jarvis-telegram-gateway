@@ -1357,6 +1357,58 @@ MODE_CHAT = "chat"
 MODE_WIZARD = "wizard"
 
 
+# ---------------------------------------------------------------------------
+# Reply keyboard (custom keyboard attached to the input bar)
+# ---------------------------------------------------------------------------
+#
+# Shown via `/keyboard` and persists until `/hide_keyboard`. Each label below
+# is treated as an alias for the corresponding slash command — see the
+# _KEYBOARD_LABEL_TO_COMMAND mapping that converts a button press into the
+# command dispatcher's input.
+#
+# Group/forum behavior: the keyboard is sent with selective=True so that only
+# the user the bot is replying to sees it. Other group members don't have
+# their input bar hijacked. selective requires the message to either reply
+# to the user or @-mention them — we attach the reply_to_message_id of the
+# user's command when sending the keyboard, satisfying the selective rule.
+
+KB_ONBOARD = "🎓 Новый курс"
+KB_CHAT = "💬 Чат"
+KB_MENU = "📋 Меню"
+KB_STATUS = "📊 Статус"
+KB_CANCEL = "❌ Отмена"
+KB_HIDE = "⌨️ Скрыть кнопки"
+
+_MAIN_REPLY_KEYBOARD: dict[str, Any] = {
+    "keyboard": [
+        [{"text": KB_ONBOARD}, {"text": KB_CHAT}],
+        [{"text": KB_MENU}, {"text": KB_STATUS}, {"text": KB_CANCEL}],
+        [{"text": KB_HIDE}],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+    "selective": True,
+    "input_field_placeholder": "Кнопка или текст…",
+}
+
+_REMOVE_REPLY_KEYBOARD: dict[str, Any] = {
+    "remove_keyboard": True,
+    "selective": True,
+}
+
+# Button label → command string. When user taps a button, the label arrives
+# as a regular text message; process_update rewrites it to the slash command
+# *before* the normal command dispatcher runs.
+_KEYBOARD_LABEL_TO_COMMAND: dict[str, str] = {
+    KB_ONBOARD: "/onboard",
+    KB_CHAT: "/chat",
+    KB_MENU: "/menu",
+    KB_STATUS: "/status",
+    KB_CANCEL: "/cancel",
+    KB_HIDE: "/hide_keyboard",
+}
+
+
 def _mode_file(agent: str, user_id: int, thread_id: int = 0) -> Path:
     """Per-(user, thread) mode file. Falsy thread_id keeps the legacy
     DM/group filename so existing state files keep working without migration.
@@ -1694,6 +1746,108 @@ def handle_command(token: str, chat_id: int, agent: str, cmd: str, args: str, cf
         send_message_with_buttons(token, chat_id, text, rows)
         return True
 
+    if cmd == "/keyboard":
+        # Attach the main reply keyboard to the input bar. In groups the
+        # keyboard goes only to the user who typed /keyboard (selective +
+        # reply-to) so other operators aren't affected. Once shown, it stays
+        # until /hide_keyboard (or until the user clears it manually).
+        thread_id = int((cfg.get("_last_message_thread_id") or 0))
+        reply_to_id = int((cfg.get("_last_message_id") or 0))
+        params: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": ("⌨️ <b>Кнопки включены.</b>\n\n"
+                     "Тапай по кнопкам в панели ввода — это аналоги команд. "
+                     "<code>/hide_keyboard</code> чтобы убрать."),
+            "parse_mode": "HTML",
+            "reply_markup": _MAIN_REPLY_KEYBOARD,
+        }
+        if thread_id:
+            params["message_thread_id"] = thread_id
+        if reply_to_id:
+            params["reply_parameters"] = {
+                "message_id": reply_to_id,
+                "allow_sending_without_reply": True,
+            }
+        try:
+            tg_api(token, "sendMessage", **params)
+        except Exception as e:
+            log.warning(f"[{agent}] /keyboard send failed: {e}")
+        return True
+
+    if cmd == "/hide_keyboard":
+        thread_id = int((cfg.get("_last_message_thread_id") or 0))
+        reply_to_id = int((cfg.get("_last_message_id") or 0))
+        params = {
+            "chat_id": chat_id,
+            "text": "⌨️ Кнопки скрыты. Покажу снова: <code>/keyboard</code>.",
+            "parse_mode": "HTML",
+            "reply_markup": _REMOVE_REPLY_KEYBOARD,
+        }
+        if thread_id:
+            params["message_thread_id"] = thread_id
+        if reply_to_id:
+            params["reply_parameters"] = {
+                "message_id": reply_to_id,
+                "allow_sending_without_reply": True,
+            }
+        try:
+            tg_api(token, "sendMessage", **params)
+        except Exception as e:
+            log.warning(f"[{agent}] /hide_keyboard send failed: {e}")
+        return True
+
+    if cmd == "/onboard":
+        # Same effect as the menu:onboard inline button — start the course
+        # wizard. Honors thread_id so it lands in the right forum topic.
+        from_user = (cfg.get("_last_message_from_user") or {})
+        user_id = from_user.get("id", chat_id)
+        thread_id = int((cfg.get("_last_message_thread_id") or 0))
+        if not (cfg.get("onboarder") or {}).get("enabled"):
+            try:
+                tg_api(token, "sendMessage", chat_id=chat_id,
+                       message_thread_id=thread_id or None,
+                       text="Онбордер выключен в config.json.")
+            except Exception:
+                pass
+            return True
+        set_user_mode(agent, user_id, MODE_WIZARD, thread_id)
+        try:
+            from onboarder import wizard as _wiz
+            _wiz.start_wizard(token, agent, cfg, chat_id, user_id,
+                              thread_id=thread_id)
+        except Exception as e:
+            log.exception(f"[{agent}] /onboard failed: {e}")
+            try:
+                tg_api(token, "sendMessage", chat_id=chat_id,
+                       message_thread_id=thread_id or None,
+                       text=f"⚠️ Не удалось запустить wizard: {e}")
+            except Exception:
+                pass
+        return True
+
+    if cmd == "/chat":
+        # Switch back to chat-with-agent mode (out of any wizard run).
+        # Honors thread_id so per-topic modes work correctly in forums.
+        from_user = (cfg.get("_last_message_from_user") or {})
+        user_id = from_user.get("id", chat_id)
+        thread_id = int((cfg.get("_last_message_thread_id") or 0))
+        prev = get_user_mode(agent, user_id, thread_id)
+        set_user_mode(agent, user_id, MODE_CHAT, thread_id)
+        try:
+            from onboarder import wizard as _wiz
+            _wiz.clear_wizard_state(agent, user_id, thread_id)
+        except Exception:
+            pass
+        text = ("<b>💬 Чат с агентом активен.</b>\nПиши как обычно."
+                if prev != MODE_CHAT else "<b>Уже в режиме чата.</b>")
+        try:
+            tg_api(token, "sendMessage", chat_id=chat_id,
+                   message_thread_id=thread_id or None,
+                   text=text, parse_mode="HTML")
+        except Exception:
+            pass
+        return True
+
     if cmd == "/cancel":
         from_user = (cfg.get("_last_message_from_user") or {})
         user_id = from_user.get("id", chat_id)
@@ -1715,8 +1869,13 @@ def handle_command(token: str, chat_id: int, agent: str, cmd: str, args: str, cf
     if cmd == "/help":
         onboarder_enabled = bool((cfg.get("onboarder") or {}).get("enabled"))
         wizard_line = "<code>/menu</code> -- меню (включая 🎓 Новый курс)\n" if onboarder_enabled else ""
+        onboard_line = "<code>/onboard</code> -- запуск wizard напрямую\n" if onboarder_enabled else ""
         text = (
             "<b>gateway commands</b>\n\n"
+            "<code>/keyboard</code> -- показать кнопки в панели ввода\n"
+            "<code>/hide_keyboard</code> -- скрыть кнопки\n"
+            "<code>/chat</code> -- режим чата с агентом\n"
+            f"{onboard_line}"
             "<code>/stop</code> or <code>/cancel</code> -- stop current agent task / выход из wizard\n"
             "<code>/status</code> -- session and memory status\n"
             "<code>/reset</code> -- reset session (saves important to MEMORY)\n"
@@ -2949,6 +3108,16 @@ def _process_update_impl(agent: str, cfg: dict, token: str, update: dict,
     # Stash sender info on cfg so handle_command() can read user_id / username.
     # Cleared after dispatch to avoid leaking between messages.
     cfg["_last_message_from_user"] = msg.get("from") or {}
+    cfg["_last_message_thread_id"] = int(msg.get("message_thread_id") or 0)
+    cfg["_last_message_id"] = int(message_id or 0)
+
+    # Reply-keyboard buttons arrive as plain text matching the label. Rewrite
+    # them to the corresponding slash command so the existing command path
+    # handles them uniformly — pressing "🎓 Новый курс" is the same as typing
+    # "/onboard". Done before any other routing so wizard / chat dispatch
+    # never sees the raw label.
+    if text in _KEYBOARD_LABEL_TO_COMMAND:
+        text = _KEYBOARD_LABEL_TO_COMMAND[text]
 
     # Handle gateway commands (/status, /reset, /help, /new, /menu, /cancel) -- don't go to claude
     if text.startswith("/"):
@@ -2962,6 +3131,8 @@ def _process_update_impl(agent: str, cfg: dict, token: str, update: dict,
         if handle_command(token, chat_id, agent, cmd, args, cfg):
             log.info(f"[{agent}] command: {cmd} {args}".strip())
             cfg.pop("_last_message_from_user", None)
+            cfg.pop("_last_message_thread_id", None)
+            cfg.pop("_last_message_id", None)
             return
 
     # Mode router: if user is in wizard mode, dispatch to onboarder, skip Claude.
@@ -2985,6 +3156,8 @@ def _process_update_impl(agent: str, cfg: dict, token: str, update: dict,
                 except Exception:
                     pass
             cfg.pop("_last_message_from_user", None)
+            cfg.pop("_last_message_thread_id", None)
+            cfg.pop("_last_message_id", None)
             return
 
     # Classify source for memory extraction provenance
@@ -3250,6 +3423,10 @@ def _process_update_impl(agent: str, cfg: dict, token: str, update: dict,
 
 _BOT_COMMANDS = [
     {"command": "menu", "description": "Меню (Новый курс, статус, режим)"},
+    {"command": "keyboard", "description": "Показать кнопки в панели ввода"},
+    {"command": "hide_keyboard", "description": "Скрыть кнопки"},
+    {"command": "onboard", "description": "Новый курс (запуск wizard)"},
+    {"command": "chat", "description": "Режим чата с агентом"},
     {"command": "cancel", "description": "Выход из wizard, обратно в чат"},
     {"command": "new", "description": "Новая сессия (полный handoff)"},
     {"command": "status", "description": "Статус сессии и памяти"},
@@ -3744,10 +3921,12 @@ def _menu_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> None:
         # Reuse /status text path
         from_msg = {"chat": {"id": chat_id}, "from": {"id": user_id}}
         cfg["_last_message_from_user"] = from_msg["from"]
+        cfg["_last_message_thread_id"] = int(thread_id or 0)
         try:
             handle_command(token, chat_id, agent, "/status", "", cfg)
         finally:
             cfg.pop("_last_message_from_user", None)
+            cfg.pop("_last_message_thread_id", None)
         answer_callback_query(token, cq_id)
         return
 
