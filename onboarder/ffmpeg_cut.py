@@ -169,18 +169,16 @@ def cut_segments(*, input_path: str | Path, cuts: list[dict],
         for i, (s, e) in enumerate(keep):
             seg = tmp / f"seg{i:03d}.mp4"
             r = subprocess.run(
-                [
-                    "ffmpeg", "-y",
-                    "-i", str(src),
-                    "-ss", f"{s:.3f}",
-                    "-to", f"{e:.3f}",
+                ["ffmpeg", "-y"]
+                + _hybrid_seek_args(src, s, e)
+                + [
                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                     "-c:a", "aac", "-b:a", "160k",
                     "-movflags", "+faststart",
                     str(seg),
                 ],
                 capture_output=True, text=True,
-                timeout=max(300, int((e - s) * 4)),
+                timeout=max(600, int((e - s) * 4)),
             )
             if r.returncode != 0 or not seg.exists():
                 raise FFmpegError(
@@ -213,8 +211,58 @@ def cut_segments(*, input_path: str | Path, cuts: list[dict],
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Hybrid-seek buffer. With keyframes every 2-5s in typical YouTube videos,
+# a 10s buffer guarantees the fast-seek lands on or before a keyframe that
+# precedes the requested start time. The buffer is then "eaten" by the
+# slow-seek that follows, giving frame-accurate output at 5-8× the speed
+# of pure output-seek.
+_HYBRID_SEEK_BUFFER_SEC = 10.0
+
+
+def _hybrid_seek_args(src: Path, start: float, end: float) -> list[str]:
+    """Build the ffmpeg seek/input arguments for cutting [start, end] from src.
+
+    Uses hybrid seek (fast input-seek + slow output-seek) for big offsets
+    so ffmpeg doesn't have to decode everything from t=0 to `start`. The
+    fast-seek lands on the nearest keyframe ≤ (start - buffer); the post-`-i`
+    `-ss buffer` drops the decoded frames between the keyframe and `start`,
+    yielding frame-accurate output.
+
+    For tiny offsets (start < buffer), no benefit — falls back to plain
+    output-seek which is fine for those.
+
+    Uses `-t DURATION` instead of `-to END` because with two `-ss` flags the
+    `-to` semantics differ between ffmpeg versions; `-t` is unambiguous.
+    """
+    duration = end - start
+    if start < _HYBRID_SEEK_BUFFER_SEC:
+        # Near the start — naive output-seek is fast enough
+        return ["-i", str(src),
+                "-ss", f"{start:.3f}",
+                "-t", f"{duration:.3f}"]
+    pre_seek = start - _HYBRID_SEEK_BUFFER_SEC
+    return ["-ss", f"{pre_seek:.3f}",
+            "-i", str(src),
+            "-ss", f"{_HYBRID_SEEK_BUFFER_SEC:.3f}",
+            "-t", f"{duration:.3f}"]
+
+
+# If two cuts are separated by less than this many seconds, merge them. The
+# tiny keep-segment between them would be too short to be useful content
+# (Whisper word-boundary noise) AND too short for ffmpeg to encode cleanly
+# at libx264-veryfast settings — risks an empty output that breaks concat.
+_MIN_KEEP_GAP_SEC = 0.5
+
+
 def _normalize_cuts(cuts: list[dict]) -> list[tuple[float, float]]:
-    """Coerce, sort, merge overlapping ranges. Drops zero-length items."""
+    """Coerce, sort, merge overlapping ranges + ranges separated by less than
+    _MIN_KEEP_GAP_SEC. Drops zero-length items.
+
+    Merging near-adjacent cuts eliminates the micro keep-segments that caused
+    the May-25 Mary Poppins failure: when two cuts ended/started 61ms apart,
+    the inverted keep-list produced a 0.061s segment that ffmpeg-libx264 timed
+    out on (no keyframes to encode, plus the surrounding CPU-saturated workers).
+    """
     pairs: list[tuple[float, float]] = []
     for c in cuts or []:
         try:
@@ -227,7 +275,8 @@ def _normalize_cuts(cuts: list[dict]) -> list[tuple[float, float]]:
     pairs.sort()
     merged: list[tuple[float, float]] = []
     for s, e in pairs:
-        if merged and s <= merged[-1][1]:
+        # Merge if overlapping (s <= prev_end) OR if gap < threshold
+        if merged and s <= merged[-1][1] + _MIN_KEEP_GAP_SEC:
             merged[-1] = (merged[-1][0], max(merged[-1][1], e))
         else:
             merged.append((s, e))
