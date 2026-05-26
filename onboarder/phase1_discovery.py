@@ -138,21 +138,25 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
          thread_id: int = 0,
          batch_run_id: str | None = None,
          batch_course_idx_offset: int = 0,
-         batch_silent_finish: bool = False) -> int:
+         batch_silent_finish: bool = False) -> tuple[int, int]:
     """Run topic-mode Phase 1 for ONE topic.
 
-    Standalone use returns 0 (caller doesn't need a value).
+    Returns `(successful_courses, course_idx_slots_used)`:
+      - successful_courses: how many channels produced lessons in the Sheet
+      - course_idx_slots_used: how many course_idx values this topic consumed
+        (= attempts before reaching `count` successes; always ≥ successful_courses).
+        Used by the batch caller to advance offset WITHOUT collision when the
+        topic's channel loop tried more channels than it ended up keeping.
 
     Batch use (when batch_run_id is provided):
       - Reuses the given run_id instead of generating a new one
       - course_idx in Sheet rows is offset by batch_course_idx_offset
-        (so e.g. topic #3 in a batch starts at course_idx=3, not 1)
+        (so e.g. topic #3 in a batch starts at course_idx = offset+1)
       - If batch_silent_finish=True, skips the final "Phase 1 готов" button
         and the wizard state→awaiting_approval update — the batch caller
         does that once after all topics finish
-      - Returns the number of courses (rows-with-lesson-idx-1) actually
-        written to Sheet for this topic, so the caller can advance the
-        course_idx offset for the next topic in the batch
+
+    Standalone use ignores the return tuple.
     """
     # ── 1. Resolve secrets and open Sheet ────────────────────────────────
     # Anthropic API key not needed: llm.py uses `claude -p` CLI via Max OAuth.
@@ -692,11 +696,16 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
             "Попробуй другую тему или расширь критерии." + diag
         )
 
+    # `slots_used` = how many course_idx values this topic actually consumed
+    # in the for-loop (= attempts before reaching count successes). Always
+    # ≥ successful_courses. The batch caller advances its offset by this
+    # value so the NEXT topic doesn't collide with our failed-channel slots.
+    slots_used = course_idx - batch_course_idx_offset
+
     # Batch mode: caller (launch_topic_batch) handles state update and final
-    # summary after ALL topics in the batch finish. Return how many courses
-    # this topic produced so the caller can advance course_idx for the next.
+    # summary after ALL topics in the batch finish.
     if batch_silent_finish:
-        return successful_courses
+        return (successful_courses, slots_used)
 
     _state.update(agent, user_id, thread_id=int(thread_id or 0),
                   step="awaiting_approval",
@@ -713,7 +722,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
           + dedup_note
           + "\n\nКаждый курс выше — со своей кнопкой "
           + "<b>«🚀 Запустить Курс N»</b>. Жми когда проверил Sheet.")
-    return successful_courses
+    return (successful_courses, slots_used)
 
 
 # ---------------------------------------------------------------------------
@@ -1521,7 +1530,18 @@ def _run_topic_batch(token: str, agent: str, cfg: dict, chat_id: int,
 
     completed_topics: list[str] = []
     failed_topics: list[str] = []
-    course_idx_offset = 0  # advances by number of courses produced per topic
+    # course_idx_offset is the next-available course_idx for any topic in
+    # this batch. Advances by SLOTS_USED (= attempt count) after each topic,
+    # not by SUCCESS COUNT — so failed channels' "burnt" course_idx values
+    # never get reused by the next topic. Fixes the 2026-05-25 overnight
+    # collision where topic 5 reused course_idx 16-20 of topic 4.
+    course_idx_offset = 0
+    # When a topic raises before reaching its for-loop (e.g. Sheets API 500
+    # in get_active_video_ids), we don't know how many slots it consumed —
+    # advance by `count` as a conservative reservation to guarantee no
+    # collision with the next topic. Same value the topic would have used
+    # in the best case.
+    EXCEPTION_RESERVE = 5  # matches the per-topic `count=5` below
 
     for topic_idx, tg in enumerate(topic_groups, start=1):
         topic = (tg.get("topic") or "").strip()
@@ -1537,7 +1557,7 @@ def _run_topic_batch(token: str, agent: str, cfg: dict, chat_id: int,
             # Each topic in the batch ALSO tries to produce up to 5 courses
             # (same as single-topic mode). Phase 1's per-channel loop stops
             # at the first 5 that succeed, or at whatever it found if fewer.
-            courses_made = _run(
+            courses_made, slots_used = _run(
                 token, agent, cfg, chat_id, user_id,
                 topic=topic, count=5, onb=onb,
                 pain=pain, audience="",
@@ -1546,7 +1566,11 @@ def _run_topic_batch(token: str, agent: str, cfg: dict, chat_id: int,
                 batch_course_idx_offset=course_idx_offset,
                 batch_silent_finish=True,
             )
-            course_idx_offset += int(courses_made or 0)
+            # Advance offset by ATTEMPTS, not successes. This is the fix:
+            # if topic burned 5 course_idx slots but only 3 succeeded, the
+            # next topic still skips all 5 — no collision on the 2 burnt
+            # failed-attempt slots.
+            course_idx_offset += int(slots_used or 0)
             if courses_made:
                 completed_topics.append(
                     f"  ✓ Тема {topic_idx}: «{topic}» — {courses_made} курс(ов)"
@@ -1562,6 +1586,13 @@ def _run_topic_batch(token: str, agent: str, cfg: dict, chat_id: int,
                   f"⚠️ Тема {topic_idx} «{_html_escape(topic)}» упала: "
                   f"<code>{_html_escape(str(e))[:200]}</code>. Продолжаю.")
             failed_topics.append(f"  ✗ Тема {topic_idx}: «{topic}» — {str(e)[:80]}")
+            # Topic raised BEFORE we know how many slots it used. Reserve
+            # `count` slots conservatively so the next topic starts cleanly
+            # past anything this topic may have partially written. Without
+            # this, the next topic collides — the exact bug from 2026-05-25
+            # when topic 4 raised on Sheets API 500 and topic 5 reused
+            # course_idx 16-20.
+            course_idx_offset += EXCEPTION_RESERVE
             continue
 
     if not completed_topics:
