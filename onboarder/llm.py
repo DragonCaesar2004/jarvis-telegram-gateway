@@ -146,6 +146,21 @@ testimonials, author bio, author expertise, lesson descriptions, etc.):
    description", "follow me on..."** even when they appear in the source
    transcripts. Those are filler the speaker added to their original recording;
    they do not belong in the published course.
+8. **NEVER state that the author's materials, content, lessons, lectures,
+   methodology, or work are "publicly available", "freely available",
+   "available online", "freely accessible", "in open sources", "open
+   access", "in the public domain", or otherwise findable outside this
+   platform.** The author appears here as the canonical instructor — not
+   as someone whose work the student could find elsewhere for free. Any
+   sentence implying the student could "also find" / "additionally
+   access" / "discover more of his/her work online" is forbidden. The
+   course's content is presented as exclusive to this platform.
+9. **NEVER write phrases like "her widely shared work", "his popular
+   online presence", "you can find more of her teachings online", "their
+   materials are widely accessible", "available for free on other
+   platforms"** — these expose the curation. Replace with credentials-
+   only language: certifications, books published, clinic affiliation,
+   teaching experience, lineage.
 
 These bans override anything in the source materials. If a transcript opens
 with "Welcome back to my channel" or closes with "subscribe and ring the
@@ -456,13 +471,23 @@ INCLUDE only videos that:
 1. **Directly serve the topic.** The title clearly signals it covers the core subject or a sub-topic any reasonable curriculum would include. "Tangentially related" is not enough — if a video would feel out of place in a paid course on this topic, exclude it.
 2. **Build on each other.** Taken together, the selected videos cover the topic from foundations to advanced application without major gaps. A reader who watches them in order should leave with a coherent mental model, not a grab-bag of tips.
 3. **Aren't redundant.** If two videos cover the same material, keep the better one (clearer title, longer/more thorough, more recent).
+4. **Are predominantly PRACTICE, not theory.** Strongly prefer hands-on tutorials, guided exercises, follow-along sessions, walkthroughs, demonstrations, technique drills, routines, "do this with me" sessions. Avoid pure-explainer / pure-lecture / talking-head / interview / podcast / "what is X" / history-and-theory videos UNLESS they're an essential foundational piece (1-2 max per course, only if no practice video covers the same concept). The student is buying a SKILL, not a survey — every lesson should leave them able to DO something new, not just know something new.
 
 EXCLUDE videos that are:
 - Off-topic (channels often cover multiple themes — only pick those that fit THIS course's topic)
 - Promotional / announcement-only (sponsorship reads, "I'm starting a new course", product launches)
 - Live streams, Q&As, podcasts, or unstructured interviews (unless they're explicitly framed as standalone lessons)
+- Pure theory / lecture / explainer videos when a practical alternative exists on the same channel covering the same concept
 - Outside preferred_video_length_min..preferred_video_length_max
 - Duplicates / reposts / "best of" compilations / Shorts (under ~3 min)
+
+## Practice vs theory — quick signal cheatsheet
+
+PRACTICE signals in titles (PREFER): "10-min routine", "follow along", "guided session", "step by step", "tutorial", "exercises for X", "technique drill", "morning practice", "do this", "how to [verb]", "before bed", "5-minute", "with me", "guided meditation", "warm-up", "cool-down", "flow", "sequence", "walkthrough", "drill", "session N", "day N", "week N", "demo".
+
+THEORY signals (DEPRIORITIZE): "what is X", "the science of X", "understanding X", "history of X", "explained", "the truth about", "5 things you should know", "interview with", "talk", "TED-style", "behind the scenes", "Q&A", "vs", "comparison", "review of", "facts about".
+
+The same words can swing either way — a "5-minute breathing exercise" is practice; a "5-things explainer about breathing" is theory. Read the title carefully.
 
 ## Sequencing
 
@@ -1424,8 +1449,9 @@ def parse_template(text: str) -> dict[str, Any]:
     }
 
 
-# Words that imply YouTube origin / online presence — sentences mentioning
-# any of these get stripped from compose output. Lowercase comparison.
+# Words/phrases that imply YouTube origin / online presence / "find this
+# elsewhere for free" — sentences mentioning any of these get stripped
+# from compose output. Lowercase comparison.
 _ORIGIN_BAN_WORDS = (
     "youtube", "youtu.be",
     "subscribe", "subscriber", "subscribers",
@@ -1437,6 +1463,23 @@ _ORIGIN_BAN_WORDS = (
     "social media",
     "view count", "views on", "viral",
     "ring the bell", "notification",
+    # "Find this stuff elsewhere for free" — exposure that the same material
+    # exists outside this platform. Added 2026-05-26 after author bios kept
+    # leaking "her teachings are freely available online" / "widely shared
+    # online" / "in the public domain" type phrases despite NO_ORIGIN rules.
+    "publicly available", "publicly accessible",
+    "freely available", "freely accessible", "freely shared",
+    "open source", "open sources", "in open sources",
+    "open access",
+    "available online", "accessible online",
+    "widely shared", "widely available",
+    "in the public domain",
+    "online presence", "online following", "online audience",
+    "her teachings online", "his teachings online",
+    "her work online", "his work online", "their work online",
+    "find more of her", "find more of his", "find more of their",
+    "more of her teachings", "more of his teachings",
+    "online resources", "online materials",
 )
 
 
