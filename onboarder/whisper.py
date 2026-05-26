@@ -64,6 +64,56 @@ _DEFAULT_PROVIDER: str = "openai"  # mutated by set_default_provider()
 WHISPER_MAX_BYTES = 24 * 1024 * 1024   # legacy back-compat constant
 
 
+# ---------------------------------------------------------------------------
+# Language normalisation
+# ---------------------------------------------------------------------------
+#
+# Whisper's verbose_json `language` field returns the FULL English name of the
+# detected language ("english", "russian", "spanish", …), not an ISO 639-1
+# code. If we feed that back as the `language=` parameter on a subsequent
+# call, OpenAI returns 400:
+#     "Invalid language 'english'. Language parameter must be specified in
+#      ISO-639-1 format."
+# This triggered specifically on multi-chunk audio (>~50 min on OpenAI,
+# >~20 min on Groq) where chunks 2+ inherit the detected language from
+# chunk 1 to skip re-detection. Single-chunk callers were unaffected
+# because phase1_enrich/phase2 already pass the return value through
+# elevenlabs_dub._iso themselves.
+
+_WHISPER_LANG_TO_ISO: dict[str, str] = {
+    "english": "en", "russian": "ru", "spanish": "es", "french": "fr",
+    "german": "de", "portuguese": "pt", "italian": "it", "chinese": "zh",
+    "japanese": "ja", "korean": "ko", "arabic": "ar", "hindi": "hi",
+    "turkish": "tr", "polish": "pl", "dutch": "nl", "ukrainian": "uk",
+    "vietnamese": "vi", "indonesian": "id", "thai": "th", "swedish": "sv",
+    "norwegian": "no", "finnish": "fi", "danish": "da", "czech": "cs",
+    "greek": "el", "hebrew": "he", "romanian": "ro", "hungarian": "hu",
+    "bulgarian": "bg", "catalan": "ca", "croatian": "hr", "slovak": "sk",
+    "slovenian": "sl", "estonian": "et", "latvian": "lv", "lithuanian": "lt",
+    "malay": "ms", "tamil": "ta", "telugu": "te", "bengali": "bn",
+    "urdu": "ur", "persian": "fa", "filipino": "tl", "tagalog": "tl",
+}
+
+
+def _normalize_lang_to_iso(lang: str) -> str | None:
+    """Whisper full-word lang → ISO 639-1. None if we can't map it.
+
+    None means "treat as auto-detect" — safer than passing back an unrecognised
+    string that may or may not be a valid ISO. Multi-chunk callers chain this
+    through `language or detected_lang or None`, so None correctly falls
+    through to fresh auto-detection on the next chunk.
+    """
+    if not lang:
+        return None
+    s = lang.strip().lower()
+    if not s:
+        return None
+    # Already-ISO (two-letter code) passes through unchanged.
+    if len(s) == 2 and s.isalpha():
+        return s
+    return _WHISPER_LANG_TO_ISO.get(s)
+
+
 def set_default_provider(provider: str) -> None:
     """Set the module-level default provider. Idempotent. Validates input."""
     global _DEFAULT_PROVIDER
@@ -219,11 +269,17 @@ def transcribe(*, api_key: str, file_path: str | Path,
             return _transcribe_one(client, chunks[0], language,
                                    with_word_timestamps, provider=resolved)
 
-        # Multi-chunk: transcribe each, merge text + shift timestamps
+        # Multi-chunk: transcribe each, merge text + shift timestamps.
+        # `detected_lang` is the language hint passed to chunks 2+ to skip
+        # re-detection. It MUST be in ISO 639-1 form ("en", not "english") —
+        # OpenAI rejects full-name input with HTTP 400. We normalise the
+        # first-chunk auto-detected response through _normalize_lang_to_iso
+        # before reusing it; if normalisation fails (unknown name), we leave
+        # detected_lang as None and chunks 2+ also auto-detect.
         merged_text = ""
         merged_words: list[Any] = []
         merged_segs: list[Any] = []
-        detected_lang = language or ""
+        detected_lang: str | None = _normalize_lang_to_iso(language or "")
         total_dur = 0.0
         time_offset = 0.0
 
@@ -231,7 +287,7 @@ def transcribe(*, api_key: str, file_path: str | Path,
             res = _transcribe_one(client, chunk, language or detected_lang or None,
                                   with_word_timestamps, provider=resolved)
             if not detected_lang:
-                detected_lang = res.get("language", "")
+                detected_lang = _normalize_lang_to_iso(res.get("language", ""))
             merged_text += (" " if merged_text else "") + res["text"]
             chunk_dur = res.get("duration") or 0.0
             for w in res.get("words") or []:
