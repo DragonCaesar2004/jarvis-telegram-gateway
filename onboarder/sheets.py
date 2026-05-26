@@ -14,6 +14,7 @@ so they can be unit-tested with a fake client without touching the real Sheet.
 
 from __future__ import annotations
 
+import functools
 import logging
 import threading
 import re
@@ -23,6 +24,75 @@ from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("gateway")
+
+
+# ---------------------------------------------------------------------------
+# Transient-error retry for gspread (Google Sheets API)
+# ---------------------------------------------------------------------------
+#
+# Google's Sheets API occasionally returns 500/502/503/504 ("Internal error
+# encountered.") under load, plus 429s when we burst many calls in a short
+# window. These are transient — a few seconds later the same call succeeds.
+# Without a retry, a single transient hiccup propagates all the way up:
+# in the 2026-05-25 overnight batch, a single 500 during topic 4's
+# get_active_video_ids killed the entire topic, which then collided
+# course_idx 16-20 with the next topic that re-used the same offset.
+#
+# Decorator policy: 3 retries with 5s/15s/45s backoff (matches llm._call_json),
+# total ~65s of waiting before surfacing the error. Only transient signatures
+# trigger retry; permanent errors (auth, 404 sheet-not-found, schema) surface
+# on the first attempt.
+
+_GSPREAD_RETRYABLE_MARKERS = (
+    "[500]", "[502]", "[503]", "[504]", "[429]",
+    "Internal error", "Internal Server Error",
+    "Bad Gateway", "Service Unavailable", "Gateway Time-out",
+    "Quota exceeded", "Rate limit", "RATE_LIMIT_EXCEEDED",
+    "Connection reset", "Connection aborted", "ConnectTimeout",
+    "Read timed out", "EAI_AGAIN", "RemoteDisconnected", "ProtocolError",
+)
+_GSPREAD_RETRY_BACKOFFS = (5, 15, 45)  # seconds; total ~65s before failure
+
+
+def _is_retryable_gspread(e: BaseException) -> bool:
+    """True if a gspread exception looks like a transient outage we should
+    retry. Excludes auth, schema, and not-found errors which won't fix
+    themselves by waiting."""
+    s = str(e)
+    return any(m in s for m in _GSPREAD_RETRYABLE_MARKERS)
+
+
+def _with_gspread_retry(fn):
+    """Decorator: retry gspread-using fn on transient API errors.
+
+    Each retry is logged at WARNING. Permanent errors surface immediately
+    (caller still sees the original exception). On exhaustion, the LAST
+    exception is re-raised — same UX as without the decorator, just after
+    a brief delay if the API hiccupped.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        last_err: BaseException | None = None
+        attempts = [0] + list(_GSPREAD_RETRY_BACKOFFS)
+        for attempt, backoff in enumerate(attempts):
+            if backoff:
+                log.warning(
+                    f"sheets.{fn.__name__} retry {attempt}/{len(attempts) - 1} "
+                    f"after {backoff}s — prev error: {str(last_err)[:200]}"
+                )
+                time.sleep(backoff)
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                last_err = e
+                if not _is_retryable_gspread(e):
+                    raise
+        # All retries exhausted — surface the last transient error so the
+        # caller's existing exception path runs (e.g. the topic-batch loop's
+        # `except` clause that now also reserves course_idx slots).
+        assert last_err is not None
+        raise last_err
+    return wrapper
 
 # Module-level mutex for the Lessons tab. Multiple parallel wizards (one per
 # Telegram forum topic) can finish Phase 1 around the same time or grab
@@ -162,6 +232,7 @@ def open_spreadsheet(client: Any, sheet_id: str) -> Any:
 # Criteria tab (unchanged from before)
 # ---------------------------------------------------------------------------
 
+@_with_gspread_retry
 def read_criteria(client: Any, sheet_id: str) -> dict[str, Any]:
     """Read tab `Criteria` and merge with defaults. Missing keys fall back to defaults."""
     ss = open_spreadsheet(client, sheet_id)
@@ -200,6 +271,7 @@ def _coerce(key: str, val: str) -> Any:
 # Unified Lessons tab
 # ---------------------------------------------------------------------------
 
+@_with_gspread_retry
 def ensure_lessons_tab(client: Any, sheet_id: str) -> Any:
     """Return the Lessons worksheet, creating it with header if missing.
 
@@ -269,6 +341,7 @@ def _migrate_header_if_needed(ws: Any) -> None:
         log.warning(f"sheets: header migration write failed: {e}")
 
 
+@_with_gspread_retry
 def get_active_video_ids(client: Any, sheet_id: str) -> set[str]:
     """Return EVERY video_id that has appeared in the Lessons tab, regardless of status.
 
@@ -304,6 +377,7 @@ def get_active_video_ids(client: Any, sheet_id: str) -> set[str]:
     return out
 
 
+@_with_gspread_retry
 def get_seen_channel_ids(client: Any, sheet_id: str) -> set[str]:
     """Return every channel_id that has appeared in the Lessons tab.
 
@@ -334,6 +408,7 @@ def get_seen_channel_ids(client: Any, sheet_id: str) -> set[str]:
     return out
 
 
+@_with_gspread_retry
 def append_lesson_rows(client: Any, sheet_id: str, *, run_id: str,
                        rows: list[dict[str, Any]]) -> list[int]:
     """Append new lesson candidates to the Lessons tab as `pending`.
@@ -495,6 +570,7 @@ def _row_to_dict(row: list[str], header: list[str]) -> dict[str, str]:
     return {h: padded[i] for i, h in enumerate(header)}
 
 
+@_with_gspread_retry
 def read_pending_approved_rows(client: Any, sheet_id: str,
                                run_id: str | None = None,
                                course_idx: int | None = None,
@@ -573,6 +649,7 @@ def read_pending_approved_rows(client: Any, sheet_id: str,
     return out
 
 
+@_with_gspread_retry
 def update_status(client: Any, sheet_id: str, *, sheet_rows: list[int],
                   new_status: str,
                   course_admin_url: str | None = None,
@@ -604,6 +681,7 @@ def update_status(client: Any, sheet_id: str, *, sheet_rows: list[int],
 
 
 
+@_with_gspread_retry
 def update_lesson_row_partial(client: Any, sheet_id: str, *, row_number: int,
                               fields: dict[str, Any],
                               status: str | None = None,
