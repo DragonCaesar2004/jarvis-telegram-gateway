@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import shutil
 import threading
+from collections import deque
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -44,6 +45,72 @@ _TLS = threading.local()
 
 
 # ---------------------------------------------------------------------------
+# F5: Phase 2 concurrency cap + FIFO queue
+# ---------------------------------------------------------------------------
+# Hard cap on simultaneous Phase 2 workers to prevent the 27-May cascade
+# (8 parallel courses → 16 ffmpeg → load avg 68 on 4 cores). Excess clicks
+# go into a FIFO queue; when a slot opens, the next queued launch starts
+# automatically.
+#
+# Implementation: non-blocking acquire + global FIFO + on-finish trigger.
+#   * launch() tries _try_acquire_slot. If True → spawn worker immediately.
+#   * If False → _enqueue + send "⏳ В очереди #N" to operator.
+#   * Worker wrapper on exit → _release_and_pop_next. If a queued kwargs
+#     comes back → spawn it (sends "🎬 Phase 2 стартовала" to its thread).
+#
+# Limit is read from config (cfg["onboarder"]["phase2_concurrency_limit"]),
+# default 3. Queue is in-memory only; gateway restart drops the queue,
+# which is acceptable — operator can re-click.
+
+_PHASE2_DEFAULT_LIMIT = 3
+_phase2_active = 0
+_phase2_queue: deque = deque()
+_phase2_lock = threading.Lock()
+
+
+def _phase2_limit(cfg: dict) -> int:
+    """Read concurrency limit from cfg with sane fallback."""
+    try:
+        v = int((cfg.get("onboarder") or {}).get("phase2_concurrency_limit")
+                or _PHASE2_DEFAULT_LIMIT)
+        return max(1, v)
+    except (TypeError, ValueError):
+        return _PHASE2_DEFAULT_LIMIT
+
+
+def _try_acquire_slot(limit: int) -> bool:
+    """Non-blocking. Returns True iff we can launch immediately (and
+    reserves the slot). Returns False iff at-cap; caller should enqueue."""
+    global _phase2_active
+    with _phase2_lock:
+        if _phase2_active < limit:
+            _phase2_active += 1
+            return True
+        return False
+
+
+def _enqueue(launch_kwargs: dict) -> int:
+    """Add to FIFO. Returns 1-indexed queue position (1 = next to start)."""
+    with _phase2_lock:
+        _phase2_queue.append(launch_kwargs)
+        return len(_phase2_queue)
+
+
+def _release_and_pop_next(limit: int) -> dict | None:
+    """Called by worker on finish. Decrements active counter; if queue
+    non-empty AND we have headroom, dequeues and reserves a slot for the
+    next launch. Returns the next launch_kwargs dict to spawn, or None."""
+    global _phase2_active
+    with _phase2_lock:
+        _phase2_active = max(0, _phase2_active - 1)
+        if _phase2_active < limit and _phase2_queue:
+            next_args = _phase2_queue.popleft()
+            _phase2_active += 1
+            return next_args
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Public entry point (called from wizard's wiz:start_phase2 callback)
 # ---------------------------------------------------------------------------
 
@@ -52,7 +119,8 @@ def launch(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
            run_id_override: str | None = None,
            course_idx_filter: int | None = None,
            voice_gender_override: str | None = None) -> None:
-    """Spawn the Phase 2 worker in a background daemon thread.
+    """Spawn the Phase 2 worker in a background daemon thread, OR enqueue
+    it if the global concurrency cap is reached.
 
     `thread_id` is the Telegram forum topic the run was started in. 0 means
     DM / non-forum group, preserving the original behavior.
@@ -65,22 +133,96 @@ def launch(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     `voice_gender_override` lets the per-course button supply a fresh
     gender choice without mutating shared wizard state (which other
     parallel per-course launches might read).
+
+    F5: at most `cfg["onboarder"]["phase2_concurrency_limit"]` (default 3)
+    workers run simultaneously. Excess launches go to a FIFO queue and
+    start automatically when a slot opens. Operators see "⏳ В очереди #N"
+    for queued launches.
     """
+    limit = _phase2_limit(cfg)
+    launch_kwargs = {
+        "token": token, "agent": agent, "cfg": cfg,
+        "chat_id": chat_id, "user_id": user_id,
+        "thread_id": int(thread_id or 0),
+        "run_id_override": run_id_override,
+        "course_idx_filter": course_idx_filter,
+        "voice_gender_override": voice_gender_override,
+    }
+    if _try_acquire_slot(limit):
+        _spawn_phase2_worker(launch_kwargs)
+        return
+    # At-cap → enqueue + inform operator
+    pos = _enqueue(launch_kwargs)
+    queued_total = pos + limit  # 1-indexed overall position (1st queued = #limit+1)
+    try:
+        from gateway import tg_api  # type: ignore
+        course_disp = (f" (Курс {course_idx_filter})"
+                       if course_idx_filter else "")
+        tg_api(token, "sendMessage", chat_id=chat_id,
+               message_thread_id=int(thread_id or 0) or None,
+               text=(
+                   f"⏳ <b>Phase 2 в очереди</b>{course_disp}\n\n"
+                   f"Сейчас параллельно работают <b>{limit}</b> курсов. "
+                   f"Этот курс — <b>#{queued_total}</b>. Стартует автоматически "
+                   f"когда место освободится."
+               ),
+               parse_mode="HTML")
+    except Exception as e:
+        log.warning(f"phase2 queue-notify failed: {e}")
+
+
+def _spawn_phase2_worker(launch_kwargs: dict) -> None:
+    """Spawn the worker thread, wrapped so it auto-pops the next queue
+    entry on exit. Caller MUST have already acquired a slot via
+    `_try_acquire_slot` (or popped one via `_release_and_pop_next`)."""
+    thread_id = launch_kwargs["thread_id"]
+    user_id = launch_kwargs["user_id"]
+    agent = launch_kwargs["agent"]
+    course_idx_filter = launch_kwargs["course_idx_filter"]
     thr = threading.Thread(
-        target=_worker,
-        args=(token, agent, cfg, chat_id, user_id, int(thread_id or 0)),
-        kwargs={
-            "run_id_override": run_id_override,
-            "course_idx_filter": course_idx_filter,
-            "voice_gender_override": voice_gender_override,
-        },
+        target=_worker_with_queue_release,
+        args=(launch_kwargs,),
         name=(
-            f"phase2-{agent}-{user_id}-{int(thread_id or 0)}"
+            f"phase2-{agent}-{user_id}-{thread_id}"
             + (f"-c{course_idx_filter}" if course_idx_filter else "")
         ),
         daemon=True,
     )
     thr.start()
+
+
+def _worker_with_queue_release(kwargs: dict) -> None:
+    """Wrap _worker so it releases its concurrency slot on exit and
+    auto-starts the next queued launch (if any)."""
+    limit = _phase2_limit(kwargs["cfg"])
+    try:
+        _worker(
+            kwargs["token"], kwargs["agent"], kwargs["cfg"],
+            kwargs["chat_id"], kwargs["user_id"],
+            kwargs["thread_id"],
+            run_id_override=kwargs.get("run_id_override"),
+            course_idx_filter=kwargs.get("course_idx_filter"),
+            voice_gender_override=kwargs.get("voice_gender_override"),
+        )
+    finally:
+        next_kwargs = _release_and_pop_next(limit)
+        if next_kwargs:
+            # Inform the queued operator that their Phase 2 is starting
+            try:
+                from gateway import tg_api  # type: ignore
+                course_disp = (f" (Курс {next_kwargs['course_idx_filter']})"
+                               if next_kwargs.get("course_idx_filter") else "")
+                tg_api(next_kwargs["token"], "sendMessage",
+                       chat_id=next_kwargs["chat_id"],
+                       message_thread_id=next_kwargs["thread_id"] or None,
+                       text=(
+                           f"🎬 <b>Phase 2 стартовала</b>{course_disp} — "
+                           f"слот в очереди освободился."
+                       ),
+                       parse_mode="HTML")
+            except Exception as e:
+                log.warning(f"phase2 dequeue-notify failed: {e}")
+            _spawn_phase2_worker(next_kwargs)
 
 
 # ---------------------------------------------------------------------------
