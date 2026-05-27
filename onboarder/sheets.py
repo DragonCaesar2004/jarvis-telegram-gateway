@@ -184,6 +184,13 @@ STATUS_PROCESSING = "processing"
 STATUS_DONE = "done"
 STATUS_FAILED = "failed"
 STATUS_SKIPPED_DUPLICATE = "skipped_duplicate"
+# Operator-initiated reject (via "❌ Отклонить" button on per-course phase2 prompt).
+# Distinct from STATUS_FAILED (which is a technical failure during Phase 1/2).
+# Rejected rows stay in the Sheet for dedup so the same video doesn't resurface
+# in a future Phase 1 — but are NOT in ACTIVE_STATUSES (a rejected course
+# could still come back through a different channel if the operator changes
+# their mind).
+STATUS_REJECTED = "rejected"
 
 # Statuses that mark a video as "owned" by another run/course (dedup gate)
 ACTIVE_STATUSES = {STATUS_PROCESSING, STATUS_DONE}
@@ -645,6 +652,47 @@ def read_pending_approved_rows(client: Any, sheet_id: str,
             "course_plan": d.get("course_plan", ""),
             "course_science": d.get("course_science", ""),
             "_sheet_row": i,  # 1-based row index for batch_update
+        })
+    return out
+
+
+@_with_gspread_retry
+def read_rows_for_course(client: Any, sheet_id: str, *,
+                         run_id: str, course_idx: int) -> list[dict[str, Any]]:
+    """Return ALL rows of a (run_id, course_idx) course — no filter on
+    status or approved. Used by the reject flow: when the operator clicks
+    «❌ Отклонить» on a per-course button, we need every row of that course
+    (regardless of status — even already-done or already-failed) so we can
+    mark them all as `rejected` and free the cache.
+
+    Lighter return shape than read_pending_approved_rows — only the fields
+    the reject finalizer needs (video_id for cache cleanup, _sheet_row for
+    batch update, course/channel for the rejection log entry).
+    """
+    ws = ensure_lessons_tab(client, sheet_id)
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        return []
+    header = rows[0]
+    out: list[dict[str, Any]] = []
+    for i, raw in enumerate(rows[1:], start=2):
+        d = _row_to_dict(raw, header)
+        if d.get("run_id", "").strip() != run_id:
+            continue
+        try:
+            row_course_idx = int(d.get("course_idx") or 0)
+        except ValueError:
+            row_course_idx = 0
+        if row_course_idx != int(course_idx):
+            continue
+        out.append({
+            "course": d.get("course", ""),
+            "channel": d.get("channel", ""),
+            "video_id": d.get("video_id", ""),
+            "lesson_idx": _safe_int(d.get("lesson_idx", "")),
+            "status": d.get("status", "").strip().lower(),
+            "course_admin_url": d.get("course_admin_url", "").strip(),
+            "_sheet_row": i,
         })
     return out
 
