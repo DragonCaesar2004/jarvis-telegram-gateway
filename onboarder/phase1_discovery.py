@@ -225,7 +225,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     # ── 2.5 Init proxy rotator for downloads (same probe UX as Phase 2) ──
     rotator = proxy_pool.ProxyRotator(proxy_pool_list, cookies_file=youtube_cookies_file)
     if proxy_pool_list:
-        _send(token, chat_id,
+        _send_noise(token, chat_id,
               f"🔍 Проверяю {len(proxy_pool_list)} прокси на YouTube…")
         last_progress = [time.time()]
         results: list[str] = []
@@ -234,12 +234,12 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
             results.append(f"{'✅' if ok else '❌'} {idx}/{total} {name}")
             now = time.time()
             if ok or now - last_progress[0] > 15 or idx == total:
-                _send(token, chat_id, "\n".join(results[-12:]))
+                _send_noise(token, chat_id, "\n".join(results[-12:]))
                 last_progress[0] = now
 
         try:
             rotator.init(on_progress=_on_probe)
-            _send(token, chat_id,
+            _send_noise(token, chat_id,
                   f"✅ Прокси готов: <code>{proxy_pool._proxy_label(rotator.current)}</code>")
         except proxy_pool.NoWorkingProxyError as e:
             raise RuntimeError(
@@ -247,15 +247,15 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                 "Обнови cookies (/menu → 📎 Загрузить cookies) и попробуй ещё раз."
             )
     else:
-        _send(token, chat_id, "⚠️ Прокси не настроен — пробую напрямую с VPS-IP")
+        _send_noise(token, chat_id, "⚠️ Прокси не настроен — пробую напрямую с VPS-IP")
 
     # ── 3. Generate query variations + parallel search → unique channels ──
     search_results = _criteria_int(criteria, "search_results", DEFAULT_SEARCH_RESULTS)
     num_queries = _criteria_int(criteria, "search_queries", DEFAULT_SEARCH_QUERIES)
 
-    _send(token, chat_id, f"🔎 <i>Генерирую поисковые запросы по теме «{_html_escape(topic)}»…</i>")
+    _send_noise(token, chat_id, f"🔎 <i>Генерирую поисковые запросы по теме «{_html_escape(topic)}»…</i>")
     queries = llm.generate_search_queries(topic=topic, pain=pain, n=num_queries)
-    _send(token, chat_id,
+    _send_noise(token, chat_id,
           f"🔍 Ищу по <b>{len(queries)}</b> запросам:\n" +
           "\n".join(f"  • <i>{_html_escape(q)}</i>" for q in queries))
 
@@ -301,7 +301,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     # free, so the only cost is wall time (~30-60s for 50 channels in
     # batches of 8).
     cap = min(len(candidates), HARD_CAP_CHANNELS_TO_CHECK)
-    _send(token, chat_id,
+    _send_noise(token, chat_id,
           f"📊 Найдено {len(candidates)} каналов в выдаче. "
           f"Проверяю метаданные у всех (лимит {cap})…")
 
@@ -374,7 +374,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
 
         # Progress message after each batch (executor scope ended).
         if time.time() - last_progress > PROGRESS_INTERVAL_SEC:
-            _send(token, chat_id,
+            _send_noise(token, chat_id,
                   f"… проверено {checked}/{cap}, прошло фильтр: {len(enriched)}")
             last_progress = time.time()
 
@@ -402,7 +402,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         )
 
     # ── 5. Claude scores remaining channels ──────────────────────────────
-    _send(token, chat_id, f"🤖 Оцениваю {len(enriched)} каналов через Claude…")
+    _send_noise(token, chat_id, f"🤖 Оцениваю {len(enriched)} каналов через Claude…")
     scored = llm.score_channels(topic=topic, criteria=criteria,
                                 channels=enriched,
                                 pain=pain, audience=audience,
@@ -484,7 +484,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         skipped_total += course_skipped
 
         if not dedup_lessons:
-            _send(token, chat_id,
+            _send_noise(token, chat_id,
                   f"⚠️ Курс {course_idx} ({_html_escape(ch_name)}) пропущен — "
                   f"все {len(lessons)} видео уже обрабатывались.")
             skip_reasons.append(f"{ch_name}: all {len(lessons)} videos were duplicates")
@@ -496,7 +496,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         # another channel.
         MIN_LESSONS_PER_COURSE = 5
         if len(dedup_lessons) < MIN_LESSONS_PER_COURSE:
-            _send(token, chat_id,
+            _send_noise(token, chat_id,
                   f"⚠️ Курс {course_idx} ({_html_escape(ch_name)}) пропущен — "
                   f"после дедупликации осталось только {len(dedup_lessons)} видео, "
                   f"минимум {MIN_LESSONS_PER_COURSE}. Канал не годится для отдельного курса.")
@@ -531,6 +531,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
                 cookies_file=youtube_cookies_file,
                 rotator=rotator,
                 on_progress=lambda msg: _send(token, chat_id, _html_escape(msg)),
+                on_progress_noise=lambda msg: _send_noise(token, chat_id, _html_escape(msg)),
                 max_parallel=parallel_per_course,
                 compose_model=compose_model,
                 pain=pain, audience=audience,
@@ -961,6 +962,7 @@ def _run_from_urls(token: str, agent: str, cfg: dict, chat_id: int, user_id: int
             cookies_file=youtube_cookies_file,
             rotator=rotator,
             on_progress=lambda msg: _send(token, chat_id, _html_escape(msg)),
+            on_progress_noise=lambda msg: _send_noise(token, chat_id, _html_escape(msg)),
             max_parallel=parallel_per_course,
             compose_model=compose_model,
             sheets_client=(client if streaming_enabled else None),
@@ -1374,6 +1376,8 @@ def _process_one_url_course(*, course_idx: int, run_id: str,
         openai_key=openai_key, cookies_file=cookies_file, rotator=rotator,
         on_progress=lambda msg: _send(token, chat_id,
                                       f"  [Курс {course_idx}] {_html_escape(msg)}"),
+        on_progress_noise=lambda msg: _send_noise(token, chat_id,
+                                      f"  [Курс {course_idx}] {_html_escape(msg)}"),
         max_parallel=parallel_per_course,
         compose_model=compose_model,
         sheets_client=(sheets_client if streaming_enabled else None),
@@ -1696,7 +1700,10 @@ def _send(token: str, chat_id: int, text: str) -> None:
     """Use gateway's tg_api lazily so we honor its retries / chunking conventions.
 
     Reads the active forum topic from `_TLS.thread_id` (set by `_worker` at
-    start) so callers don't have to pass thread_id explicitly.
+    start) so callers don't have to pass thread_id explicitly. This is the
+    MILESTONE channel — only big-deal messages (course ready, course failed,
+    Phase 1 finished, fatal crash) go here. Progress noise routes to
+    `_send_noise` below.
     """
     from gateway import tg_api  # type: ignore
     thread_id = int(getattr(_TLS, "thread_id", 0) or 0)
@@ -1707,6 +1714,23 @@ def _send(token: str, chat_id: int, text: str) -> None:
         tg_api(token, "sendMessage", **kwargs)
     except Exception as e:
         log.warning(f"phase1 _send failed: {e}")
+
+
+def _send_noise(token: str, chat_id: int, text: str) -> None:
+    """Send a progress-noise message to the General thread (thread_id=0) of
+    the forum group — bypasses the operator's topic thread to keep it clean
+    of per-video / proxy-probe / "filter out" chatter. Falls back to the
+    main chat for non-forum groups (degrades gracefully).
+
+    Deliberately does NOT read `_TLS.thread_id` — the whole point is to
+    route AWAY from the operator's topic.
+    """
+    from gateway import tg_api  # type: ignore
+    try:
+        # Omit message_thread_id → General in forum group, main chat otherwise
+        tg_api(token, "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML")
+    except Exception as e:
+        log.warning(f"phase1 _send_noise failed: {e}")
 
 
 def _send_with_buttons(token: str, chat_id: int, text: str,

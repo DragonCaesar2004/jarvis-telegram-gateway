@@ -62,6 +62,7 @@ def enrich_course(*, course_idx: int, run_id: str,
                   cookies_file: str | None,
                   rotator: ProxyRotator | None,
                   on_progress: Callable[[str], None] | None = None,
+                  on_progress_noise: Callable[[str], None] | None = None,
                   max_parallel: int = DEFAULT_PARALLEL_PER_COURSE,
                   compose_model: str = llm.DEFAULT_MODEL_QUALITY,
                   pain: str = "",
@@ -107,10 +108,18 @@ def enrich_course(*, course_idx: int, run_id: str,
         }
     """
 
-    def _emit(msg: str) -> None:
-        if on_progress:
+    def _emit(msg: str, *, noise: bool = True) -> None:
+        """F2: noise-routing. By default per-video / per-step status lines
+        go to `on_progress_noise` (which the caller wires up to General
+        thread). Milestone lines (course-level failure summary, "K videos
+        skipped" warning) pass `noise=False` and route to `on_progress`
+        (operator's thread). If only one callback is wired, the other path
+        silently drops — no double-sending.
+        """
+        cb = on_progress_noise if noise else on_progress
+        if cb:
             try:
-                on_progress(msg)
+                cb(msg)
             except Exception:
                 pass
         log.info(f"phase1_enrich[course={course_idx}] {msg}")
@@ -203,7 +212,7 @@ def enrich_course(*, course_idx: int, run_id: str,
 
     if not processed:
         _emit(f"⚠️ Курс {course_idx}: ни одно видео не транскрибировалось. "
-              f"Сдаюсь по этому курсу.")
+              f"Сдаюсь по этому курсу.", noise=False)
         return {
             "videos": [],
             "course_title": course_title_from_llm,
@@ -399,7 +408,7 @@ def enrich_course(*, course_idx: int, run_id: str,
 
     if failed:
         _emit(f"⚠️ В курсе {course_idx} пропущено {len(failed)} видео из-за ошибок "
-              f"(остальные {len(enriched_videos)} прошли).")
+              f"(остальные {len(enriched_videos)} прошли).", noise=False)
 
     # Pre-render the structured plan/science back to the delimiter format the
     # operator edits in Sheet (single multiline cell). Phase 2 parses these
