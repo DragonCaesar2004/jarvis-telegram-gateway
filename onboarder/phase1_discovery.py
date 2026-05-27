@@ -1746,8 +1746,8 @@ def _send_per_course_phase2_button(token: str, chat_id: int, sheet_url: str, *,
                                    course_title: str, video_count: int,
                                    channel_name: str) -> None:
     """Sent right after a course's rows hit the Sheet — gives the operator
-    a course-specific «🚀 Запустить Курс N» button so they can launch Phase 2
-    for that one course without waiting for the rest of Phase 1.
+    two buttons: «🚀 Запустить Курс N» (start Phase 2) or «❌ Отклонить»
+    (reject + free cache + record reason for future discovery LLM).
     """
     text = (
         f"✅ <b>Курс {course_idx} готов</b> "
@@ -1759,8 +1759,12 @@ def _send_per_course_phase2_button(token: str, chat_id: int, sheet_url: str, *,
     )
     _send_with_buttons(
         token, chat_id, text,
-        buttons=[[{"text": f"🚀 Запустить Курс {course_idx}",
-                   "callback_data": f"wiz:p2c:{run_id}:{course_idx}"}]],
+        buttons=[[
+            {"text": f"🚀 Запустить Курс {course_idx}",
+             "callback_data": f"wiz:p2c:{run_id}:{course_idx}"},
+            {"text": "❌ Отклонить",
+             "callback_data": f"wiz:rj:{run_id}:{course_idx}"},
+        ]],
     )
 
 

@@ -145,6 +145,7 @@ STEP_PHASE1_RUNNING = "phase1_running"
 STEP_AWAITING_APPROVAL = "awaiting_approval"
 STEP_AWAITING_COOKIES_PRE_PHASE1 = "awaiting_cookies_pre_phase1"  # F1: gate before Phase 1 launch
 STEP_AWAITING_COOKIES_PRE_PHASE2 = "awaiting_cookies_pre_phase2"  # forced refresh before phase2
+STEP_AWAITING_REJECT_REASON = "awaiting_reject_reason"  # F3: operator typing reject reason
 STEP_PHASE2_RUNNING = "phase2_running"
 STEP_DONE = "done"
 STEP_AWAITING_COOKIES = "awaiting_cookies"  # standalone cookies upload (from /menu)
@@ -255,6 +256,29 @@ def handle_wizard_message(token: str, agent: str, cfg: dict, chat_id: int,
                 STEP_AWAITING_COOKIES_PRE_PHASE1):
         _handle_cookies_upload(token, agent, cfg, chat_id, user_id, msg,
                                thread_id=thread_id)
+        return
+
+    # F3: operator is typing the reject reason for a course they pressed
+    # «❌ Отклонить» on. Capture and finalize. Skip token → empty reason.
+    if step == STEP_AWAITING_REJECT_REASON:
+        run_id_pending = st.get("_reject_run_id", "")
+        try:
+            course_idx_pending = int(st.get("_reject_course_idx") or 0)
+        except (TypeError, ValueError):
+            course_idx_pending = 0
+        if not run_id_pending or not course_idx_pending:
+            log.warning(f"reject reason text but state missing _reject_run_id/_reject_course_idx")
+            _send(token, chat_id, "Состояние reject потеряно — попробуй ещё раз.",
+                  thread_id=thread_id)
+            return
+        reason = text.strip()
+        if reason.lower() in _SKIP_TOKENS:
+            reason = ""
+        _finalize_rejection(token, agent, cfg, chat_id, user_id,
+                            thread_id=thread_id,
+                            run_id=run_id_pending,
+                            course_idx=course_idx_pending,
+                            reason=reason)
         return
 
     if step == STEP_ASK_TOPIC:
@@ -663,6 +687,88 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
             except Exception:
                 pass
             _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
+        return
+
+    # F3: per-course REJECT button. Triggered from the «❌ Отклонить»
+    # button on Phase 1's per-course «Курс N готов» message.
+    # Formats:
+    #   wiz:rj:{run_id}:{course_idx}     — operator clicked reject
+    #   wiz:rjs:{run_id}:{course_idx}    — operator chose to skip reason
+    if action.startswith("rj:") or action.startswith("rjs:"):
+        is_skip = action.startswith("rjs:")
+        parts = action.split(":")
+        if len(parts) != 3:
+            answer_callback_query(token, cq_id, "Битый callback", show_alert=True)
+            return
+        run_id = parts[1]
+        try:
+            course_idx = int(parts[2])
+        except ValueError:
+            answer_callback_query(token, cq_id, "Битый course_idx", show_alert=True)
+            return
+
+        if is_skip:
+            # Skip-reason path: finalize immediately with empty reason
+            answer_callback_query(token, cq_id, "Без причины")
+            _finalize_rejection(token, agent, cfg, chat_id, user_id,
+                                thread_id=thread_id, run_id=run_id,
+                                course_idx=course_idx, reason="")
+            return
+
+        # Reject-with-reason path: strip the buttons from the per-course
+        # message (prevent double-click), stash reject context, ask reason.
+        answer_callback_query(token, cq_id, "Отклонить курс…")
+        msg_id = msg.get("message_id")
+        if msg_id:
+            try:
+                tg_api(token, "editMessageReplyMarkup",
+                       chat_id=chat_id, message_id=msg_id,
+                       reply_markup={"inline_keyboard": []})
+            except Exception as e:
+                log.warning(f"wiz:rj: could not strip buttons: {e}")
+
+        # Look up course title + channel from Sheet so the reason-prompt has
+        # context. Cheap call — single get_all_values + filter.
+        course_title = ""
+        channel = ""
+        try:
+            from . import _secrets as _s, sheets
+            onb = (cfg.get("onboarder") or {})
+            sa = _s.resolve_path(onb, "google_service_account")
+            sheet_id_local = onb.get("google_sheet_id") or ""
+            client = sheets.open_client(sa)
+            rows = sheets.read_rows_for_course(client, sheet_id_local,
+                                                run_id=run_id, course_idx=course_idx)
+            if rows:
+                course_title = rows[0].get("course", "") or ""
+                channel = rows[0].get("channel", "") or ""
+        except Exception as e:
+            log.warning(f"wiz:rj: could not fetch course context: {e}")
+
+        _state.update(agent, user_id, thread_id=thread_id,
+                      step=STEP_AWAITING_REJECT_REASON,
+                      _reject_run_id=run_id,
+                      _reject_course_idx=course_idx,
+                      _reject_course_title=course_title,
+                      _reject_channel=channel)
+
+        title_disp = _html_escape(course_title)[:160] if course_title else f"Курс {course_idx}"
+        _send_with_buttons(
+            token, chat_id,
+            text=(
+                f"🚫 <b>Отклонить курс {course_idx}</b>"
+                f"{' — «' + title_disp + '»' if course_title else ''}?\n\n"
+                f"Напиши <b>одним сообщением</b>, почему отклоняешь "
+                f"(что не так с этим курсом/каналом). Это запоминается и помогает "
+                f"будущим Phase 1 не предлагать похожие материалы.\n\n"
+                f"Или нажми «Пропустить» — отклоню без причины."
+            ),
+            buttons=[[
+                {"text": "⏭ Пропустить причину",
+                 "callback_data": f"wiz:rjs:{run_id}:{course_idx}"}
+            ]],
+            thread_id=thread_id,
+        )
         return
 
     # Per-course Phase 2 launch button. Triggered from Phase 1's per-course
@@ -1226,6 +1332,103 @@ def _dispatch_phase1(token: str, agent: str, cfg: dict, chat_id: int,
         log.exception(f"[{agent}] failed to launch phase1: {e}")
         _send_text(f"⚠️ Не удалось запустить Phase 1: {e}")
         _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Reject-flow helper (F3)
+# ---------------------------------------------------------------------------
+
+def _finalize_rejection(token: str, agent: str, cfg: dict,
+                        chat_id: int, user_id: int, *,
+                        thread_id: int,
+                        run_id: str, course_idx: int,
+                        reason: str) -> None:
+    """Commit a per-course rejection:
+      1. Append to state/rejections.jsonl for future LLM feedback.
+      2. Mark every row of (run_id, course_idx) in Sheet as status=rejected.
+      3. Delete cached MP4s for those rows' video_ids (free disk).
+      4. Clear _reject_* fields from wizard state, set step=AWAITING_APPROVAL.
+      5. Confirm in operator's thread; optional noise line to General.
+
+    All Sheet/cache failures are caught — operator's intent (a record
+    in JSONL) is preserved even if subsequent steps fail.
+    """
+    from gateway import tg_api  # type: ignore
+    from . import _secrets as _s, cache, rejections, sheets
+
+    st = _state.load(agent, user_id, thread_id)
+    course_title = st.get("_reject_course_title", "") or ""
+    channel = st.get("_reject_channel", "") or ""
+
+    # Step 1: append to JSONL (failure-safe, returns bool)
+    rejections.append_rejection(
+        run_id=run_id, course_idx=int(course_idx),
+        channel=channel, course_title=course_title,
+        reason=reason or "",
+        user_id=int(user_id), thread_id=int(thread_id or 0),
+    )
+
+    # Step 2-3: open Sheet, mark rows + delete cached MP4s
+    sheet_rows_updated = 0
+    freed_bytes = 0
+    try:
+        onb = (cfg.get("onboarder") or {})
+        sa = _s.resolve_path(onb, "google_service_account")
+        sheet_id = onb.get("google_sheet_id") or ""
+        client = sheets.open_client(sa)
+        rows = sheets.read_rows_for_course(client, sheet_id,
+                                            run_id=run_id, course_idx=course_idx)
+        if rows:
+            sheet_row_indices = [r["_sheet_row"] for r in rows]
+            sheets.update_status(
+                client, sheet_id,
+                sheet_rows=sheet_row_indices,
+                new_status=sheets.STATUS_REJECTED,
+                failure_reason=(reason[:300] if reason else None),
+            )
+            sheet_rows_updated = len(sheet_row_indices)
+            # Delete cached MP4s
+            for r in rows:
+                vid = (r.get("video_id") or "").strip()
+                if not vid:
+                    continue
+                try:
+                    p = cache.cached_path(vid)
+                    if p.exists():
+                        freed_bytes += p.stat().st_size
+                except OSError:
+                    pass
+                cache.delete_cached(vid)
+    except Exception as e:
+        log.warning(f"_finalize_rejection: Sheet/cache step failed for "
+                    f"run={run_id} course={course_idx}: {e}")
+
+    # Step 4: clear state, return to approval-waiting
+    st_after = _state.load(agent, user_id, thread_id)
+    for k in ("_reject_run_id", "_reject_course_idx",
+              "_reject_course_title", "_reject_channel"):
+        st_after.pop(k, None)
+    st_after["step"] = STEP_AWAITING_APPROVAL
+    _state.save(agent, user_id, st_after, thread_id)
+
+    # Step 5: confirm to operator
+    freed_mb = freed_bytes / (1024 * 1024) if freed_bytes else 0.0
+    title_disp = _html_escape(course_title[:100]) if course_title else f"Курс {course_idx}"
+    reason_block = (
+        f"\n<i>Причина: {_html_escape(reason[:300])}</i>" if reason else ""
+    )
+    try:
+        tg_api(token, "sendMessage", chat_id=chat_id,
+               message_thread_id=thread_id or None,
+               text=(
+                   f"✅ <b>Курс {course_idx} отклонён</b> — «{title_disp}»\n"
+                   f"{sheet_rows_updated} видео → <code>rejected</code>. "
+                   f"Освобождено {freed_mb:.1f} МБ кэша."
+                   + reason_block
+               ),
+               parse_mode="HTML")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
