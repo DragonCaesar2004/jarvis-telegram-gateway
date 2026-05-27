@@ -32,7 +32,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import Any
 
-from . import (_secrets, llm, phase1_enrich, proxy_pool, sheets,
+from . import (_secrets, llm, phase1_enrich, proxy_pool, rejections, sheets,
                state as _state, whisper, youtube_dl as ytdl)
 from .proxy_pool import CookiesNeededError
 
@@ -201,6 +201,15 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     log.info(f"phase1[{user_id}] {len(active_video_ids)} videos and "
              f"{len(blocked_channel_ids)} channels previously seen in Sheet — "
              f"deduping these (any status, including rejected/failed/legacy_import)")
+
+    # Load recent operator rejections. Empty list when no rejections yet
+    # (first launch after deploy) → behaves identically to before. When
+    # populated, passed to llm.score_channels / llm.select_videos to feed
+    # the "PREVIOUSLY REJECTED COURSES" prompt block.
+    rejection_log = rejections.load_recent_rejections(n=20)
+    if rejection_log:
+        log.info(f"phase1[{user_id}] loaded {len(rejection_log)} recent "
+                 f"rejection records for LLM feedback")
 
     # Batch mode reuses the caller's run_id so all topics in the batch
     # land under the same run grouping in the Sheet.
@@ -396,7 +405,8 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     _send(token, chat_id, f"🤖 Оцениваю {len(enriched)} каналов через Claude…")
     scored = llm.score_channels(topic=topic, criteria=criteria,
                                 channels=enriched,
-                                pain=pain, audience=audience)
+                                pain=pain, audience=audience,
+                                rejections=rejection_log)
     # Merge score into enriched lookup
     score_by_id = {s["channel_id"]: s for s in scored}
     enriched.sort(key=lambda c: score_by_id.get(c["channel_id"], {}).get("score", 0),
@@ -447,7 +457,8 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         try:
             sel = llm.select_videos(topic=topic, criteria=criteria,
                                     channel_name=ch_name, videos=videos_for_llm,
-                                    pain=pain, audience=audience)
+                                    pain=pain, audience=audience,
+                                    rejections=rejection_log)
         except Exception as e:
             log.warning(f"phase1[{user_id}] select_videos failed for {ch_name}: {e}")
             skip_reasons.append(f"{ch_name}: select_videos error: {str(e)[:80]}")

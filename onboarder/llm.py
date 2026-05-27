@@ -199,6 +199,65 @@ def _pain_audience_block(pain: str, audience: str) -> str:
     )
     return "\n".join(parts)
 
+
+def _rejection_feedback_block(rejections: list[dict[str, Any]] | None) -> str:
+    """Return a system-prompt addendum listing courses the operator rejected
+    in past Phase 1 runs. Empty string when no rejections (zero behaviour
+    change). Caller passes whatever rejections.load_recent_rejections()
+    returned — usually the last 20.
+
+    Dedups by (channel, course_title), keeping the most recent rejection
+    per pair so the LLM gets a clean signal without repetition.
+
+    The block tells the model two things:
+      1. Specific channels/courses to penalize (negative exemplars).
+      2. Generic categories of mistakes to avoid (mined from the free-form
+         reasons).
+    """
+    if not rejections:
+        return ""
+
+    # Dedup most-recent-wins by (channel, course_title)
+    seen: set[tuple[str, str]] = set()
+    deduped: list[dict[str, Any]] = []
+    for r in reversed(rejections):
+        key = ((r.get("channel") or "").strip(),
+               (r.get("course_title") or "").strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+    deduped.reverse()  # restore chronological order in the prompt
+
+    if not deduped:
+        return ""
+
+    lines = [
+        "\n\n## PREVIOUSLY REJECTED COURSES",
+        "The operator rejected the following courses in earlier Phase 1 runs.",
+        "Avoid producing courses that share their channel, their angle, or",
+        "the issues described in the rejection reason. Treat each entry as a",
+        "STRONG NEGATIVE SIGNAL — heavily penalize candidate channels or",
+        "video selections that resemble them. The operator already decided",
+        "these don't fit; don't make them choose again.\n",
+    ]
+    for r in deduped[:20]:
+        ch = (r.get("channel") or "").strip()
+        ct = (r.get("course_title") or "").strip()
+        reason = (r.get("reason") or "").strip()
+        bits: list[str] = []
+        if ch:
+            bits.append(f"channel «{ch}»")
+        if ct:
+            bits.append(f"course «{ct}»")
+        head = " / ".join(bits) or "(unknown course)"
+        if reason:
+            lines.append(f'- {head}: "{reason[:300]}"')
+        else:
+            lines.append(f"- {head}: (no reason supplied)")
+    return "\n".join(lines)
+
+
 # Default subprocess timeout — should fit longest prompt round-trip.
 # Channel scoring on 15 channels: ~15s. Video selection: ~30s. Course composition: ~60s.
 CLAUDE_CLI_TIMEOUT_SEC = 180
@@ -435,13 +494,20 @@ Return ONLY valid JSON, no prose:
 
 def score_channels(*, topic: str, criteria: dict[str, Any],
                    channels: list[dict[str, Any]], model: str = DEFAULT_MODEL_FAST,
-                   pain: str = "", audience: str = "") -> list[dict[str, Any]]:
+                   pain: str = "", audience: str = "",
+                   rejections: list[dict[str, Any]] | None = None,
+                   ) -> list[dict[str, Any]]:
     """Return list of {channel_id, score, reason} sorted by score desc.
 
     `channels` items shape (from yt-dlp metadata):
         {"channel_id": str, "name": str, "subscribers": int, "video_count": int,
          "description": str, "language": str | None,
          "recent_videos": [{"title": str, "published_at": str}, ...]}
+
+    `rejections` (optional): recent operator-rejected courses from
+    rejections.load_recent_rejections(). When non-empty, a "PREVIOUSLY
+    REJECTED COURSES" block is appended to the system prompt so the LLM
+    penalizes candidates that resemble past rejections.
     """
     payload: dict[str, Any] = {"topic": topic, "criteria": criteria, "channels": channels}
     if pain:
@@ -449,7 +515,9 @@ def score_channels(*, topic: str, criteria: dict[str, Any],
     if audience:
         payload["target_audience"] = audience
     user = json.dumps(payload, ensure_ascii=False, indent=2)
-    system = SCORE_CHANNELS_SYSTEM + _pain_audience_block(pain, audience)
+    system = (SCORE_CHANNELS_SYSTEM
+              + _pain_audience_block(pain, audience)
+              + _rejection_feedback_block(rejections))
     parsed = _call_json(model=model, system=system, user=user, timeout=900)  # 15 min for score_channels
     if not isinstance(parsed, list):
         raise ValueError(f"score_channels: expected list, got {type(parsed).__name__}")
@@ -532,12 +600,18 @@ SELECT_VIDEOS_TIMEOUT_SEC = 300
 def select_videos(*, topic: str, criteria: dict[str, Any],
                   channel_name: str, videos: list[dict[str, Any]],
                   model: str = DEFAULT_MODEL_FAST,
-                  pain: str = "", audience: str = "") -> dict[str, Any]:
+                  pain: str = "", audience: str = "",
+                  rejections: list[dict[str, Any]] | None = None,
+                  ) -> dict[str, Any]:
     """Return {course_title, lessons[]} or {course_title: null, lessons: [], skip_reason}.
 
     `videos` items shape (yt-dlp listing):
         {"video_id": str, "title": str, "duration_sec": int, "published_at": str,
          "view_count": int, "description": str (truncated)}
+
+    `rejections` (optional): recent operator-rejected courses. When non-empty,
+    appended to the system prompt so the LLM can decide to SKIP this channel
+    (returning skip_reason) if it resembles a previously-rejected course.
     """
     # Cap the candidate list to keep prompt size and round-trip time sane.
     # yt-dlp returns newest-first; trim the tail.
@@ -555,7 +629,9 @@ def select_videos(*, topic: str, criteria: dict[str, Any],
     if audience:
         payload["target_audience"] = audience
     user = json.dumps(payload, ensure_ascii=False, indent=2)
-    system = SELECT_VIDEOS_SYSTEM + _pain_audience_block(pain, audience)
+    system = (SELECT_VIDEOS_SYSTEM
+              + _pain_audience_block(pain, audience)
+              + _rejection_feedback_block(rejections))
     parsed = _call_json(model=model, system=system, user=user,
                         max_tokens=8192,
                         timeout=SELECT_VIDEOS_TIMEOUT_SEC)
