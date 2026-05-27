@@ -429,19 +429,33 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
     course_summaries: list[str] = []
     skipped_total = 0
     total_videos_written = 0
-    # Batch mode offsets course_idx so each topic's course gets a unique
-    # course_idx within the shared run_id (topic #1 → idx 1, topic #2 → idx 2…).
-    course_idx = batch_course_idx_offset
+    # F6: course_idx is allocated on SUCCESS only — not per channel attempt.
+    # This makes course_idx contiguous (1, 2, 3, ...) within a topic regardless
+    # of how many channels failed during scoring/select/dedup. Between topics,
+    # _run_topic_batch advances offset by `successful_courses` (the F6 way) to
+    # keep numbering contiguous across the whole run too.
+    # `successful_courses` is the source of truth: course_idx for a successful
+    # course = batch_course_idx_offset + successful_courses + 1 at the moment
+    # of commit. Channels that fail (no videos in age window, select_videos
+    # skip, all-duplicate, < 5 videos after dedup) do NOT burn a slot.
     successful_courses = 0
+    attempts = 0
+    course_idx = batch_course_idx_offset  # used only for display in fail paths
     skip_reasons: list[str] = []  # for the final failure message if zero succeed
     for ch in candidate_channels:
         if successful_courses >= count:
             break
-        course_idx += 1
+        attempts += 1
         ch_name = ch.get("channel_name") or ch["channel_id"]
+        # Tentative course_idx for the "trying" message — it's what the
+        # course WILL get if this channel succeeds. Failed channels just
+        # don't consume it; the NEXT successful channel takes the same
+        # number.
+        tentative_idx = batch_course_idx_offset + successful_courses + 1
         _send(token, chat_id,
-              f"🎬 Курс {course_idx} (нужно {count}, успешных {successful_courses}) — "
-              f"канал «{_html_escape(ch_name)}»: тяну видео и отбираю…")
+              f"🎬 Курс {tentative_idx} (нужно {count}, успешных {successful_courses}, "
+              f"попытка #{attempts}) — канал «{_html_escape(ch_name)}»: "
+              f"тяну видео и отбираю…")
 
         all_videos = ytdl.list_channel_videos(
             ch["channel_id"],
@@ -485,7 +499,7 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
 
         if not dedup_lessons:
             _send_noise(token, chat_id,
-                  f"⚠️ Курс {course_idx} ({_html_escape(ch_name)}) пропущен — "
+                  f"⚠️ Канал «{_html_escape(ch_name)}» пропущен — "
                   f"все {len(lessons)} видео уже обрабатывались.")
             skip_reasons.append(f"{ch_name}: all {len(lessons)} videos were duplicates")
             continue
@@ -497,11 +511,15 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         MIN_LESSONS_PER_COURSE = 5
         if len(dedup_lessons) < MIN_LESSONS_PER_COURSE:
             _send_noise(token, chat_id,
-                  f"⚠️ Курс {course_idx} ({_html_escape(ch_name)}) пропущен — "
+                  f"⚠️ Канал «{_html_escape(ch_name)}» пропущен — "
                   f"после дедупликации осталось только {len(dedup_lessons)} видео, "
                   f"минимум {MIN_LESSONS_PER_COURSE}. Канал не годится для отдельного курса.")
             skip_reasons.append(f"{ch_name}: only {len(dedup_lessons)}/5 unique videos after dedup")
             continue
+
+        # F6: SUCCESS-COMMIT POINT. Past all skip-paths above. Now we
+        # commit the course_idx — this channel will produce rows.
+        course_idx = batch_course_idx_offset + successful_courses + 1
 
         # ── 6a. ENRICH: download + transcribe + cuts + describe + compose ──
         videos_metadata = {v["video_id"]: v for v in all_videos}
