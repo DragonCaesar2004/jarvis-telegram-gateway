@@ -26,6 +26,8 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
+from pathlib import Path
 from typing import Any, Callable
 
 from . import state as _state
@@ -141,6 +143,7 @@ STEP_CLARIFY = "clarify"            # awaiting operator's free-form answer to cl
 STEP_CONFIRM = "confirm"
 STEP_PHASE1_RUNNING = "phase1_running"
 STEP_AWAITING_APPROVAL = "awaiting_approval"
+STEP_AWAITING_COOKIES_PRE_PHASE1 = "awaiting_cookies_pre_phase1"  # F1: gate before Phase 1 launch
 STEP_AWAITING_COOKIES_PRE_PHASE2 = "awaiting_cookies_pre_phase2"  # forced refresh before phase2
 STEP_PHASE2_RUNNING = "phase2_running"
 STEP_DONE = "done"
@@ -150,6 +153,32 @@ STEP_ASK_VOICE_PHASE2 = "ask_voice_phase2"  # gender selection right before Phas
 
 # Inputs that mean "no answer" for optional pain/audience steps.
 _SKIP_TOKENS = {"-", "—", "skip", "/skip", "пропустить", "нет", "no"}
+
+# F1: how fresh YouTube cookies must be for Phase 1 to launch without
+# asking the operator to re-upload. Six hours covers the common case of
+# "I uploaded cookies this morning, want to launch this evening" while
+# still catching truly stale cookies that would crash mid-Phase 1.
+_COOKIES_MAX_AGE_SEC = 6 * 3600
+
+
+def _cookies_fresh(cfg: dict[str, Any], max_age_sec: int = _COOKIES_MAX_AGE_SEC) -> bool:
+    """True iff YouTube cookies file exists AND was modified within
+    `max_age_sec` seconds. Used by the pre-Phase-1 gate so the operator
+    refreshes cookies BEFORE Phase 1 launches rather than discovering
+    staleness mid-batch through a proxy-pool-exhausted error.
+    """
+    onb = (cfg.get("onboarder") or {})
+    path_str = onb.get("youtube_cookies_file") or "~/.secrets/youtube-cookies.txt"
+    try:
+        p = Path(path_str).expanduser()
+    except (TypeError, ValueError):
+        return False
+    if not p.exists():
+        return False
+    try:
+        return (time.time() - p.stat().st_mtime) <= max_age_sec
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +251,8 @@ def handle_wizard_message(token: str, agent: str, cfg: dict, chat_id: int,
 
     step = st.get("step", STEP_ASK_TOPIC)
 
-    if step in (STEP_AWAITING_COOKIES, STEP_AWAITING_COOKIES_PRE_PHASE2):
+    if step in (STEP_AWAITING_COOKIES, STEP_AWAITING_COOKIES_PRE_PHASE2,
+                STEP_AWAITING_COOKIES_PRE_PHASE1):
         _handle_cookies_upload(token, agent, cfg, chat_id, user_id, msg,
                                thread_id=thread_id)
         return
@@ -546,6 +576,48 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
             clear_wizard_state(agent, user_id, thread_id)
             return
 
+        # Build the canonical (kind, args) for Phase 1 launch. Done BEFORE
+        # the cookies-freshness gate so we can stash these into state and
+        # resume on cookies upload without recomputing clarification merges.
+        kind, args = _build_phase1_launch_args(
+            url_mode=url_mode, url_groups=url_groups, video_ids=video_ids,
+            topic_groups=topic_groups, topic=topic, description=description,
+            count=count,
+            clarify_answers=clarify_answers,
+            clarify_questions_per_topic=clarify_questions_per_topic,
+        )
+
+        # F1: cookies-freshness gate. If mtime > 6h or missing → ask the
+        # operator to re-upload before Phase 1 launches. Avoids the
+        # mid-run "all 20 proxies blocked, please upload cookies" cascade
+        # we saw before this feature. After upload, Case D in
+        # _handle_cookies_upload resumes with the same (kind, args).
+        if not _cookies_fresh(cfg):
+            _state.update(agent, user_id, thread_id=thread_id,
+                          count=count,
+                          step=STEP_AWAITING_COOKIES_PRE_PHASE1,
+                          _pending_launch_kind=kind,
+                          _pending_launch_args=args)
+            answer_callback_query(token, cq_id, "Сначала свежие cookies")
+            _send_with_buttons(
+                token, chat_id,
+                text=(
+                    "📎 <b>Cookies устарели или отсутствуют.</b>\n\n"
+                    "Свежие YouTube cookies нужны ПЕРЕД Phase 1 (последний раз "
+                    "сохранил &gt; 6 часов назад). Загрузи файл "
+                    "<code>cookies.txt</code> следующим сообщением — Phase 1 "
+                    "стартует сам, как только пришлёшь.\n\n"
+                    "<b>Как получить файл:</b>\n"
+                    "1. Поставь расширение <i>Get cookies.txt LOCALLY</i> в Chrome/Edge\n"
+                    "2. Открой youtube.com (залогинен)\n"
+                    "3. Иконка расширения → Export As → cookies.txt\n"
+                    "4. Перетащи файл сюда"
+                ),
+                buttons=[[{"text": "✖️ Отмена", "callback_data": "wiz:cancel"}]],
+                thread_id=thread_id,
+            )
+            return
+
         # Phase 1 doesn't need voice_gender. The dubbing choice happens at
         # Phase 2 launch — after the operator has seen the actual video set
         # in the Sheet and can judge whether dubbing is even needed.
@@ -553,169 +625,8 @@ def _wizard_callback_handler(token: str, agent: str, cfg: dict, cq: dict) -> Non
                       count=count, step=STEP_PHASE1_RUNNING)
         answer_callback_query(token, cq_id, "Phase 1 запущен")
 
-        # Topic multi-batch (operator pasted multiple TOPICS separated by ===)
-        if topic_groups and not url_mode:
-            # Enrich each topic's `pain` with its operator-given clarification
-            # (free-form answer to the clarify questions). The downstream
-            # llm._pain_audience_block() picks the augmented pain up via the
-            # existing prompt path — no other code needs to change.
-            enriched_topic_groups: list[dict[str, str]] = []
-            for i, tg in enumerate(topic_groups):
-                base_pain = tg.get("pain", "") or ""
-                ans = clarify_answers[i] if i < len(clarify_answers) else ""
-                qs = (clarify_questions_per_topic[i]
-                      if i < len(clarify_questions_per_topic) else [])
-                new_pain = _combine_pain_with_clarification(base_pain, qs, ans)
-                enriched_topic_groups.append({**tg, "pain": new_pain})
-            try:
-                tg_api(token, "sendMessage", chat_id=chat_id,
-                       message_thread_id=thread_id or None,
-                       text=(
-                           f"🔍 <b>Phase 1 запущен — пакет из {len(topic_groups)} тем.</b>\n\n"
-                           "Каждая тема пройдёт полную Phase 1: поиск YouTube-каналов, "
-                           "скоринг через Claude, отбор видео, скачивание, "
-                           "транскрибация, compose. Курсы пишутся в Sheet по ходу.\n\n"
-                           f"Примерно <b>~{20 * len(topic_groups)}-{40 * len(topic_groups)} мин</b> "
-                           "на весь пакет. Можешь вернуться в чат "
-                           "(<code>/menu</code> → 💬 Чат), пришлю одно итоговое "
-                           "сообщение когда всё будет готово."
-                       ),
-                       parse_mode="HTML")
-            except Exception:
-                pass
-            try:
-                from . import phase1_discovery
-                phase1_discovery.launch_topic_batch(
-                    token, agent, cfg, chat_id, user_id,
-                    topic_groups=enriched_topic_groups, thread_id=thread_id,
-                )
-            except Exception as e:
-                log.exception(f"[{agent}] failed to launch phase1_topic_batch: {e}")
-                try:
-                    tg_api(token, "sendMessage", chat_id=chat_id,
-                           message_thread_id=thread_id or None,
-                           text=f"⚠️ Не удалось запустить Phase 1: {e}")
-                except Exception:
-                    pass
-                _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
-            return
-
-        # URL multi-batch (operator pasted multiple courses separated by ===/---)
-        if url_mode and url_groups:
-            total = sum(len(g) for g in url_groups)
-            try:
-                tg_api(token, "sendMessage", chat_id=chat_id,
-                       message_thread_id=thread_id or None,
-                       text=(
-                           f"🔗 <b>Phase 1 запущен — пакет из {len(url_groups)} курсов.</b>\n\n"
-                           f"Всего видео: <b>{total}</b>\n\n"
-                           "Курсы обрабатываются последовательно. Каждый: скачивание, "
-                           "Whisper, разметка вырезок, исследование автора, compose. "
-                           "Тему и названия генерирую по транскриптам.\n\n"
-                           f"Примерно <b>~{15 * len(url_groups)}-{30 * len(url_groups)} мин</b> на весь пакет. "
-                           "Можешь вернуться в чат (<code>/menu</code> → 💬 Чат), "
-                           "пришлю одно итоговое сообщение когда всё будет готово."
-                       ),
-                       parse_mode="HTML")
-            except Exception:
-                pass
-            try:
-                from . import phase1_discovery
-                phase1_discovery.launch_from_url_groups(
-                    token, agent, cfg, chat_id, user_id,
-                    url_groups=url_groups, thread_id=thread_id,
-                )
-            except Exception as e:
-                log.exception(f"[{agent}] failed to launch phase1_from_url_groups: {e}")
-                try:
-                    tg_api(token, "sendMessage", chat_id=chat_id,
-                           message_thread_id=thread_id or None,
-                           text=f"⚠️ Не удалось запустить Phase 1: {e}")
-                except Exception:
-                    pass
-                _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
-            return
-
-        # URL single-course mode (legacy single-group input)
-        if url_mode and video_ids:
-            try:
-                tg_api(token, "sendMessage", chat_id=chat_id,
-                       message_thread_id=thread_id or None,
-                       text=(
-                           "🔗 <b>Phase 1 запущен (прямые ссылки).</b>\n\n"
-                           f"Видео в обработке: <b>{len(video_ids)}</b>\n\n"
-                           "Скачиваю видео, транскрибирую (Whisper), размечаю вырезки, "
-                           "исследую автора и составляю описание курса. "
-                           "Тему и названия генерирую автоматически по транскрипту.\n\n"
-                           "~15-30 минут. Можешь вернуться в чат "
-                           "(<code>/menu</code> → 💬 Чат), пришлю результат как будет готово."
-                       ),
-                       parse_mode="HTML")
-            except Exception:
-                pass
-            try:
-                from . import phase1_discovery
-                phase1_discovery.launch_from_urls(
-                    token, agent, cfg, chat_id, user_id,
-                    video_ids=video_ids, thread_id=thread_id,
-                )
-            except Exception as e:
-                log.exception(f"[{agent}] failed to launch phase1_from_urls: {e}")
-                try:
-                    tg_api(token, "sendMessage", chat_id=chat_id,
-                           message_thread_id=thread_id or None,
-                           text=f"⚠️ Не удалось запустить Phase 1: {e}")
-                except Exception:
-                    pass
-                _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
-            return
-
-        # Normal topic-based flow.
-        # Enrich the single-topic pain with the operator's clarification
-        # answer (if any). This is the entry point for the "1 topic up to
-        # 5 courses" flow; both the topic and clarify state live in the
-        # wizard state under length-1 lists.
-        single_ans = clarify_answers[0] if clarify_answers else ""
-        single_qs = (clarify_questions_per_topic[0]
-                     if clarify_questions_per_topic else [])
-        enriched_pain = _combine_pain_with_clarification(
-            description, single_qs, single_ans)
-        desc_block = (f"\nОписание: <b>{_html_escape(description)[:300]}</b>"
-                      if description else "")
-        try:
-            tg_api(token, "sendMessage", chat_id=chat_id,
-                   message_thread_id=thread_id or None,
-                   text=(
-                       "🔍 <b>Phase 1 запущен.</b>\n\n"
-                       f"Тема: <b>{_html_escape(topic)}</b>"
-                       f"{desc_block}\n\n"
-                       "Phase 1 ищет каналы (до 5), скачивает видео, "
-                       "транскрибирует (Whisper), размечает вырезки, пишет "
-                       "описания уроков и курса, ищет инфу об авторе через "
-                       "WebSearch. На выходе в Sheet будут реальные описания, "
-                       "готовые для лендинга.\n\n"
-                       "~20-45 минут на каждый курс (5 курсов = ~2-4 часа). "
-                       "Можешь вернуться в чат с агентом (<code>/menu</code> → "
-                       "💬 Чат), пришлю результат как будет готово."
-                   ),
-                   parse_mode="HTML")
-        except Exception:
-            pass
-        try:
-            from . import phase1_discovery
-            phase1_discovery.launch(token, agent, cfg, chat_id, user_id,
-                                    topic, count,
-                                    pain=enriched_pain,
-                                    thread_id=thread_id)
-        except Exception as e:
-            log.exception(f"[{agent}] failed to launch phase1: {e}")
-            try:
-                tg_api(token, "sendMessage", chat_id=chat_id,
-                       message_thread_id=thread_id or None,
-                       text=f"⚠️ Не удалось запустить Phase 1: {e}")
-            except Exception:
-                pass
-            _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
+        _dispatch_phase1(token, agent, cfg, chat_id, user_id,
+                         thread_id=thread_id, kind=kind, args=args)
         return
 
     if action in ("voice_male", "voice_female"):
@@ -1148,6 +1059,176 @@ def _combine_pain_with_clarification(pain: str, questions: list[str],
 
 
 # ---------------------------------------------------------------------------
+# Phase 1 launch helpers (F1: cookies-gate + resume after upload)
+# ---------------------------------------------------------------------------
+#
+# Used by both `wiz:start_phase1` (direct launch with fresh cookies) and
+# `_handle_cookies_upload` Case D (resume after operator uploaded cookies).
+# Splitting the args-building from the preamble/dispatch lets us stash the
+# canonical (kind, args) tuple into wizard state between the two events.
+
+def _build_phase1_launch_args(*, url_mode: bool, url_groups: list,
+                               video_ids: list, topic_groups: list,
+                               topic: str, description: str, count: int,
+                               clarify_answers: list,
+                               clarify_questions_per_topic: list,
+                              ) -> tuple[str, dict[str, Any]]:
+    """Decide which Phase 1 launch kind applies + bundle its args.
+
+    Returns (kind, args) where kind is one of:
+      "topic_batch" — multi-topic batch (===-separated). args has
+                      `topic_groups` (with each topic's pain enriched).
+      "url_groups"  — multi-course URL batch. args has `url_groups`.
+      "url_single"  — single-URL list. args has `video_ids`.
+      "topic_single" — single topic. args has `topic`, `pain` (enriched), `count`.
+    """
+    if topic_groups and not url_mode:
+        # Multi-topic batch: enrich each topic's pain with its clarification
+        enriched: list[dict[str, str]] = []
+        for i, tg in enumerate(topic_groups):
+            base_pain = tg.get("pain", "") or ""
+            ans = clarify_answers[i] if i < len(clarify_answers) else ""
+            qs = (clarify_questions_per_topic[i]
+                  if i < len(clarify_questions_per_topic) else [])
+            new_pain = _combine_pain_with_clarification(base_pain, qs, ans)
+            enriched.append({**tg, "pain": new_pain})
+        return ("topic_batch", {"topic_groups": enriched})
+
+    if url_mode and url_groups:
+        return ("url_groups", {"url_groups": url_groups})
+
+    if url_mode and video_ids:
+        return ("url_single", {"video_ids": video_ids})
+
+    # Single-topic: enrich the single-pain with the single clarification
+    single_ans = clarify_answers[0] if clarify_answers else ""
+    single_qs = (clarify_questions_per_topic[0]
+                 if clarify_questions_per_topic else [])
+    enriched_pain = _combine_pain_with_clarification(
+        description, single_qs, single_ans)
+    return ("topic_single",
+            {"topic": topic, "pain": enriched_pain, "count": int(count)})
+
+
+def _dispatch_phase1(token: str, agent: str, cfg: dict, chat_id: int,
+                     user_id: int, *, thread_id: int,
+                     kind: str, args: dict[str, Any]) -> None:
+    """Send Phase 1 preamble message + spawn the discovery worker.
+
+    Mirrors the 4 launch kinds from the wizard's start_phase1 handler.
+    Centralised here so the cookies-gate resume path (Case D in
+    _handle_cookies_upload) can reuse the same preamble + dispatch.
+
+    On launch exception: sets state.step=error, sends fail message.
+    """
+    from gateway import tg_api  # type: ignore
+    from . import phase1_discovery
+
+    def _send_text(text: str) -> None:
+        try:
+            tg_api(token, "sendMessage", chat_id=chat_id,
+                   message_thread_id=thread_id or None,
+                   text=text, parse_mode="HTML")
+        except Exception:
+            pass
+
+    if kind == "topic_batch":
+        topic_groups = args.get("topic_groups") or []
+        _send_text(
+            f"🔍 <b>Phase 1 запущен — пакет из {len(topic_groups)} тем.</b>\n\n"
+            "Каждая тема пройдёт полную Phase 1: поиск YouTube-каналов, "
+            "скоринг через Claude, отбор видео, скачивание, "
+            "транскрибация, compose. Курсы пишутся в Sheet по ходу.\n\n"
+            f"Примерно <b>~{20 * len(topic_groups)}-{40 * len(topic_groups)} мин</b> "
+            "на весь пакет. Можешь вернуться в чат "
+            "(<code>/menu</code> → 💬 Чат), пришлю одно итоговое "
+            "сообщение когда всё будет готово."
+        )
+        try:
+            phase1_discovery.launch_topic_batch(
+                token, agent, cfg, chat_id, user_id,
+                topic_groups=topic_groups, thread_id=thread_id,
+            )
+        except Exception as e:
+            log.exception(f"[{agent}] failed to launch phase1_topic_batch: {e}")
+            _send_text(f"⚠️ Не удалось запустить Phase 1: {e}")
+            _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
+        return
+
+    if kind == "url_groups":
+        url_groups = args.get("url_groups") or []
+        total = sum(len(g) for g in url_groups)
+        _send_text(
+            f"🔗 <b>Phase 1 запущен — пакет из {len(url_groups)} курсов.</b>\n\n"
+            f"Всего видео: <b>{total}</b>\n\n"
+            "Курсы обрабатываются последовательно. Каждый: скачивание, "
+            "Whisper, разметка вырезок, исследование автора, compose. "
+            "Тему и названия генерирую по транскриптам.\n\n"
+            f"Примерно <b>~{15 * len(url_groups)}-{30 * len(url_groups)} мин</b> на весь пакет. "
+            "Можешь вернуться в чат (<code>/menu</code> → 💬 Чат), "
+            "пришлю одно итоговое сообщение когда всё будет готово."
+        )
+        try:
+            phase1_discovery.launch_from_url_groups(
+                token, agent, cfg, chat_id, user_id,
+                url_groups=url_groups, thread_id=thread_id,
+            )
+        except Exception as e:
+            log.exception(f"[{agent}] failed to launch phase1_from_url_groups: {e}")
+            _send_text(f"⚠️ Не удалось запустить Phase 1: {e}")
+            _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
+        return
+
+    if kind == "url_single":
+        video_ids = args.get("video_ids") or []
+        _send_text(
+            "🔗 <b>Phase 1 запущен (прямые ссылки).</b>\n\n"
+            f"Видео в обработке: <b>{len(video_ids)}</b>\n\n"
+            "Скачиваю видео, транскрибирую (Whisper), размечаю вырезки, "
+            "исследую автора и составляю описание курса. "
+            "Тему и названия генерирую автоматически по транскрипту.\n\n"
+            "~15-30 минут. Можешь вернуться в чат "
+            "(<code>/menu</code> → 💬 Чат), пришлю результат как будет готово."
+        )
+        try:
+            phase1_discovery.launch_from_urls(
+                token, agent, cfg, chat_id, user_id,
+                video_ids=video_ids, thread_id=thread_id,
+            )
+        except Exception as e:
+            log.exception(f"[{agent}] failed to launch phase1_from_urls: {e}")
+            _send_text(f"⚠️ Не удалось запустить Phase 1: {e}")
+            _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
+        return
+
+    # topic_single (default fallback)
+    topic = args.get("topic") or ""
+    pain = args.get("pain") or ""
+    count = int(args.get("count") or 5)
+    desc_block = (f"\nОписание: <b>{_html_escape(pain[:300])}</b>" if pain else "")
+    _send_text(
+        "🔍 <b>Phase 1 запущен.</b>\n\n"
+        f"Тема: <b>{_html_escape(topic)}</b>"
+        f"{desc_block}\n\n"
+        "Phase 1 ищет каналы (до 5), скачивает видео, "
+        "транскрибирует (Whisper), размечает вырезки, пишет "
+        "описания уроков и курса, ищет инфу об авторе через "
+        "WebSearch. На выходе в Sheet будут реальные описания, "
+        "готовые для лендинга.\n\n"
+        "~20-45 минут на каждый курс (5 курсов = ~2-4 часа). "
+        "Можешь вернуться в чат с агентом (<code>/menu</code> → "
+        "💬 Чат), пришлю результат как будет готово."
+    )
+    try:
+        phase1_discovery.launch(token, agent, cfg, chat_id, user_id,
+                                topic, count, pain=pain, thread_id=thread_id)
+    except Exception as e:
+        log.exception(f"[{agent}] failed to launch phase1: {e}")
+        _send_text(f"⚠️ Не удалось запустить Phase 1: {e}")
+        _state.update(agent, user_id, thread_id=thread_id, step="error", error=str(e))
+
+
+# ---------------------------------------------------------------------------
 # Cookie upload handler
 # ---------------------------------------------------------------------------
 
@@ -1236,6 +1317,35 @@ def _handle_cookies_upload(token: str, agent: str, cfg: dict,
             ]],
             thread_id=thread_id,
         )
+        return
+
+    # Case D (F1): cookies were requested by the pre-Phase 1 gate. Auto-
+    # resume the Phase 1 launch with the stashed (kind, args) — no return
+    # to chat, no manual re-trigger needed. This is the explicit UX fix
+    # for the 2026-05-26 incident where Phase 1 died after cookies error
+    # and the operator didn't realise they had to re-run the wizard.
+    if current_step == STEP_AWAITING_COOKIES_PRE_PHASE1:
+        kind = st.pop("_pending_launch_kind", None)
+        args = st.pop("_pending_launch_args", None) or {}
+        if not kind:
+            # Defensive: no stashed args (shouldn't happen if state went
+            # through start_phase1). Fall back to clean-state behaviour.
+            log.warning(f"PRE_PHASE1 cookies upload but no _pending_launch_kind in state")
+            st["step"] = "ask_topic"
+            _state.save(agent, user_id, st, thread_id)
+            _send(token, chat_id,
+                  f"✅ Cookies обновлены ({size_kb:.1f} KB).\n\n"
+                  "Состояние wizard потеряно — открой <code>/menu</code> → 🎓 Новый курс заново.",
+                  thread_id=thread_id)
+            return
+        st["step"] = STEP_PHASE1_RUNNING
+        _state.save(agent, user_id, st, thread_id)
+        _send(token, chat_id,
+              f"✅ <b>Cookies обновлены</b> ({size_kb:.1f} KB, {line_count} строк).\n"
+              "🚀 Запускаю Phase 1…",
+              thread_id=thread_id)
+        _dispatch_phase1(token, agent, cfg, chat_id, user_id,
+                         thread_id=thread_id, kind=kind, args=args)
         return
 
     # Case B: standalone cookies upload during an active run (e.g. user is on
