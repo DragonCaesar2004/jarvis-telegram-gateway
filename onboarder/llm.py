@@ -331,50 +331,49 @@ def _call_json(*, model: str, system: str, user: str,
                     "and CLAUDE_CODE_OAUTH_TOKEN is set in the gateway's env."
                 ) from e
 
-        if r.returncode == 0 and (r.stdout or "").strip():
-            break  # success
-        last_err = f"exit {r.returncode}: stderr={r.stderr[:300]} stdout={r.stdout[:200]}"
-        # Only retry on transient API errors. Permanent failures (auth, schema)
-        # surface immediately so we don't waste a minute on something doomed.
-        if not _is_retryable_cli_failure(r.stderr or "", r.stdout or ""):
-            raise RuntimeError(f"claude CLI {last_err}")
-    else:
-        raise RuntimeError(f"claude CLI exhausted retries: {last_err}")
+        if r.returncode != 0 or not (r.stdout or "").strip():
+            last_err = f"exit {r.returncode}: stderr={r.stderr[:300]} stdout={r.stdout[:200]}"
+            if not _is_retryable_cli_failure(r.stderr or "", r.stdout or ""):
+                raise RuntimeError(f"claude CLI {last_err}")
+            continue  # retry CLI
 
-    text = (r.stdout or "").strip()
-    if not text:
-        raise RuntimeError(f"claude CLI returned empty stdout. stderr={r.stderr[:500]!r}")
+        # CLI succeeded — try to parse JSON. On parse failure, retry the whole
+        # call: same prompt re-sampled may produce valid JSON. Lost-whole-topic
+        # bug 2026-05-30 happened because a single malformed-JSON response from
+        # Claude (a missing comma) killed the entire topic with no retry.
+        text = (r.stdout or "").strip()
 
-    # Strip code fences if model wrapped JSON in ```json ... ```
-    if text.startswith("```"):
-        # Drop opening fence (with optional language tag) and trailing fence
-        first_nl = text.find("\n")
-        if first_nl != -1:
-            text = text[first_nl + 1:]
-        if text.rstrip().endswith("```"):
-            text = text.rsplit("```", 1)[0]
-        text = text.strip()
+        # Strip code fences if model wrapped JSON in ```json ... ```
+        if text.startswith("```"):
+            first_nl = text.find("\n")
+            if first_nl != -1:
+                text = text[first_nl + 1:]
+            if text.rstrip().endswith("```"):
+                text = text.rsplit("```", 1)[0]
+            text = text.strip()
 
-    # Some Claude responses include leading prose before JSON; try to find first { or [
-    if not (text.startswith("{") or text.startswith("[")):
-        for opener in ("{", "["):
-            idx = text.find(opener)
-            if idx != -1:
-                text = text[idx:]
-                break
+        # Some Claude responses include leading prose before JSON; try to find first { or [
+        if not (text.startswith("{") or text.startswith("[")):
+            for opener in ("{", "["):
+                idx = text.find(opener)
+                if idx != -1:
+                    text = text[idx:]
+                    break
 
-    # raw_decode tolerates trailing prose after the JSON (Claude sometimes
-    # appends commentary). Reads the JSON value, returns it + end position.
-    try:
-        obj, end_idx = json.JSONDecoder().raw_decode(text)
-        if end_idx < len(text):
-            tail = text[end_idx:].strip()
-            if tail:
-                log.info(f"llm: ignored {len(tail)} chars of trailing text after JSON")
-        return obj
-    except json.JSONDecodeError as e:
-        log.error(f"llm: JSON parse failed. Raw: {text[:500]}")
-        raise ValueError(f"LLM returned non-JSON: {e}")
+        try:
+            obj, end_idx = json.JSONDecoder().raw_decode(text)
+            if end_idx < len(text):
+                tail = text[end_idx:].strip()
+                if tail:
+                    log.info(f"llm: ignored {len(tail)} chars of trailing text after JSON")
+            return obj
+        except json.JSONDecodeError as e:
+            last_err = f"JSON parse failed: {e}"
+            log.warning(f"llm._call_json: malformed JSON, will retry. {last_err}. "
+                        f"Raw: {text[:300]!r}")
+            continue  # retry — re-sampling often produces valid JSON
+
+    raise RuntimeError(f"claude CLI exhausted retries: {last_err}")
 
 
 # ---------------------------------------------------------------------------
