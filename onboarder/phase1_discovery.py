@@ -157,7 +157,23 @@ def _run(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
         does that once after all topics finish
 
     Standalone use ignores the return tuple.
+
+    OPT-IN v2 PIPELINE: when `onb["phase1_use_new_pipeline"]` is true, routes
+    to phase1_discovery_v2._run_v2 (hybrid Claude + yt-dlp pipeline). Defaults
+    to false → existing yt-dlp-search-driven pipeline runs unchanged.
+    Rollback = flip flag to false + restart gateway (no git revert needed).
     """
+    if onb.get("phase1_use_new_pipeline"):
+        from . import phase1_discovery_v2
+        log.info(f"phase1[{user_id}] routing to v2 pipeline (opt-in flag)")
+        return phase1_discovery_v2._run_v2(
+            token, agent, cfg, chat_id, user_id, topic, count, onb,
+            pain=pain, audience=audience, thread_id=thread_id,
+            batch_run_id=batch_run_id,
+            batch_course_idx_offset=batch_course_idx_offset,
+            batch_silent_finish=batch_silent_finish,
+        )
+
     # ── 1. Resolve secrets and open Sheet ────────────────────────────────
     # Anthropic API key not needed: llm.py uses `claude -p` CLI via Max OAuth.
     sa_path = _secrets.resolve_path(onb, "google_service_account")
