@@ -383,6 +383,52 @@ def _step2_filter_size(candidates: list[dict],
 # Step 3 — yt-dlp /videos enumeration + filter
 # ---------------------------------------------------------------------------
 
+def _v2_list_videos_full(channel_id: str, max_results: int) -> list[dict]:
+    """List channel videos with FULL per-entry metadata (duration, upload_date).
+
+    Why this exists: youtube_dl.list_channel_videos uses
+    `extract_flat: "in_playlist"` which returns only id+title — duration is
+    None/0 in flat mode for most YouTube responses. Our v2 step 3 NEEDS
+    duration to apply the 6-25 min filter; without it every video fails as
+    "too short" (duration=0 < 360s).
+
+    Use ytdl._ydl() which defaults to extract_flat=False (full per-entry
+    extraction). Slower than flat mode (~1-2 sec per video × N = ~2-3 min
+    for 80 videos) but it's the only way to get duration without paying
+    for YouTube Data API quota.
+
+    Returns the same shape as ytdl.list_channel_videos.
+    """
+    url = ytdl._channel_videos_url(channel_id)
+    # _ydl() default already has extract_flat=False; we just cap entries.
+    # ignoreerrors lets us continue past unavailable/private videos in the list.
+    try:
+        with ytdl._ydl({"playlistend": max(1, max_results),
+                        "ignoreerrors": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        log.warning(f"phase1_v2: list_videos_full failed for {url}: {e}")
+        return []
+    entries = (info or {}).get("entries") or []
+    out: list[dict] = []
+    for e in entries:
+        if not e:
+            continue
+        vid = e.get("id") or ""
+        if not vid:
+            continue
+        out.append({
+            "video_id": vid,
+            "title": e.get("title") or "",
+            "duration_sec": int(e.get("duration") or 0),
+            "view_count": int(e.get("view_count") or 0),
+            "upload_date": e.get("upload_date") or "",
+            "url": e.get("webpage_url") or f"https://youtu.be/{vid}",
+            "description": (e.get("description") or "")[:500],
+        })
+    return out
+
+
 def _step3_enumerate(channels: list[dict],
                      min_dur_sec: int, max_dur_sec: int,
                      min_year: int, max_videos: int,
@@ -397,15 +443,15 @@ def _step3_enumerate(channels: list[dict],
     out: list[dict] = []
     for ch in channels:
         try:
-            # Pull the most recent N videos. We pass max_age_months=None
-            # because we apply a stricter year filter ourselves below.
-            raw_videos = ytdl.list_channel_videos(
-                ch["channel_id"],
-                max_results=max_videos,
-                max_age_months=None,
+            # Use the v2-local full-metadata helper. ytdl.list_channel_videos
+            # uses flat-playlist mode which strips durations to 0, making the
+            # 6-25 min filter reject everything. _v2_list_videos_full does
+            # per-entry extraction so duration is preserved.
+            raw_videos = _v2_list_videos_full(
+                ch["channel_id"], max_results=max_videos,
             )
         except Exception as e:
-            log.warning(f"phase1_v2: list_channel_videos failed for {ch['channel_name']!r}: {e}")
+            log.warning(f"phase1_v2: list videos failed for {ch['channel_name']!r}: {e}")
             raw_videos = []
         valid: list[dict] = []
         for v in raw_videos:
