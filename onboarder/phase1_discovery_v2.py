@@ -383,7 +383,9 @@ def _step2_filter_size(candidates: list[dict],
 # Step 3 — yt-dlp /videos enumeration + filter
 # ---------------------------------------------------------------------------
 
-def _v2_list_videos_full(channel_id: str, max_results: int) -> list[dict]:
+def _v2_list_videos_full(channel_id: str, max_results: int,
+                         cookies_file: str | None = None,
+                         proxy_url: str | None = None) -> list[dict]:
     """List channel videos with FULL per-entry metadata (duration, upload_date).
 
     Why this exists: youtube_dl.list_channel_videos uses
@@ -391,6 +393,14 @@ def _v2_list_videos_full(channel_id: str, max_results: int) -> list[dict]:
     None/0 in flat mode for most YouTube responses. Our v2 step 3 NEEDS
     duration to apply the 6-25 min filter; without it every video fails as
     "too short" (duration=0 < 360s).
+
+    CRITICAL — cookies + proxy: with extract_flat=False, yt-dlp issues a
+    full per-video request for each entry on the channel's /videos tab.
+    YouTube flags datacenter IPs as bots and requires login cookies for
+    those requests (we saw exactly this in the first v2 deploy attempt:
+    every per-video request returned "Sign in to confirm you're not a
+    bot"). Cookies + a rotating residential/datacenter proxy from our
+    pool fixes that. Mirror the same env that phase2 download uses.
 
     Use ytdl._ydl() which defaults to extract_flat=False (full per-entry
     extraction). Slower than flat mode (~1-2 sec per video × N = ~2-3 min
@@ -400,11 +410,16 @@ def _v2_list_videos_full(channel_id: str, max_results: int) -> list[dict]:
     Returns the same shape as ytdl.list_channel_videos.
     """
     url = ytdl._channel_videos_url(channel_id)
-    # _ydl() default already has extract_flat=False; we just cap entries.
-    # ignoreerrors lets us continue past unavailable/private videos in the list.
+    extra: dict[str, Any] = {
+        "playlistend": max(1, max_results),
+        "ignoreerrors": True,
+    }
+    if cookies_file:
+        extra["cookiefile"] = cookies_file
+    if proxy_url:
+        extra["proxy"] = proxy_url
     try:
-        with ytdl._ydl({"playlistend": max(1, max_results),
-                        "ignoreerrors": True}) as ydl:
+        with ytdl._ydl(extra) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
         log.warning(f"phase1_v2: list_videos_full failed for {url}: {e}")
@@ -433,22 +448,39 @@ def _step3_enumerate(channels: list[dict],
                      min_dur_sec: int, max_dur_sec: int,
                      min_year: int, max_videos: int,
                      seen_video_ids: set[str],
-                     on_progress: Any) -> list[dict]:
+                     on_progress: Any,
+                     cookies_file: str | None = None,
+                     rotator: Any = None) -> list[dict]:
     """For each channel, pull recent videos + apply hard filters.
 
     Returns the channels list enriched with a `videos: list[dict]` field
     containing video_id, title, duration_sec, upload_year, view_count.
     Empty videos list = no valid content — that channel will fail step 4.
+
+    cookies_file + rotator are required for non-flat extraction (YouTube
+    flags datacenter IPs as bots without login cookies). Mirror the same
+    env that phase2 downloads use.
     """
     out: list[dict] = []
     for ch in channels:
+        # Pick a fresh proxy per channel from the rotator so YouTube doesn't
+        # bin a single IP for ~80 per-video requests in a row.
+        proxy_url = None
+        if rotator is not None:
+            try:
+                proxy_url = rotator.current
+            except Exception:
+                proxy_url = None
         try:
             # Use the v2-local full-metadata helper. ytdl.list_channel_videos
             # uses flat-playlist mode which strips durations to 0, making the
             # 6-25 min filter reject everything. _v2_list_videos_full does
             # per-entry extraction so duration is preserved.
             raw_videos = _v2_list_videos_full(
-                ch["channel_id"], max_results=max_videos,
+                ch["channel_id"],
+                max_results=max_videos,
+                cookies_file=cookies_file,
+                proxy_url=proxy_url,
             )
         except Exception as e:
             log.warning(f"phase1_v2: list videos failed for {ch['channel_name']!r}: {e}")
@@ -1099,6 +1131,8 @@ def _run_v2(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
             max_videos=max_videos_per_channel,
             seen_video_ids=active_video_ids,
             on_progress=_on_enum,
+            cookies_file=youtube_cookies_file,
+            rotator=rotator,
         )
         if enum_progress and len(enum_progress) % 4 != 0:
             _send_noise(token, chat_id, "\n".join(enum_progress[-4:]))
