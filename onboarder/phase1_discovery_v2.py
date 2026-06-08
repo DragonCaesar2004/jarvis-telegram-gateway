@@ -386,33 +386,25 @@ def _step2_filter_size(candidates: list[dict],
 def _v2_list_videos_full(channel_id: str, max_results: int,
                          cookies_file: str | None = None,
                          proxy_url: str | None = None) -> list[dict]:
-    """List channel videos with FULL per-entry metadata (duration, upload_date).
+    """List channel videos in FLAT mode (1 HTTP request per channel).
 
-    Why this exists: youtube_dl.list_channel_videos uses
-    `extract_flat: "in_playlist"` which returns only id+title — duration is
-    None/0 in flat mode for most YouTube responses. Our v2 step 3 NEEDS
-    duration to apply the 6-25 min filter; without it every video fails as
-    "too short" (duration=0 < 360s).
+    Earlier the v2 step 3 used extract_flat=False which fires one HTTP
+    request PER video — for an 80-video channel that's 80 requests through
+    a single proxy back-to-back. YouTube binned the proxy as a bot after
+    20-40 requests and silently nulled the remaining entries, leaving
+    "0/2 video подходят" with no visible cause. Verified empirically on
+    @hubermanlab, @FeldenkraisAccess, @MovementAndPosture — duration IS
+    populated in flat mode (4337s, 332s, 405s etc); only upload_date is
+    sometimes missing, handled gracefully by step 3 (year=0 → keep, don't
+    filter when year unknown).
 
-    CRITICAL — cookies + proxy: with extract_flat=False, yt-dlp issues a
-    full per-video request for each entry on the channel's /videos tab.
-    YouTube flags datacenter IPs as bots and requires login cookies for
-    those requests (we saw exactly this in the first v2 deploy attempt:
-    every per-video request returned "Sign in to confirm you're not a
-    bot"). Cookies + a rotating residential/datacenter proxy from our
-    pool fixes that. Mirror the same env that phase2 download uses.
-
-    Use ytdl._ydl() which defaults to extract_flat=False (full per-entry
-    extraction). Slower than flat mode (~1-2 sec per video × N = ~2-3 min
-    for 80 videos) but it's the only way to get duration without paying
-    for YouTube Data API quota.
-
-    Returns the same shape as ytdl.list_channel_videos.
+    Cookies + proxy still plumbed as defense in depth (single request also
+    benefits from a clean IP), but blast radius is 80× smaller.
     """
     url = ytdl._channel_videos_url(channel_id)
     extra: dict[str, Any] = {
+        "extract_flat": "in_playlist",
         "playlistend": max(1, max_results),
-        "ignoreerrors": True,
     }
     if cookies_file:
         extra["cookiefile"] = cookies_file
@@ -422,7 +414,7 @@ def _v2_list_videos_full(channel_id: str, max_results: int,
         with ytdl._ydl(extra) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
-        log.warning(f"phase1_v2: list_videos_full failed for {url}: {e}")
+        log.warning(f"phase1_v2: list videos failed for {url}: {e}")
         return []
     entries = (info or {}).get("entries") or []
     out: list[dict] = []
@@ -438,8 +430,8 @@ def _v2_list_videos_full(channel_id: str, max_results: int,
             "duration_sec": int(e.get("duration") or 0),
             "view_count": int(e.get("view_count") or 0),
             "upload_date": e.get("upload_date") or "",
-            "url": e.get("webpage_url") or f"https://youtu.be/{vid}",
-            "description": (e.get("description") or "")[:500],
+            "url": e.get("url") or f"https://youtu.be/{vid}",
+            "description": "",
         })
     return out
 
@@ -498,7 +490,9 @@ def _step3_enumerate(channels: list[dict],
                 year = int(date_str[:4]) if date_str[:4].isdigit() else 0
             except (ValueError, IndexError):
                 year = 0
-            if year < min_year:
+            # Flat mode often returns upload_date=None — keep the video then,
+            # don't drop it just because YouTube didn't surface the date.
+            if year and year < min_year:
                 continue
             valid.append({
                 "video_id": vid,
@@ -871,6 +865,17 @@ def _process_one_course(*, course_idx: int, run_id: str, ch_record: dict,
         late_skipped = len(course_rows) - len(rows_to_write)
         if rows_to_write:
             sheets.append_lesson_rows(client, sheet_id, run_id=run_id, rows=rows_to_write)
+            # Now (post-write) mark these as seen so subsequent courses in
+            # this same run / iteration won't re-pick the same videos. This
+            # replaces the pre-write add() that previously caused
+            # self-pollution dedup at the course's own late-dedup check.
+            for r in rows_to_write:
+                vid = r.get("video_id")
+                if vid:
+                    active_video_ids.add(vid)
+                chid = r.get("channel_id")
+                if chid:
+                    blocked_channel_ids.add(chid)
     if late_skipped:
         log.info(f"phase1_v2: late dedup dropped {late_skipped} rows for course {course_idx}")
 
@@ -1157,12 +1162,17 @@ def _run_v2(token: str, agent: str, cfg: dict, chat_id: int, user_id: int,
             _send_noise(token, chat_id, "\n".join(select_progress[-3:]))
 
         # Accumulate; trim to target if iteration overshoots.
+        # NOTE: We DON'T add selected video_ids to active_video_ids here —
+        # that used to cause self-pollution: the course's own selected videos
+        # would show up as "already seen" when _process_one_course ran its
+        # late-dedup at line 700, killing every single course. Marking as
+        # seen now happens AFTER successful Sheet write inside
+        # _process_one_course, so cross-course / cross-iteration dedup still
+        # works without blocking the course from itself.
         for c in iter_courses:
             if len(selected_courses) >= target_courses:
                 break
             selected_courses.append(c)
-            for v in c["selected_videos"]:
-                active_video_ids.add(v["video_id"])
 
         iteration_history.append({
             "iter": iteration,
